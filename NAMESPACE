@@ -3,6 +3,7 @@
 S3method(prepare_data_infections_only,default)
 S3method(prepare_data_infections_only,epiworld_model)
 export(build_cnn_model)
+export(filter_non_null)
 export(generate_theta)
 export(main_pipeline)
 export(prepare_data)

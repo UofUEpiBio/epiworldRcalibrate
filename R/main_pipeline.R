@@ -1,3 +1,4 @@
+library(data.table)
 #' Main Pipeline
 #'
 #' Executes the full pipeline: simulation, data preparation, and modeling.
@@ -7,6 +8,7 @@
 #' @param ndays Integer. Number of simulation days.
 #' @param ncores Integer. Number of cores for parallelization.
 #' @export
+
 main_pipeline <- function(N, n, ndays, ncores) {
   theta <- generate_theta(N, n)
   seeds <- sample.int(.Machine$integer.max, N, TRUE)
