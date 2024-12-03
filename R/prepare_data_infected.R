@@ -7,6 +7,9 @@
 #'
 #' @export
 prepare_data_infected <- function(data) {
+  library(reticulate)
+  reticulate::import("numpy")
+  library(keras3)
   if (!is.numeric(data)) {
     stop("Input 'data' must be a numeric vector.")
   }
@@ -46,11 +49,7 @@ prepare_data_infected <- function(data) {
     result <- tensorflow::array_reshape(ans_array, dim = c(1, length(dprep), 1))
     return(result)
 
-  }, error = function(e) {
-    print("Error encountered:")
-    print(e)
-    return(e)
-  })
+  } , error = function(e) e)
 
   if (inherits(err, "error")) {
     return(err)
