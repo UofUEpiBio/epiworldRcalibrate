@@ -10,10 +10,10 @@
 #' @param ncores Integer. The number of cores to use for parallel processing.
 #' @return Executes the pipeline and generates plots.
 #' @export
-N=2e4
-n=5000
-ncores=20
-ndays=50
+# N=2e4
+# n=5000
+# ncores=20
+# ndays=50
 simulate_calibrate_sir<- function(N,n,ndays,ncores) {
   library(keras3)
   library(data.table)
