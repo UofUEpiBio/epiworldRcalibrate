@@ -2,18 +2,18 @@
 % Please edit documentation in R/generate_theta.R
 \name{generate_theta}
 \alias{generate_theta}
-\title{Generate Theta Parameters}
+\title{Generate Theta Parameters for SIR Model Simulation}
 \usage{
 generate_theta(N, n)
 }
 \arguments{
-\item{N}{Integer. Number of datasets to generate.}
+\item{N}{Integer. The number of parameter sets to generate.}
 
-\item{n}{Integer. Size of the population.}
+\item{n}{Integer. The population size for each simulation.}
 }
 \value{
-A \code{data.table} containing theta parameters.
+A data.table containing the generated parameters.
 }
 \description{
-Generates the theta parameters for the simulation pipeline.
+Generates a data table of parameters needed to simulate SIR models.
 }

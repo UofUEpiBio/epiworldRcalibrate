@@ -2,26 +2,26 @@
 % Please edit documentation in R/run_simulations.R
 \name{run_simulations}
 \alias{run_simulations}
-\title{Run Simulations}
+\title{Run SIR Model Simulations}
 \usage{
-run_simulations(N, n, ndays, ncores, theta, seeds)
+run_simulations(N, n, ndays, ncores, theta, seeds, path)
 }
 \arguments{
-\item{N}{Integer. Number of simulations to run.}
+\item{N}{Integer. The number of simulations to run.}
 
-\item{n}{Integer. Size of the population.}
+\item{n}{Integer. The population size for each simulation.}
 
-\item{ndays}{Integer. Number of days to simulate.}
+\item{ndays}{Integer. The number of days to simulate.}
 
-\item{ncores}{Integer. Number of cores for parallel execution.}
+\item{ncores}{Integer. The number of cores to use for parallel processing.}
 
-\item{theta}{A \code{data.table} of theta parameters.}
+\item{theta}{\code{data.table}. The parameters for the simulations.}
 
-\item{seeds}{Integer vector of seeds for reproducibility.}
+\item{seeds}{Integer vector. Random seeds for each simulation.}
 }
 \value{
-A list of simulation results.
+A list containing the simulation results as matrices.
 }
 \description{
-Runs the SIR-CONN simulations based on theta parameters.
+Runs SIR model simulations using the \code{epiworldR} package in parallel.
 }

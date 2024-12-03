@@ -1,18 +1,20 @@
-#' Generate Theta Parameters
+#' Generate Theta Parameters for SIR Model Simulation
 #'
-#' Generates the theta parameters for the simulation pipeline.
+#' @description
+#' Generates a data table of parameters needed to simulate SIR models.
 #'
-#' @param N Integer. Number of datasets to generate.
-#' @param n Integer. Size of the population.
-#' @return A `data.table` containing theta parameters.
+#' @param N Integer. The number of parameter sets to generate.
+#' @param n Integer. The population size for each simulation.
+#' @return A data.table containing the generated parameters.
 #' @export
 generate_theta <- function(N, n) {
+  library(data.table)
   set.seed(1231)
-  theta <- data.table(
+  theta <- data.table::data.table(
     preval = sample((100:2000) / n, N, TRUE),
-    crate  = rgamma(N, 5, 1),
-    ptran  = rbeta(N, 3, 7),
-    prec   = rbeta(N, 10, 10*2 - 10)
+    crate  = rgamma(N, 5, 1),    # Mean 5
+    ptran  = rbeta(N, 3, 7),     # Mean 0.3
+    prec   = rbeta(N, 10, 10)    # Mean 0.5
   )
   return(theta)
 }

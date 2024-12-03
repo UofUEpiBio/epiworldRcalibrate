@@ -1,18 +1,12 @@
-library(epiworldR)
-library(data.table)
-library(tensorflow)
-library(keras3)
-
-#' Prepare data for model analysis
+#' Prepare Data for TensorFlow Model: General SIR Data Preparation
 #'
-#' This function processes simulation output from epiworldR and prepares it for use in
-#' predictive modeling or analysis. It handles incidence data, reproductive numbers,
-#' and generation times.
+#' @param m An `epiworldR` model object.
+#' @param max_days The maximum number of days to consider for data preparation. Defaults to 50.
 #'
-#' @param m An epiworldR model object.
-#' @param max_days The maximum number of days to include in the output.
-#' @return An array containing processed simulation data.
+#' @return A reshaped array of processed data suitable for TensorFlow models. If an error occurs, it returns the error object.
+#'
 #' @export
+
 prepare_data <- function(m, max_days = 50) {
 
   err <- tryCatch({
@@ -26,14 +20,13 @@ prepare_data <- function(m, max_days = 50) {
     ans <- lapply(ans, data.table::as.data.table)
 
     # Replacing NaN and NAs with the previous value
-    ans$repnum[,
-               "avg" := data.table::nafill(.SD[[1L]], "locf"), by = "virus_id",
-               .SDcols = "avg"
-    ]
-    ans$gentime[,
-                "avg" := data.table::nafill(.SD[[1L]], "locf"), by = "virus_id",
-                .SDcols = "avg"
-    ]
+    # in each element in the list
+    # Replace NA values with the last observed value
+    ans$repnum$avg <- data.table::nafill(ans$repnum$avg, type = "locf")
+
+    # Replace NA values with the last observed value
+    ans$gentime$avg <- data.table::nafill(ans$gentime$avg, type = "locf")
+
 
     # Filtering up to max_days
     ans$repnum    <- ans$repnum[ans$repnum$date <= max_days,]
@@ -41,11 +34,14 @@ prepare_data <- function(m, max_days = 50) {
     ans$incidence <- ans$incidence[as.integer(rownames(ans$incidence)) <= (max_days + 1),]
 
     # Reference table for merging
+    # ndays <- epiworldR::get_ndays(m)
+
     ref_table <- data.table::data.table(
       date = 0:max_days
     )
 
-    # Replace $ with [[ ]] to avoid warnings
+    # Replace the $ with the [[ ]] to avoid the warning in the next
+    # two lines
     ans[["repnum"]] <- data.table::merge.data.table(
       ref_table, ans[["repnum"]], by = "date", all.x = TRUE
     )
@@ -53,9 +49,10 @@ prepare_data <- function(m, max_days = 50) {
       ref_table, ans[["gentime"]], by = "date", all.x = TRUE
     )
 
-    # Generating the arrays
+
+    # Generating the data.table with necessary columns
     ans <- data.table::data.table(
-      infected =  ans[["incidence"]][["Infected"]],
+      infected  = ans[["incidence"]][["Infected"]],
       recovered = ans[["incidence"]][["Recovered"]],
       repnum    = ans[["repnum"]][["avg"]],
       gentime   = ans[["gentime"]][["avg"]],
@@ -63,19 +60,12 @@ prepare_data <- function(m, max_days = 50) {
       gentime_sd = ans[["gentime"]][["sd"]]
     )
 
-    # Filling NAs with last observed value
-    ans[, "infected" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "infected"]
-    ans[, "recovered" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "recovered"]
-    ans[, "repnum" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "repnum"]
-    ans[, "gentime" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "gentime"]
-    ans[, "repnum_sd" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "repnum_sd"]
-    ans[, "gentime_sd" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "gentime_sd"]
+    # Replace NA values with the last observed value for all columns
+    nafill_cols <- c("infected", "recovered", "repnum", "gentime", "repnum_sd", "gentime_sd")
+
+    for (col in nafill_cols) {
+      ans[[col]] <- data.table::nafill(ans[[col]], type = "locf")
+    }
 
   }, error = function(e) e)
 
@@ -95,81 +85,70 @@ prepare_data <- function(m, max_days = 50) {
     abm_hist_feat,
     dim = c(1, dim(dprep))
   )
+
 }
 
-#' Prepare infections-only data
-#'
-#' Processes incidence data from epiworldR to extract only infection counts.
-#'
-#' @param m An epiworldR model object or data.table.
-#' @param ... Additional parameters passed to methods.
-#' @return An array containing processed infection data.
-#' @export
-prepare_data_infections_only <- function(m, ...) {
-  UseMethod("prepare_data_infections_only")
-}
 
-#' Method for epiworld model
-#'
-#' Prepares infections-only data specifically for an epiworldR model.
-#'
-#' @param m An epiworldR model object.
-#' @param ... Additional parameters.
-#' @export
-prepare_data_infections_only.epiworld_model <- function(m, ...) {
-  ans <- epiworldR::plot_incidence(m, plot = FALSE) |>
-    data.table::as.data.table()
 
-  prepare_data_infections_only.default(
-    m = ans,
-    ...
-  )
-}
-
-#' Default method for infections-only data
-#'
-#' Handles generic data for infections-only processing.
-#'
-#' @param m A data.table containing incidence data.
-#' @param max_days The maximum number of days to include in the output.
-#' @param ... Additional parameters.
-#' @return An array containing processed infection data.
-#' @export
-prepare_data_infections_only.default <- function(m, max_days = 50, ...) {
-
-  err <- tryCatch({
-    ans <- list(
-      incidence = data.table::data.table(Infected = m)
-    )
-
-    # Filtering up to max_days
-    ans$incidence <- ans$incidence[as.integer(rownames(ans$incidence)) <= (max_days + 1),]
-
-    # Generating the arrays
-    ans <- data.table::data.table(
-      infected = ans[["incidence"]][["Infected"]]
-    )
-
-    # Filling NAs with last observed value
-    ans[, "infected" := data.table::nafill(.SD[[1]], "locf"),
-        .SDcols = "infected"]
-
-  }, error = function(e) e)
-
-  # If there is an error, return NULL
-  if (inherits(err, "error")) {
-    return(err)
-  }
-
-  # Returning without the first observation (which is mostly zero)
-  dprep <- t(diff(as.matrix(ans[-1,])))
-
-  ans <- array(dim = c(1, dim(dprep)))
-  ans[1,,] <- dprep
-  abm_hist_feat <- ans
-
-  array_reshape(
-    abm_hist_feat,
-    dim = c(1, dim(dprep))
-  )
-}
+#
+# prepare_data_infections_only <- function(m, ...) {
+#   UseMethod("prepare_data_infectios_only")
+# }
+#
+# prepare_data_infections_only.epiworld_model <- function(m, ...) {
+#   ans <- epiworldR::plot_incidence(m, plot = FALSE) |>
+#     data.table::as.data.table()
+#
+#   prepare_data_infections_only.data.table(
+#     m = ans,
+#     ...
+#   )
+# }
+#
+# prepare_data_infections_only.default <- function(m, max_days = 50, ...) {
+#
+#   err <- tryCatch({
+#     ans <- list(
+#       incidence = data.table(Infected=m)
+#     )
+#
+#     # Replacing NaN and NAs with the previous value
+#     # in each element in the list
+#     # Filtering up to max_days
+#     ans$incidence <- ans$incidence[as.integer(rownames(ans$incidence)) <= (max_days + 1),]
+#
+#     # Reference table for merging
+#     # ndays <- epiworldR::get_ndays(m)
+#     ref_table <- data.table::data.table(
+#       date = 0:max_days
+#     )
+#
+#     # Generating the arrays
+#     ans <- data.table::data.table(
+#       infected =  ans[["incidence"]][["Infected"]]
+#     )
+#
+#     # Filling NAs with last obs
+#     ans[, "infected" := data.table::nafill(.SD[[1]], "locf"),
+#         .SDcols = "infected"]
+#
+#   }, error = function(e) e)
+#
+#   # If there is an error, return NULL
+#   if (inherits(err, "error")) {
+#     return(err)
+#   }
+#
+#   # Returning without the first observation (which is mostly zero)
+#   dprep <- t(diff(as.matrix(ans[-1,])))
+#
+#   ans <- array(dim = c(1, dim(dprep)))
+#   ans[1,,] <- dprep
+#   abm_hist_feat <- ans
+#
+#   array_reshape(
+#     abm_hist_feat,
+#     dim = c(1, dim(dprep))
+#   )
+#
+# }

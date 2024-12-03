@@ -2,40 +2,23 @@
 % Please edit documentation in R/filter_non_null.R
 \name{filter_non_null}
 \alias{filter_non_null}
-\title{Filter Out Null or NA Matrices}
+\title{Filter Non-Null Simulation Results}
 \usage{
 filter_non_null(matrices, theta)
 }
 \arguments{
-\item{matrices}{A list of matrices to be filtered.}
+\item{matrices}{List. The list of simulation result matrices.}
 
-\item{theta}{A data frame or matrix containing parameters corresponding to each matrix in \code{matrices}.}
+\item{theta}{\code{data.table}. The parameters corresponding to the simulations.}
 }
 \value{
 A list containing:
 \describe{
-\item{\code{matrices}}{A filtered list of matrices without errors or \code{NA} values.}
-\item{\code{theta}}{The corresponding \code{theta} parameters for the filtered matrices.}
-\item{\code{N}}{An integer indicating the number of matrices after filtering.}
+\item{matrices}{The filtered list of matrices.}
+\item{theta}{The filtered parameters.}
+\item{N}{The updated number of simulations.}
 }
 }
 \description{
-This function filters out matrices that are either errors or contain any \code{NA} values from a list of matrices.
-It also filters the corresponding \code{theta} parameters to match the filtered matrices.
-}
-\examples{
-# Create a list of matrices, some with errors and NAs
-matrices <- list(
-  matrix(1:4, nrow = 2),
-  simpleError("Error in simulation"),
-  matrix(c(1, NA, 3, 4), nrow = 2)
-)
-theta <- data.frame(param1 = c(0.1, 0.2, 0.3))
-
-# Filter out invalid matrices
-result <- filter_non_null(matrices, theta)
-print(result$matrices)
-print(result$theta)
-print(result$N)
-
+Filters out simulations that resulted in errors or contain \code{NA} values.
 }

@@ -1,20 +1,27 @@
-Package: myfirst.package
+Package: epiworldRcalibrate
 Title: Calibration with CNN
-Version: 0.0.0.9000
+Version: 0.0.1
 Authors@R: 
     person("First", "Last", , "first.last@example.com", role = c("aut", "cre"),
            comment = c(ORCID = "YOUR-ORCID-ID"))
-Description: Calibration with CNN
+Description: Provides functions for calibration using Convolutional Neural Networks (CNN).
+    The package includes methods for generating simulated data, training CNN models,
+    and evaluating the calibration results.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
 Suggests: 
+    knitr,
+    rmarkdown,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
 Imports:
     epiworldR,
     data.table,
     tensorflow,
-    keras3
-
+    parallel,
+    keras3,
+    dplyr,
+    ggplot2 (>= 3.4.0)
+VignetteBuilder: knitr
