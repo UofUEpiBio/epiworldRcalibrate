@@ -7,7 +7,7 @@
 #'
 #' @export
 
-prepare_data <- function(m, max_days = 50) {
+prepare_data <- function(m, max_days =max_days) {
 
   err <- tryCatch({
     ans <- list(

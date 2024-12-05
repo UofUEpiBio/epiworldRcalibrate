@@ -56,7 +56,7 @@ calibrate_sir <- function(data) {
   ans <- tensorflow::array_reshape(ans, dim = c(1, 1, a, 1))  # Reshape for the model
 
   # Determine model file path
-  model_path <- if (a <= 30) {
+  model_path <- if (a <= 31) {
     system.file("models", "sir30-cnn.keras", package = "epiworldRcalibrate")
   } else {
     system.file("models", "sir60-cnn.keras", package = "epiworldRcalibrate")

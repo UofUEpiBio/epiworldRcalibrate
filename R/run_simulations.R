@@ -13,7 +13,7 @@
 #' @return A list containing the simulation results as matrices.
 #' @export
 
-run_simulations <- function(N, n, ndays, ncores, theta, seeds,path) {
+run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
   library(epiworldR)
   matrices <- parallel::mclapply(1:N, FUN = function(i) {
     set.seed(seeds[i])
@@ -28,7 +28,7 @@ run_simulations <- function(N, n, ndays, ncores, theta, seeds,path) {
 
     verbose_off(m)
     run(m, ndays = ndays)
-    ans <- prepare_data(m)
+    ans <- prepare_data(m,max_days=ndays)
 
     return(ans)
   }, mc.cores = ncores)
