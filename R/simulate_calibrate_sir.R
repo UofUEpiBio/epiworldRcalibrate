@@ -14,7 +14,7 @@
 # n=5000
 # ncores=20
 # ndays=50
-simulate_calibrate_sir<- function(N,n,ndays,ncores) {
+simulate_calibrate_sir<- function(N,n,ndays,ncores,epochs,verbose) {
   library(keras3)
   library(data.table)
   library(tensorflow)
@@ -35,7 +35,7 @@ simulate_calibrate_sir<- function(N,n,ndays,ncores) {
 
   path="~/epiworldRcalibrate/misc/simulated_data/sir-%06i.rds"
   # Run simulations
-  matrices <- run_simulations(N, n, ndays, ncores, theta,seeds,path)
+  matrices <- run_simulations(N, n, ndays, ncores, theta,seeds)
 
   # Filter non-null elements
   filtered_data <- filter_non_null(matrices, theta)
@@ -61,7 +61,7 @@ simulate_calibrate_sir<- function(N,n,ndays,ncores) {
 
   # Build and train the CNN model
   model <- build_cnn_model(dim(arrays_1d)[-1], ncol(theta2))
-  train_model(model, train)
+  train_model(model, train,epochs=epochs,verbose=verbose)
 
   # Evaluate the model
   eval_results <- evaluate_model(model, test, theta)

@@ -8,7 +8,7 @@
 #' @param epochs Integer. The number of epochs for training.
 #' @return The trained model (updated in place).
 #' @export
-train_model <- function(model, train_data, epochs = 100) {
+train_model <- function(model, train_data, epochs = epochs,verbose=verbose) {
   tensorflow::set_random_seed(331)
-  model %>% keras3::fit(train_data$x, train_data$y, epochs = epochs, verbose = 2)
+  model %>% keras3::fit(train_data$x, train_data$y, epochs = epochs, verbose = verbose)
 }
