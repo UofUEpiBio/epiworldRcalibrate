@@ -221,10 +221,7 @@ data=incidence$Infected
 # Save theta and simulations data
 theta2 <-as.data.table(copy(theta))
 theta2$crate <- plogis(theta2$crate / 10)
-
-
 result=calibrate_sir(data)
-plot(m)
 ```
 
 The output of `calibrate_sir` will include predicted values such as `preval` (prevalence), `crate` (case rate), `ptran` (transmission probability), and `prec` (precision).
@@ -245,10 +242,8 @@ comparison <- data.frame(rbind(
 rownames(comparison)=c("Actual", "Predicted", "MAE")
 print(comparison)
 ```
-
+Now, I want to compare the plots of SIR model with predicted values and actual values:
 ```{r}
-predicted$preval
-param=c(result$pred)
 m2 <- epiworldR:: ModelSIRCONN(
   "mycon",
   prevalence        = predicted$preval,
@@ -260,7 +255,15 @@ m2 <- epiworldR:: ModelSIRCONN(
 
 verbose_off(m2)
 run(m2, ndays = ndays)
-plot(m2)
+# Set up the plotting area to have 1 row and 2 columns
+par(mfrow = c(1, 2))
+
+# Plot with predicted parameters
+plot(m2, main = "SIR Predicted Parameters")
+
+# Plot with actual parameters
+plot(m, main = "SIR Actual Parameters")
+
 ```
 
 ```{r}
