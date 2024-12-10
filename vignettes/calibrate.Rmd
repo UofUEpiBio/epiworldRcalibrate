@@ -244,10 +244,14 @@ print(comparison)
 ```
 Now, I want to compare the plots of SIR model with predicted values and actual values:
 ```{r}
+# Apply reverse logistic transformation to theta2$crate / 10
+predicted$new <- exp(predicted$crate / 10) / (1 + exp(predicted$crate / 10))
+
+
 m2 <- epiworldR:: ModelSIRCONN(
   "mycon",
   prevalence        = predicted$preval,
-  contact_rate      = predicted$crate,
+  contact_rate      = predicted$new,
   transmission_rate = predicted$ptran,
   recovery_rate     = predicted$prec,
   n                 = n
@@ -255,13 +259,9 @@ m2 <- epiworldR:: ModelSIRCONN(
 
 verbose_off(m2)
 run(m2, ndays = ndays)
-# Set up the plotting area to have 1 row and 2 columns
 par(mfrow = c(1, 2))
 
-# Plot with predicted parameters
 plot(m2, main = "SIR Predicted Parameters")
-
-# Plot with actual parameters
 plot(m, main = "SIR Actual Parameters")
 
 ```
