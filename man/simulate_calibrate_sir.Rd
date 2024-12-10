@@ -4,7 +4,7 @@
 \alias{simulate_calibrate_sir}
 \title{simulate calibrate sir Function}
 \usage{
-simulate_calibrate_sir(N, n, ndays, ncores)
+simulate_calibrate_sir(N, n, ndays, ncores, epochs, verbose)
 }
 \arguments{
 \item{N}{Integer. The number of simulations to run.}

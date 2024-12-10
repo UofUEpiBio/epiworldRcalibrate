@@ -4,7 +4,7 @@
 \alias{run_simulations}
 \title{Run SIR Model Simulations}
 \usage{
-run_simulations(N, n, ndays, ncores, theta, seeds, path)
+run_simulations(N, n, ndays, ncores, theta, seeds)
 }
 \arguments{
 \item{N}{Integer. The number of simulations to run.}
