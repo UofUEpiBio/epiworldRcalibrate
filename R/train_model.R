@@ -6,6 +6,7 @@
 #' @param model Keras model. The compiled model to be trained.
 #' @param train_data List. A list containing training data (`x` and `y`).
 #' @param epochs Integer. The number of epochs for training.
+#' @param verbose Integer. 0 shows the result of training and 2 doesnt.
 #' @return The trained model (updated in place).
 #' @export
 train_model <- function(model, train_data, epochs = epochs,verbose=verbose) {

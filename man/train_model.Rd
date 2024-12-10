@@ -12,6 +12,8 @@ train_model(model, train_data, epochs = epochs, verbose = verbose)
 \item{train_data}{List. A list containing training data (\code{x} and \code{y}).}
 
 \item{epochs}{Integer. The number of epochs for training.}
+
+\item{verbose}{Integer. 0 shows the result of training and 2 doesnt.}
 }
 \value{
 The trained model (updated in place).
