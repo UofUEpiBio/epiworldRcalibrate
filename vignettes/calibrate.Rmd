@@ -81,6 +81,8 @@ head(seeds,5)
 Next, the function runs the simulations for the SIR model using the generated parameters and seeds and using epiworldR package:
 
 ```{r}
+N=10
+n=5000
 ndays=50
 ncores=20
 matrices <- run_simulations(N, n, ndays, ncores, theta, seeds)
