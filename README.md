@@ -21,14 +21,16 @@ library(tensorflow)
 library(reticulate)
 reticulate::import("numpy")
 library(epiworldRcalibrate)
-
+```
+```{r}
 N <- 2e4
 n <- 5000
 ndays <- 50
 ncores <- 20
 epochs <- 2
 verbose <- 2
-
+```
+```{r}
 simulate_calibrate_sir <- function(N, n, ndays, ncores, epochs, verbose) {
   # ⚙️ Generate Theta and Seeds
   theta <- generate_theta(N, n)
@@ -72,16 +74,8 @@ simulate_calibrate_sir(N, n, ndays, ncores, epochs, verbose)
 ### 🔧 calibrate_sir()
 
 This function is used to predict SIR model parameters based on input data. It takes as input a numeric matrix or array containing counts of infected individuals over a period of 30 or 60 days and returns predicted values for parameters like prevalence, contact rate, transmission probability, and precision.
-
-```{r}
 # 📌 Example usage of calibrate_sir function
-library(epiworldR)
-library(keras3)
-library(tensorflow)
-library(reticulate)
-reticulate::import("numpy")
-library(epiworldRcalibrate)
-
+```{r}
 N <- 1
 n <- 5000
 set.seed(123)
@@ -108,8 +102,10 @@ data <- incidence$Infected
 # 💾 Save theta and simulations data
 theta2 <- as.data.table(copy(theta))
 theta2$crate <- plogis(theta2$crate / 10)
+```
 
 # 🔧 Calibrate SIR model
+```{r}
 result <- calibrate_sir(data)
 print(result)
 ```
