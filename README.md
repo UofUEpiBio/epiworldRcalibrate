@@ -1,5 +1,5 @@
 
-## 📊 simulate_calibrate_sir() and 🔧 calibrate_sir()
+## 🚀 simulate_calibrate_sir() and 🔧 calibrate_sir()
 
 ### ✍️ Authors: George Vega Yon, Sima NJF
 # 🌍 Introduction
