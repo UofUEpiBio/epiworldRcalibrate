@@ -10,6 +10,9 @@
 #' @param ncores Integer. The number of cores to use for parallel processing.
 #' @param theta `data.table`. The parameters for the simulations.
 #' @param seeds Integer vector. Random seeds for each simulation.
+#' @importFrom parallel makeCluster stopCluster clusterExport clusterEvalQ parLapply mclapply
+#' @importFrom epiworldR run verbose_off
+#' @importFrom data.table as.data.table dcast melt
 #' @return A list containing the simulation results as matrices.
 #' @export
 

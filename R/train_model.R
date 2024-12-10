@@ -11,5 +11,5 @@
 #' @export
 train_model <- function(model, train_data, epochs = epochs,verbose=verbose) {
   tensorflow::set_random_seed(331)
-  model %>% keras3::fit(train_data$x, train_data$y, epochs = epochs, verbose = verbose)
+  model |> keras3::fit(train_data$x, train_data$y, epochs = epochs, verbose = verbose)
 }

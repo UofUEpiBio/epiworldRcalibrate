@@ -10,6 +10,7 @@
 #' @param ncores Integer. The number of cores to use for parallel processing.
 #' @param epochs Integer. The number of training.
 #' @param verbose Integer. 0 shows the result of training and 2 doesnt.
+#' @importFrom data.table copy
 #' @return Executes the pipeline and generates plots.
 #' @export
 # N=2e4
