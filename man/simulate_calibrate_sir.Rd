@@ -14,6 +14,10 @@ simulate_calibrate_sir(N, n, ndays, ncores, epochs, verbose)
 \item{ndays}{Integer. The number of days to simulate.}
 
 \item{ncores}{Integer. The number of cores to use for parallel processing.}
+
+\item{epochs}{Integer. The number of training.}
+
+\item{verbose}{Integer. 0 shows the result of training and 2 doesnt.}
 }
 \value{
 Executes the pipeline and generates plots.

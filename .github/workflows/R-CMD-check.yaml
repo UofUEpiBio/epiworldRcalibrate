@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - {os: macos-latest,   r: 'release'}
+          - {os: macos-12,   r: 'release'}
           - {os: windows-latest, r: 'release'}
           - {os: ubuntu-latest,   r: 'devel', http-user-agent: 'release'}
           - {os: ubuntu-latest,   r: 'release'}
@@ -27,6 +27,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set TAR options to suppress warnings
+        run: echo "TAR=tar --no-same-owner" >> $GITHUB_ENV
 
       - uses: r-lib/actions/setup-pandoc@v2
 
