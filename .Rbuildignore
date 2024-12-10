@@ -7,3 +7,5 @@
 =======
 ^misc$
 >>>>>>> b1fce5ac678b1f125c0aa460a8145c4686616376
+README.Rmd
+^.*\\.Rproj$
