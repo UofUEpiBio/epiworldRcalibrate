@@ -7,6 +7,6 @@
 # * https://testthat.r-lib.org/articles/special-files.html
 
 library(testthat)
-library(myfirst.package)
+library(epiworldRcalibrate)
 
-test_check("myfirst.package")
+test_check("epiworldRcalibrate")

@@ -4,7 +4,7 @@
 \alias{train_model}
 \title{Train the CNN Model}
 \usage{
-train_model(model, train_data, epochs = 100)
+train_model(model, train_data, epochs = epochs, verbose = verbose)
 }
 \arguments{
 \item{model}{Keras model. The compiled model to be trained.}

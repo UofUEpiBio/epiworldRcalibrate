@@ -18,19 +18,23 @@ The vignette guides you through the different stages of the function, including 
 ## Prerequisites
 
 Ensure that the following libraries are installed and loaded:
-
-```{r}
-library(epiworldRcalibrate)
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  eval = FALSE, # Globally disables evaluation of all chunks
+  echo = TRUE   # Shows code in the vignette but does not run it
+)
 ```
+
+
 
 ```{r}
 library(epiworldR)
-library(epiworldRcalibrate)
 library(keras3)
 library(data.table)
 library(tensorflow)
 library(reticulate)
 reticulate::import("numpy")
+library(epiworldRcalibrate)
 ```
 
 # Function Overview
