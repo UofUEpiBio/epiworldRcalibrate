@@ -10,6 +10,10 @@
 #' @param MAEs Numeric vector. The Mean Absolute Errors for each output variable.
 #' @param N Integer. Total number of simulations.
 #' @param N_train Integer. Number of training examples.
+#' @importFrom dplyr mutate row_number
+#' @importFrom ggplot2 aes geom_boxplot geom_point facet_wrap labs geom_abline
+#' @importFrom keras3 array_reshape
+#' @importFrom data.table dcast melt
 #' @return Generates plots (displayed on the active graphics device).
 #' @export
 
@@ -19,11 +23,11 @@ plot_results <- function(pred, test_data, theta, MAEs, N, N_train) {
   library(ggplot2)
 
   # Add an 'id' column
-  pred <- pred %>%
+  pred <- pred |>
     mutate(id = row_number())
 
   # Modify the 'crate' column
-  pred <- pred %>%
+  pred <- pred |>
     mutate(crate = qlogis(crate) * 10)
 
   pred_long <- melt(pred, id.vars = "id")
