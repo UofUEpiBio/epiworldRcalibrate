@@ -224,6 +224,7 @@ theta2$crate <- plogis(theta2$crate / 10)
 
 
 result=calibrate_sir(data)
+plot(m)
 ```
 
 The output of `calibrate_sir` will include predicted values such as `preval` (prevalence), `crate` (case rate), `ptran` (transmission probability), and `prec` (precision).
@@ -243,6 +244,23 @@ comparison <- data.frame(rbind(
 ))
 rownames(comparison)=c("Actual", "Predicted", "MAE")
 print(comparison)
+```
+
+```{r}
+predicted$preval
+param=c(result$pred)
+m2 <- epiworldR:: ModelSIRCONN(
+  "mycon",
+  prevalence        = predicted$preval,
+  contact_rate      = predicted$crate,
+  transmission_rate = predicted$ptran,
+  recovery_rate     = predicted$prec,
+  n                 = n
+)
+
+verbose_off(m2)
+run(m2, ndays = ndays)
+plot(m2)
 ```
 
 ```{r}
