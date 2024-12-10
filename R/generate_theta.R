@@ -5,6 +5,7 @@
 #'
 #' @param N Integer. The number of parameter sets to generate.
 #' @param n Integer. The population size for each simulation.
+#' @importFrom stats plogis predict qlogis rbeta rgamma
 #' @return A data.table containing the generated parameters.
 #' @export
 generate_theta <- function(N, n) {
