@@ -15,59 +15,58 @@
 
 run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
   library(epiworldR)
-  matrices <- parallel::mclapply(1:N, FUN = function(i) {
-    set.seed(seeds[i])
-    m <- epiworldR:: ModelSIRCONN(
-      "mycon",
-      prevalence        = theta$preval[i],
-      contact_rate      = theta$crate[i],
-      transmission_rate = theta$ptran[i],
-      recovery_rate     = theta$prec[i],
-      n                 = n
-    )
+  library(parallel)
 
-    verbose_off(m)
-    run(m, ndays = ndays)
-    ans <- prepare_data(m,max_days=ndays)
+  # Detect the operating system
+  os_type <- .Platform$OS.type
 
-    return(ans)
-  }, mc.cores = ncores)
+  if (os_type == "windows") {
+    # Use parLapply for Windows
+    cl <- makeCluster(ncores)
+    on.exit(stopCluster(cl)) # Ensure the cluster is stopped after use
+
+    clusterExport(cl, varlist = c("theta", "n", "ndays", "seeds", "prepare_data"), envir = environment())
+    clusterEvalQ(cl, library(epiworldR)) # Load necessary libraries on workers
+
+    matrices <- parLapply(cl, 1:N, function(i) {
+      set.seed(seeds[i])
+      m <- epiworldR::ModelSIRCONN(
+        "mycon",
+        prevalence        = theta$preval[i],
+        contact_rate      = theta$crate[i],
+        transmission_rate = theta$ptran[i],
+        recovery_rate     = theta$prec[i],
+        n                 = n
+      )
+
+      verbose_off(m)
+      run(m, ndays = ndays)
+      ans <- prepare_data(m, max_days = ndays)
+
+      return(ans)
+    })
+
+  } else {
+    # Use mclapply for macOS/Linux
+    matrices <- mclapply(1:N, function(i) {
+      set.seed(seeds[i])
+      m <- epiworldR::ModelSIRCONN(
+        "mycon",
+        prevalence        = theta$preval[i],
+        contact_rate      = theta$crate[i],
+        transmission_rate = theta$ptran[i],
+        recovery_rate     = theta$prec[i],
+        n                 = n
+      )
+
+      verbose_off(m)
+      run(m, ndays = ndays)
+      ans <- prepare_data(m, max_days = ndays)
+
+      return(ans)
+    }, mc.cores = ncores)
+  }
 
   return(matrices)
 }
-
-
-
-# run_simulations <- function(N, n, ndays, ncores, theta) {
-#   matrices <- parallel::mclapply(1:N, FUN = function(i) {
-#     fn <- sprintf("~/myfisrt.package/misc/simulated_data/sir-%06i.rds", i)
-#
-#     if (file.exists(fn))
-#       return(readRDS(fn))
-#     seeds <- sample.int(.Machine$integer.max, N, TRUE)
-#     set.seed(seeds[i])
-#
-#     m <- ModelSIRCONN(
-#       "mycon",
-#       prevalence        = theta$preval[i],
-#       contact_rate      = theta$crate[i],
-#       transmission_rate = theta$ptran[i],
-#       recovery_rate     = theta$prec[i],
-#       n                 = n
-#     )
-#
-#     verbose_off_and_run(m, ndays)
-#     ans <- prepare_data(m)
-#     saveRDS(ans, fn)
-#
-#     return(ans)
-#   }, mc.cores = ncores)
-#
-#   return(matrices)
-# }
-# run_simulations(2e4,5000,50,20,theta)
-#path="~/myfisrt.package/misc/simulated_data/sir-%06i.rds"
-# source("~/myfisrt.package/R/dataprep.R")
-# Input dataset as a vector
-
 
