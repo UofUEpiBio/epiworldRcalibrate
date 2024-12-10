@@ -44,7 +44,6 @@
 #
 #   return(list(pred = pred))
 # }
-
 calibrate_sir <- function(data) {
   # Load required libraries
   library(tensorflow)
@@ -75,8 +74,6 @@ calibrate_sir <- function(data) {
     data.table::as.data.table() |>
     data.table::setnames(c("preval", "crate", "ptran", "prec"))
 
-  # Apply the logistic transformation to the 'crate' column
-  pred$crate <- qlogis(pred$crate)
 
   # Return predictions as a list
   return(list(pred = pred))

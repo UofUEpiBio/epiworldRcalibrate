@@ -21,11 +21,16 @@ Ensure that the following libraries are installed and loaded:
 
 ```{r}
 library(epiworldRcalibrate)
+```
+
+```{r}
+library(epiworldR)
+library(epiworldRcalibrate)
 library(keras3)
 library(data.table)
 library(tensorflow)
 library(reticulate)
-library()
+reticulate::import("numpy")
 ```
 
 # Function Overview
@@ -74,8 +79,7 @@ Next, the function runs the simulations for the SIR model using the generated pa
 ```{r}
 ndays=50
 ncores=20
-path = "~/epiworldRcalibrate/misc/simulated_data/sir-%06i.rds"
-matrices <- run_simulations(N, n, ndays, ncores, theta, seeds, path)
+matrices <- run_simulations(N, n, ndays, ncores, theta, seeds)
 matrices[[1]][1,,] 
 ```
 
@@ -113,7 +117,7 @@ head(arrays_1d[,,1])
 
 -   `prepare_data_for_tensorflow()`: Reshapes the simulated data into the format required for TensorFlow training.
 
-## 5. Split Data into Training and Testing Sets
+The transformation is essential because contact rate (crate) originally has values greater than 0, and the CNN expects normalized values between 0 and 1 for effective training. By scaling (crate / 10) and then applying the logistic transformation (plogis()), we ensure that the contact rate is expressed as a probability, which is easier for the CNN to handle and learn from. \## 5. Split Data into Training and Testing Sets
 
 The dataset is split into training and testing sets to evaluate the model's performance: (our default is to use 70% of the data as train and 30% as test)
 
@@ -131,11 +135,13 @@ The Convolutional Neural Network (CNN) model is built and trained on the simulat
 
 ```{r}
 model <- build_cnn_model(dim(arrays_1d)[-1], ncol(theta))
-train_model(model, train)
+train_model(model, train, epochs=2, verbose=1)
 ```
 
 -   `build_cnn_model()`: Builds a CNN model with input dimensions based on the simulation data.
 -   `train_model()`: Trains the model using the training dataset.
+    -   `epochs`: The number of times the learning algorithm will work through the entire training dataset.
+    -   `verbose`: Controls the level of logging output during training, where `0` is silent, `1` shows progress bars, and `2` displays one line per epoch.
 
 ## 7. Evaluate the Model
 
@@ -159,6 +165,18 @@ print(head(pred,10))
 print(MAEs)
 ```
 
+These was all the steps behind the `simulate_calibrate_sir` function but you can just call this function and see results:(it may take 2 minutes)
+
+```{r}
+N=2e4
+n=5000
+ndays=50
+epochs=100
+ncores=20
+verbose=2
+simulate_calibrate_sir(N,n,ndays,ncores,epochs,verbose)
+```
+
 # Conclusion
 
 The `simulate_calibrate_sir` function provides a comprehensive workflow to generate, simulate, and calibrate an SIR model using deep learning. It leverages TensorFlow and Keras to create a powerful calibration model, and it offers valuable insights into how well a CNN can learn the dynamics of a simulated epidemic.
@@ -167,56 +185,96 @@ The workflow covers all aspects of data simulation, processing, and model traini
 
 Feel free to modify and extend the function based on your specific requirements.
 
-#  Section 2: See the Calibration
+# Section 2: See the Calibration
 
-After running the simulation and calibration of the SIR model, it is essential to examine the calibration results to understand how well the model performed. The following steps can be taken to see the calibration:
+After running the simulation and calibration of the SIR model, it is essential to examine the calibration results to understand how well the model performed.
 
-Predict Parameters Using CNN Model: After training the Convolutional Neural Network (CNN) model, you can use the calibrate_sir(data) function to predict the parameters of the SIR model based on input data. The data parameter should be a numeric matrix or array containing counts of infected individuals over a period of 30 or 60 days.
+The following steps can be taken to see the calibration:
+
+**Predict Parameters Using CNN Model:** After training the Convolutional Neural Network (CNN) model, you can use the `calibrate_sir(data)` function to predict the parameters of the SIR model based on input data. The `data` parameter should be a numeric matrix or array containing counts of infected individuals over a period of 30 or 60 days.
 
 ```{r}
 N=1
 n=5000
 set.seed(123)
 theta <- generate_theta(N, n)
-  
+ncores=20
+ndays=60
+seeds=123
 
-  
+# Run simulations
+i=1
+m <- epiworldR:: ModelSIRCONN(
+  "mycon",
+  prevalence        = theta$preval[i],
+  contact_rate      = theta$crate[i],
+  transmission_rate = theta$ptran[i],
+  recovery_rate     = theta$prec[i],
+  n                 = n
+)
 
-  path="~/epiworldRcalibrate/misc/simulated_data/sir-%06i.rds"
-  # Run simulations
-  matrices <- run_simulations(N, n, ndays, ncores, theta,seeds,path)
+verbose_off(m)
+run(m, ndays = ndays)
+incidence = epiworldR::plot_incidence(m, plot = FALSE)
+data=incidence$Infected
 
-  # Filter non-null elements
-  filtered_data <- filter_non_null(matrices, theta)
-  matrices <- filtered_data$matrices
-  theta <- filtered_data$theta
-  N <- filtered_data$N
-
-  # Prepare data for TensorFlow
-  arrays_1d <- prepare_data_for_tensorflow(matrices, N)
-arrays_1d <- arrays_1d[,1,,drop=FALSE]
-N     <- dim(arrays_1d)[1]
-
-  # Save theta and simulations data
-  theta2 <-as.data.table(copy(theta))
-  theta2$crate <- plogis(theta2$crate / 10)
-
+# Save theta and simulations data
+theta2 <-as.data.table(copy(theta))
+theta2$crate <- plogis(theta2$crate / 10)
 
 
+result=calibrate_sir(data)
 ```
 
-The output of calibrate_sir will include predicted values such as preval (prevalence), crate (case rate), ptran (transmission probability), and prec (precision).
+The output of `calibrate_sir` will include predicted values such as `preval` (prevalence), `crate` (case rate), `ptran` (transmission probability), and `prec` (precision).
 
-Evaluate Calibration Accuracy: To evaluate how well the calibration has worked, you can compare the predicted parameters with the true parameters that were used to generate the simulation. You can use metrics such as Mean Absolute Error (MAE) or Root Mean Square Error (RMSE) to measure the accuracy of the predictions.
+**Evaluate Calibration Accuracy:** To evaluate how well the calibration has worked, you can compare the predicted parameters with the true parameters that were used to generate the simulation. You can use metrics such as Mean Absolute Error (MAE) or Root Mean Square Error (RMSE) to measure the accuracy of the predictions.
 
 ```{r}
 # Assuming you have a set of true parameters for comparison
-true_params <- c(preval = 0.12, crate = 5, ptran = 0.2, prec = 0.5)
-predicted_params <- result$pred
+predicted <- result$pred  # Replace with actual column name for predictions
+actual <- theta2  # Assuming 'data' contains the actual infected numbers
+MAE=abs((predicted-actual))
+# Combine actual and predicted values into a data table
+comparison <- data.frame(rbind(
+  Actual = actual,
+  Predicted = predicted,
+  MAE=MAE
+))
+rownames(comparison)=c("Actual", "Predicted", "MAE")
+print(comparison)
+```
 
-# Calculate Mean Absolute Error (MAE)
-mae <- mean(abs(true_params - unlist(predicted_params)))
-print(paste("Mean Absolute Error (MAE):", mae))
+```{r}
+# Plot the predicted vs actual values
+library(ggplot2)
+library(ggrepel)
+ggplot(comparison, aes(x = Actual, y = Predicted, label = Parameter)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(aes(color = Parameter), size = 4) +
+  geom_text_repel(size = 4, max.overlaps = 20) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Calibration of SIR Model Parameters",
+    subtitle = "Comparing Predicted vs. Actual Values",
+    x = "Actual Values",
+    y = "Predicted Values",
+    color = "Parameter"
+  ) +
+  theme_light(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "bottom"
+  )
+comparison <- data.frame(
+  Parameter = c("Prevalence", "Contact Rate", "Transmission", "Recovery Rate"),
+  Predicted = unlist(predicted),
+  Actual = unlist(actual)
+)
+
+
+
 ```
 
 # References
@@ -224,6 +282,7 @@ print(paste("Mean Absolute Error (MAE):", mae))
 -   [Keras Documentation](https://keras.rstudio.com/)
 -   [TensorFlow for R](https://tensorflow.rstudio.com/)
 -   [Epidemiology Models in R](https://CRAN.R-project.org/)
+-   [epiworld on GitHub](https://github.com/UofUEpiBio/epiworld)
 
 # Session Info
 
