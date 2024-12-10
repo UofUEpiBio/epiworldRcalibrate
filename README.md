@@ -17,6 +17,8 @@ This function simulates and calibrates an SIR (Susceptible-Infected-Recovered) m
 - `n`: Population size
 - `ndays`: Number of days to simulate
 - `ncores`: Number of cores for parallel processing
+- `verbose`:0 for seeing the results and 2 for not seeing the result of training.
+- `epochs`: Number of time of training the model.
 
 ```{r}
 # 📌 Example usage of simulate_calibrate_sir function
