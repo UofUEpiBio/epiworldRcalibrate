@@ -15,9 +15,9 @@ simulate_calibrate_sir(N, n, ndays, ncores, epochs, verbose)
 
 \item{ncores}{Integer. The number of cores to use for parallel processing.}
 
-\item{epochs}{Integer. The number of training.}
+\item{epochs}{Integer. The number of training epochs.}
 
-\item{verbose}{Integer. 0 shows the result of training and 2 doesnt.}
+\item{verbose}{Integer. Verbosity mode for training. 0 shows training output, 2 doesn't.}
 }
 \value{
 Executes the pipeline and generates plots.

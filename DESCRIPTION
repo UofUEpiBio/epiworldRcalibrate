@@ -24,5 +24,6 @@ Imports:
     keras3,
     dplyr,
     ggplot2 (>= 3.4.0),
-    stats
+    stats,
+    reticulate
 VignetteBuilder: knitr

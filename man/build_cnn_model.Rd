@@ -15,5 +15,5 @@ build_cnn_model(input_shape, output_units)
 A compiled Keras model ready for training.
 }
 \description{
-Constructs and compiles a CNN model using the \code{keras} package.
+Constructs and compiles a CNN model using the \code{keras3} package.
 }

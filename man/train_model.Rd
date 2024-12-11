@@ -4,7 +4,7 @@
 \alias{train_model}
 \title{Train the CNN Model}
 \usage{
-train_model(model, train_data, epochs = epochs, verbose = verbose)
+train_model(model, train_data, epochs, verbose)
 }
 \arguments{
 \item{model}{Keras model. The compiled model to be trained.}
@@ -13,7 +13,7 @@ train_model(model, train_data, epochs = epochs, verbose = verbose)
 
 \item{epochs}{Integer. The number of epochs for training.}
 
-\item{verbose}{Integer. 0 shows the result of training and 2 doesnt.}
+\item{verbose}{Integer. Verbosity mode for training output.}
 }
 \value{
 The trained model (updated in place).

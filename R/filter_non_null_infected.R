@@ -16,11 +16,10 @@
 #' The function then returns the filtered matrices and their count.
 #'
 #' @export
-
 filter_non_null_infected <- function(matrices) {
   is_not_null <- intersect(
     which(!sapply(matrices, inherits, what = "error")),
-    which(!sapply(matrices, \(x) any(is.na(x))))
+    which(!sapply(matrices, function(x) any(is.na(x))))
   )
 
   matrices <- matrices[is_not_null]
