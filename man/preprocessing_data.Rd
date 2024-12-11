@@ -23,6 +23,4 @@ The function performs the following steps:
 \item Filters the data using \code{filter_non_null_infected()} to exclude missing or invalid values.
 \item Extracts and reshapes the data into a one-column matrix format.
 }
-
-The function is designed to handle sequential data and prepare it for further processing in machine learning workflows.
 }

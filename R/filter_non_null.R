@@ -15,7 +15,7 @@
 filter_non_null <- function(matrices, theta) {
   is_not_null <- intersect(
     which(!sapply(matrices, inherits, what = "error")),
-    which(!sapply(matrices, \(x) any(is.na(x))))
+    which(!sapply(matrices, function(x) any(is.na(x))))
   )
 
   matrices <- matrices[is_not_null]

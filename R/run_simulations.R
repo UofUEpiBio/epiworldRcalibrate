@@ -1,4 +1,3 @@
-
 #' Run SIR Model Simulations
 #'
 #' @description
@@ -11,27 +10,24 @@
 #' @param theta `data.table`. The parameters for the simulations.
 #' @param seeds Integer vector. Random seeds for each simulation.
 #' @importFrom parallel makeCluster stopCluster clusterExport clusterEvalQ parLapply mclapply
-#' @importFrom epiworldR run verbose_off
+#' @importFrom epiworldR run verbose_off ModelSIRCONN
 #' @importFrom data.table as.data.table dcast melt
 #' @return A list containing the simulation results as matrices.
 #' @export
-
 run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
-  library(epiworldR)
-  library(parallel)
-
-  # Detect the operating system
   os_type <- .Platform$OS.type
 
   if (os_type == "windows") {
-    # Use parLapply for Windows
-    cl <- makeCluster(ncores)
-    on.exit(stopCluster(cl)) # Ensure the cluster is stopped after use
+    cl <- parallel::makeCluster(ncores)
+    on.exit(parallel::stopCluster(cl))
 
-    clusterExport(cl, varlist = c("theta", "n", "ndays", "seeds", "prepare_data"), envir = environment())
-    clusterEvalQ(cl, library(epiworldR)) # Load necessary libraries on workers
+    parallel::clusterExport(cl, varlist = c("theta", "n", "ndays", "seeds", "prepare_data"), envir = environment())
+    parallel::clusterEvalQ(cl, {
+      # Load needed packages on workers if required (if not already loaded)
+      # library(epiworldR) # Not allowed, we rely on namespaces now
+    })
 
-    matrices <- parLapply(cl, 1:N, function(i) {
+    matrices <- parallel::parLapply(cl, 1:N, function(i) {
       set.seed(seeds[i])
       m <- epiworldR::ModelSIRCONN(
         "mycon",
@@ -42,16 +38,14 @@ run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
         n                 = n
       )
 
-      verbose_off(m)
-      run(m, ndays = ndays)
+      epiworldR::verbose_off(m)
+      epiworldR::run(m, ndays = ndays)
       ans <- prepare_data(m, max_days = ndays)
-
       return(ans)
     })
 
   } else {
-    # Use mclapply for macOS/Linux
-    matrices <- mclapply(1:N, function(i) {
+    matrices <- parallel::mclapply(1:N, function(i) {
       set.seed(seeds[i])
       m <- epiworldR::ModelSIRCONN(
         "mycon",
@@ -62,14 +56,12 @@ run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
         n                 = n
       )
 
-      verbose_off(m)
-      run(m, ndays = ndays)
+      epiworldR::verbose_off(m)
+      epiworldR::run(m, ndays = ndays)
       ans <- prepare_data(m, max_days = ndays)
-
       return(ans)
     }, mc.cores = ncores)
   }
 
   return(matrices)
 }
-

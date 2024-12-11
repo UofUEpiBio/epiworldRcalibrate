@@ -12,7 +12,8 @@ prepare_data(m, max_days = max_days)
 \item{max_days}{The maximum number of days to consider for data preparation. Defaults to 50.}
 }
 \value{
-A reshaped array of processed data suitable for TensorFlow models. If an error occurs, it returns the error object.
+A reshaped array of processed data suitable for TensorFlow models.
+If an error occurs, it returns the error object.
 }
 \description{
 Prepare Data for TensorFlow Model: General SIR Data Preparation

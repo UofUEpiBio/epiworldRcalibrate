@@ -13,7 +13,7 @@
 #' }
 #' @export
 evaluate_model <- function(model, test_data, theta) {
-  pred <- predict(model, x = test_data$x) |>
+  pred <- model$predict(test_data$x) |>
     data.table::as.data.table() |>
     data.table::setnames(colnames(theta))
 

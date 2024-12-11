@@ -1,7 +1,7 @@
 #' Build a Convolutional Neural Network Model
 #'
 #' @description
-#' Constructs and compiles a CNN model using the `keras` package.
+#' Constructs and compiles a CNN model using the `keras3` package.
 #'
 #' @param input_shape Integer vector. The shape of the input data (excluding batch size).
 #' @param output_units Integer. The number of output units (number of output variables).
@@ -20,10 +20,6 @@ build_cnn_model <- function(input_shape, output_units) {
     keras3::layer_dense(units = output_units, activation = 'sigmoid')
 
   model |> keras3::compile(optimizer = 'adam', loss = 'mse', metrics = 'accuracy')
-
-  # Save the model in native Keras format
-  # model$save('/home/u1418987/epiworld-benchmark-oct15/calibration/sir-cnn.keras')
-
 
   return(model)
 }
