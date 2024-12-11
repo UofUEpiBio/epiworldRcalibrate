@@ -62,7 +62,7 @@ The function's arguments are:
 The first step in the function is to generate the parameter sets (`theta`) and random seeds for the simulation:
 
 ```{r}
-N=2e4
+N=10
 n=5000
 theta <- generate_theta(N, n)
 head(theta,5)
