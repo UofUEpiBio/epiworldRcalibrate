@@ -35,3 +35,4 @@ run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
 
   return(matrices)
 }
+
