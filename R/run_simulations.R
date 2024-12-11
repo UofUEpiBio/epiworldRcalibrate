@@ -15,53 +15,23 @@
 #' @return A list containing the simulation results as matrices.
 #' @export
 run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
-  os_type <- .Platform$OS.type
+  matrices <- parallel::mclapply(1:N, FUN = function(i) {
+    set.seed(seeds[i])
+    m <- epiworldR:: ModelSIRCONN(
+      "mycon",
+      prevalence        = theta$preval[i],
+      contact_rate      = theta$crate[i],
+      transmission_rate = theta$ptran[i],
+      recovery_rate     = theta$prec[i],
+      n                 = n
+    )
 
-  if (os_type == "windows") {
-    cl <- parallel::makeCluster(ncores)
-    on.exit(parallel::stopCluster(cl))
+    verbose_off(m)
+    run(m, ndays = ndays)
+    ans <- prepare_data(m,max_days=ndays)
 
-    parallel::clusterExport(cl, varlist = c("theta", "n", "ndays", "seeds", "prepare_data"), envir = environment())
-    parallel::clusterEvalQ(cl, {
-      # Load needed packages on workers if required (if not already loaded)
-      # library(epiworldR) # Not allowed, we rely on namespaces now
-    })
-
-    matrices <- parallel::parLapply(cl, 1:N, function(i) {
-      set.seed(seeds[i])
-      m <- epiworldR::ModelSIRCONN(
-        "mycon",
-        prevalence        = theta$preval[i],
-        contact_rate      = theta$crate[i],
-        transmission_rate = theta$ptran[i],
-        recovery_rate     = theta$prec[i],
-        n                 = n
-      )
-
-      epiworldR::verbose_off(m)
-      epiworldR::run(m, ndays = ndays)
-      ans <- prepare_data(m, max_days = ndays)
-      return(ans)
-    })
-
-  } else {
-    matrices <- parallel::mclapply(1:N, function(i) {
-      set.seed(seeds[i])
-      m <- epiworldR::ModelSIRCONN(
-        "mycon",
-        prevalence        = theta$preval[i],
-        contact_rate      = theta$crate[i],
-        transmission_rate = theta$ptran[i],
-        recovery_rate     = theta$prec[i],
-        n                 = n
-      )
-
-      epiworldR::verbose_off(m)
-      epiworldR::run(m, ndays = ndays)
-      ans <- prepare_data(m, max_days = ndays)
-      return(ans)
-    }, mc.cores = ncores)
-  }
+    return(ans)
+  }, mc.cores = ncores)
 
   return(matrices)
 }
