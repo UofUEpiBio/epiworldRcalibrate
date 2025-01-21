@@ -9,7 +9,6 @@
 #' @export
 
 prepare_data <- function(m, max_days =max_days) {
-
   err <- tryCatch({
     ans <- list(
       repnum    = epiworldR::plot_reproductive_number(m, plot = FALSE),
@@ -88,4 +87,4 @@ prepare_data <- function(m, max_days =max_days) {
   )
 
 }
-
+prepare_data(m,60)
