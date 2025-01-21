@@ -2,25 +2,29 @@
 % Please edit documentation in R/preprocessing_data.R
 \name{preprocessing_data}
 \alias{preprocessing_data}
-\title{Preprocess Data for Machine Learning Models}
+\title{Preprocesses Data for Model Input}
 \usage{
 preprocessing_data(data)
 }
 \arguments{
-\item{data}{A numeric vector or data frame containing time-series data to be processed.}
+\item{m}{A data structure containing the input data. Assumes a named list with an element \code{Infected}.}
 }
 \value{
-A matrix where the data is reshaped into a single column, suitable for machine learning models.
+A reshaped array containing preprocessed data. If an error occurs, the function returns an error object.
 }
 \description{
-This function preprocesses input data for use in machine learning models, focusing on filtering,
-reshaping, and preparing it for TensorFlow or similar frameworks.
+This function preprocesses data for use in modeling. It handles missing values, filters data
+based on the maximum number of days, and reshapes the output into a structured array format.
 }
 \details{
 The function performs the following steps:
-\enumerate{
-\item Prepares the input data using \code{prepare_data_infected()}.
-\item Filters the data using \code{filter_non_null_infected()} to exclude missing or invalid values.
-\item Extracts and reshapes the data into a one-column matrix format.
+\itemize{
+\item Converts the input data to a \code{data.table} format.
+\item Filters rows based on \code{max_days}.
+\item Fills missing values using the last observation carried forward ("locf").
+\item Calculates the difference between consecutive rows after the first observation.
+\item Reshapes the processed data into a 3D array.
 }
+
+If any error occurs during processing, the function catches the error and returns it.
 }

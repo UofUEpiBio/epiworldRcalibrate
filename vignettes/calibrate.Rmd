@@ -66,6 +66,8 @@ N=10
 n=5000
 theta <- generate_theta(N, n)
 head(theta,5)
+
+
 ```
 
 ```{r}
@@ -207,23 +209,24 @@ theta <- generate_theta(N, n)
 ncores=20
 ndays=60
 seeds=123
-
+theta[1,2]=7
 # Run simulations
 i=1
 m <- epiworldR:: ModelSIRCONN(
   "mycon",
-  prevalence        = theta$preval[i],
-  contact_rate      = theta$crate[i],
-  transmission_rate = theta$ptran[i],
-  recovery_rate     = theta$prec[i],
+  prevalence        = 0.12,
+  contact_rate      = 6.09,
+  transmission_rate = 0.1,
+  recovery_rate     = 1/7,
   n                 = n
 )
-
+ndays=30
+plogis(6.09/10)
 verbose_off(m)
 run(m, ndays = ndays)
 incidence = epiworldR::plot_incidence(m, plot = FALSE)
 data=incidence$Infected
-
+length(data)
 # Save theta and simulations data
 theta2 <-as.data.table(copy(theta))
 theta2$crate <- plogis(theta2$crate / 10)
@@ -237,38 +240,84 @@ The output of `calibrate_sir` will include predicted values such as `preval` (pr
 ```{r}
 # Assuming you have a set of true parameters for comparison
 predicted <- result$pred  # Replace with actual column name for predictions
-actual <- theta2  # Assuming 'data' contains the actual infected numbers
+actual <- (data.frame(preval=0.12,crate=0.64,ptran=0.1,prec=0.14))  # Assuming 'data' contains the actual infected numbers
 MAE=abs((predicted-actual))
 # Combine actual and predicted values into a data table
 comparison <- data.frame(rbind(
   Actual = actual,
-  Predicted = predicted,
-  MAE=MAE
+  Predicted = predicted
 ))
-rownames(comparison)=c("Actual", "Predicted", "MAE")
+rownames(comparison)=c("Actual", "Predicted")
 print(comparison)
 ```
 Now, I want to compare the plots of SIR model with predicted values and actual values:
 ```{r}
 # Apply reverse logistic transformation to theta2$crate / 10
-predicted$new <- exp(predicted$crate / 10) / (1 + exp(predicted$crate / 10))
-
-
+predicted$new <- 6.63
+plogis(7/10)
 m2 <- epiworldR:: ModelSIRCONN(
   "mycon",
-  prevalence        = predicted$preval,
-  contact_rate      = predicted$new,
-  transmission_rate = predicted$ptran,
-  recovery_rate     = predicted$prec,
+  prevalence        = 0.02,
+  contact_rate      = 7,
+  transmission_rate = 0.27,
+  recovery_rate     = 0.49,
   n                 = n
 )
 
 verbose_off(m2)
-run(m2, ndays = ndays)
+run(m2, ndays = 30)
 par(mfrow = c(1, 2))
-
 plot(m2, main = "SIR Predicted Parameters")
+```
+
+
+```{r}
 plot(m, main = "SIR Actual Parameters")
+
+```
+
+
+```{r}
+incidence1 = epiworldR::plot_incidence(m, plot = TRUE)
+```
+
+
+```{r}
+incidence2 = epiworldR::plot_incidence(m2, plot = TRUE)
+plot(incidence1$Infected)
+plot(incidence2$Infected)
+
+# Extract data from the incidence objects
+# Assuming incidence1 and incidence2 are already created using plot_incidence()
+incidence1_data <- data.frame(Days = 1:nrow(incidence1), Infected = incidence1$Infected, Type = "Actual")
+incidence2_data <- data.frame(Days = 1:nrow(incidence2), Infected = incidence2$Infected, Type = "Predicted")
+
+# Combine the data for plotting
+combined_data <- rbind(incidence1_data, incidence2_data)
+
+# Load necessary library
+library(ggplot2)
+```
+
+
+```{r}
+# Create the plot
+ggplot(combined_data, aes(x = Days, y = Infected, color = Type, linetype = Type)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = c("Predicted" = "darkred", "Actual" = "blue")) +
+  labs(
+    title = "Infection Incidence: Actual vs Predicted",
+    x = "Days",
+    y = "Number of Infected Individuals",
+    color = "Legend",
+    linetype = "Legend"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
 
 ```
 
@@ -317,3 +366,47 @@ comparison <- data.frame(
 sessionInfo()
 
 ```
+
+```{r}
+set.seed(123)
+theta=generate_theta(1,5000)
+
+m <- epiworldR:: ModelSIRCONN(
+  "mycon",
+  prevalence        = 0.119,
+  contact_rate      = 6.09,
+  transmission_rate = 0.1,
+  recovery_rate     = 1/7,
+  n                 = 5000
+)
+
+run(m, ndays = 61)
+incidence = epiworldR::plot_incidence(m, plot = FALSE)
+data=incidence$Infected
+
+# Save theta and simulations data
+theta2 <-as.data.table(copy(theta))
+theta2$crate <- plogis(theta2$crate/10)
+
+
+
+result=calibrate_sir(data)
+data <- data.frame(
+  Category = c("Actual", "Predicted", "MAE"),
+  preval = c(0.1190000, 0.2230902, 0.1040902),
+  crate = c(0.64784451, 0.61379176, 0.03405274),
+  ptran = c(0.0797096, 0.2127937, 0.1330841),
+  prec = c(0.54575686, 0.53561789, 0.01013897)
+)
+
+# Calculate adjusted_crate using the formula plogis(x/10) = crate
+data$adjusted_crate <- log(data$crate / (1 - data$crate)) * 10
+data$adjusted_crate[3]=1.5
+# Print the table
+print(data)
+6.1-4.6
+```
+```{r}
+
+```
+

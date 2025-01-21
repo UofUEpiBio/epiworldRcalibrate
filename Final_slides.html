@@ -416,7 +416,7 @@
 </section>
 <section class="slide level2">
 
-<h3 id="what-we-have-done-so-far">What we have done so far 🦠📈</h3>
+<h3 id="what-we-have-done-so-far">What we have done so far? 🦠📈</h3>
 
 <img data-src="misc/plan.jpg" style="width:180.0%" class="r-stretch quarto-figure-center"><div style="display: flex; align-items: flex-start; gap: 15px;">
 
@@ -453,8 +453,8 @@
 <h3>📊 <strong>Model Parameters</strong></h3>
 <table>
 <colgroup>
-<col style="width: 35%">
-<col style="width: 64%">
+<col style="width: 36%">
+<col style="width: 63%">
 </colgroup>
 <thead>
 <tr class="header">
@@ -499,7 +499,7 @@
 <span id="cb2-5"><a href="#cb2-5"></a>ncores <span class="ot">=</span> <span class="dv">20</span></span>
 <span id="cb2-6"><a href="#cb2-6"></a>verbose <span class="ot">=</span> <span class="dv">2</span></span>
 <span id="cb2-7"><a href="#cb2-7"></a><span class="fu">simulate_calibrate_sir</span>(N, n, ndays, ncores, epochs, verbose)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
-<div class="columns" style="font-size:17px;">
+<div class="columns" style="font-size:15px;">
 <div class="column" style="width:40%;">
 <p>🎯 <span style="color: #4CAF50;"><strong>What Does This Function Do?</strong></span></p>
 <p>1️⃣ <span style="color: #2196F3;"><strong>Data Generation:</strong></span> Create realistic epidemic scenarios</p>
@@ -508,12 +508,12 @@
 <p>4️⃣ <span style="color: #FF5722;"><strong>Evaluation:</strong></span> Assess performance (e.g., MAE)</p>
 <p>5️⃣ <span style="color: #673AB7;"><strong>Visualization:</strong></span> Generate intuitive plots</p>
 </div><div class="column" style="width:60%;">
-<table style="width:99%;">
+<table>
 <colgroup>
-<col style="width: 28%">
-<col style="width: 21%">
-<col style="width: 28%">
-<col style="width: 20%">
+<col style="width: 26%">
+<col style="width: 23%">
+<col style="width: 26%">
+<col style="width: 23%">
 </colgroup>
 <thead>
 <tr class="header">
@@ -569,24 +569,12 @@
 <h2>🌟 Going Deep into the Function</h2>
 <div class="columns">
 <div class="column" style="width:60%;">
-<div id="code-container" style="
-  font-family: 'Courier New', Courier, monospace; 
-  background-color: #1e1e1e; 
-  color: #dcdcdc; 
-  padding: 20px; 
-  border-radius: 10px; 
-  line-height: 1.8; 
-  max-width: 100%; 
-  position: relative; 
-  box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.3); 
-  font-size: 20px;">
 
 <pre><code id="code-block">
 simulate_calibrate_sir &lt;- function(N, n, ndays, ncores, epochs, verbose) {
   theta &lt;- generate_theta(N, n)
   seeds &lt;- sample.int(.Machine$integer.max, N, TRUE)
-  path = "~/epiworldRcalibrate/misc/simulated_data/sir-%06i.rds"
-
+  
   matrices &lt;- run_simulations(N, n, ndays, ncores, theta, seeds)
 
   filtered_data &lt;- filter_non_null(matrices, theta)
@@ -614,7 +602,6 @@ simulate_calibrate_sir &lt;- function(N, n, ndays, ncores, epochs, verbose) {
   return(list(pred = pred, MAEs = MAEs))
 }
 </code></pre>
-</div>
 </div><div class="column" style="width:40%;">
 <h6 id="video-example">🎥 Video Example:</h6>
 <iframe src="https://drive.google.com/file/d/1O4S4RqJPBQAZF_0MYK5n98yQevXyYZyg/preview" width="100%" height="500" frameborder="0" allowfullscreen="">
@@ -648,8 +635,9 @@ document.addEventListener("keydown", function (event) {
 });
 </script>
 </section>
-<section id="model-calibration-made-easy" class="slide level2">
-<h2>Model Calibration Made Easy 🎯🤖</h2>
+<section id="empower-yourself-perform-your-own-calibration" class="slide level2">
+<h2>🎯 Empower Yourself: Perform Your Own Calibration:</h2>
+<p>Model Calibration Made Easy 🎯🤖</p>
 <div class="columns">
 <div class="column" style="font-size: 20px;">
 <h3 id="calibrate-parameters">🔍 Calibrate Parameters:</h3>
@@ -700,16 +688,16 @@ document.addEventListener("keydown", function (event) {
 <span id="cb3-22"><a href="#cb3-22"></a>data<span class="ot">=</span>incidence<span class="sc">$</span>Infected</span>
 <span id="cb3-23"><a href="#cb3-23"></a>result<span class="ot">=</span><span class="fu">calibrate_sir</span>(data)</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </section>
-<section id="empower-yourself-perform-your-own-calibration" class="slide level2">
-<h2>🎯 Empower Yourself: Perform Your Own Calibration</h2>
+<section id="results" class="slide level2">
+<h2>Results:</h2>
 <h3 id="sir-model-actual-vs-predicted-table"><span style="font-size: 20px;">SIR Model Actual vs Predicted Table</span></h3>
-<table style="width:97%;">
+<table>
 <colgroup>
-<col style="width: 15%">
-<col style="width: 12%">
+<col style="width: 19%">
+<col style="width: 19%">
+<col style="width: 19%">
 <col style="width: 21%">
-<col style="width: 26%">
-<col style="width: 21%">
+<col style="width: 19%">
 </colgroup>
 <thead>
 <tr class="header">
@@ -756,8 +744,8 @@ document.addEventListener("keydown", function (event) {
 <strong>Thank You for Your Attention!</strong>
 </p>
 <p style="font-size: 20px; color: #555;">
-Questions? Feel free to ask! 😊
-</p>
+</p><p>Questions? Feel free to ask! 😊</p>
+<p></p>
 </div>
 <div style="text-align: center; font-size: 16px; color: #888; margin-top: 30px;">
 <p>
