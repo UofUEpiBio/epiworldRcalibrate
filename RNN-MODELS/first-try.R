@@ -123,220 +123,38 @@ is_not_null <- intersect(
 )
 matrices <- matrices[is_not_null]
 # spliting datasets:
-
-# Number of cuts you want to make
-n_cuts <- 2
-
-# Minimum number of days in each interval
-min_diff <- 15
-
-# Total number of days
-max_day <- 60
-
-# Optional: Set seed for reproducibility
-seed_value <- 123  # You can change this value or remove it for different results
-
-# **Step 2: Initialize Storage for Cuts**
-
-# Create a data frame to store the start and end days of each cut
-cuts <- data.frame(start = integer(n_cuts), end = integer(n_cuts))
-
-# **Step 3: Define a Function to Generate Non-Overlapping Cuts**
-
-generate_cuts <- function(n_cuts, min_diff, max_day, seed = NULL) {
-  if (!is.null(seed)) {
-    set.seed(seed)  # Set seed for reproducibility
-  }
-
-  cuts <- data.frame(start = integer(n_cuts), end = integer(n_cuts))
-
-  for (i in 1:n_cuts) {
-    attempt <- 1
-    max_attempts <- 1000  # Prevent infinite loops
-
-    repeat {
-      # Randomly select a start day between 1 and (max_day - min_diff)
-      start <- sample(1:(max_day - min_diff), 1)
-
-      # Randomly select an end day ensuring the interval is at least min_diff days long
-      end <- sample((start + min_diff):max_day, 1)
-
-      # Check for overlaps with previously selected cuts
-      if (i > 1) {
-        overlap <- any(!(end < cuts$start[1:(i-1)] | start > cuts$end[1:(i-1)]))
-      } else {
-        overlap <- FALSE
-      }
-
-      if (!overlap) {
-        # No overlap detected; accept the cut
-        cuts$start[i] <- start
-        cuts$end[i] <- end
-        break
-      } else {
-        # Overlap detected; retry
-        attempt <- attempt + 1
-        if (attempt > max_attempts) {
-          stop("Unable to generate non-overlapping cuts after ", max_attempts, " attempts.")
-        }
-      }
-    }
-  }
-
-  return(cuts)
-}
-
-# **Step 4: Generate Random Cuts**
-
-# Generate the cuts using the defined function
-cuts <- generate_cuts(n_cuts = n_cuts, min_diff = min_diff, max_day = max_day, seed = seed_value)
-
-# Display the generated cuts
-print("Generated Cuts:")
-print(cuts)
+length(matrices)
+# 19994 dataset of 1,6,59 ya 19994,6, 59
+dim(matrices[[1]])
+theta    <- theta[is_not_null,]
 
 
-extracted_data <- list()
-data_list=matrices
-# Loop through each cut and extract the corresponding rows from all matrices
-for (i in 1:n_cuts) {
-  # Extract the start and end days for the current cut
-  start_day <- cuts$start[i]
-  end_day <- cuts$end[i]
-
-  # Define a name for the current cut
-  cut_name <- paste0("Cut_", i, "_Days_", start_day, "-", end_day)
-
-  # Inform the user about the current processing cut
-  cat("Processing ", cut_name, "...\n")
-
-  # Extract the subset of days from each matrix in `data_list`
-  # This creates a list of matrices containing only the rows from start_day to end_day
-  subset_list <- vector("list", length = length(data_list))
-
-  # Optionally, name the list elements based on their index or any other naming convention
-  # names(subset_list) <- paste0("Matrix_", seq_along(data_list)))
-
-  # Iterate over each matrix in data_list
-  for (i in seq_along(data_list)) {
-    mat <- data_list[[i]]  # Access the i-th matrix
-
-    # Check if the matrix has enough rows
-    if (length(mat[1,1,]) >= end_day) {
-      # Extract rows from start_day to end_day
-      subset <- mat[,,start_day:end_day]
-    } else {
-      # Calculate the required number of rows
-      required_rows <- end_day - start_day + 1
-
-      # Create a matrix of NAs with the required dimensions
-      subset <- (matrix(NA, nrow = required_rows, ncol = ncol(mat)))
-
-      # Optionally, set column names if your matrices have them
-      # colnames(subset) <- colnames(mat)
-    }
-
-    # Store the subset in the subset_list
-    subset_list[[i]] <- t(subset)
-  }
-}
-
-
-split_data <- function(n_cuts, title) {
-  set.seed(123)
-  max_day <- 60
-  min_diff <- 15
-  data_length <- length(data_list)
-  extracted_data <- list()
-
-  generate_cuts <- function(n_cuts, min_diff, max_day) {
-    cuts <- data.frame(start = integer(n_cuts), end = integer(n_cuts))
-    for (i in 1:n_cuts) {
-      repeat {
-        start <- sample(1:(max_day - min_diff), 1)
-        end <- sample((start + min_diff):max_day, 1)
-        if (i == 1 || all(end < cuts$start[1:(i-1)] | start > cuts$end[1:(i-1)])) {
-          cuts$start[i] <- start
-          cuts$end[i] <- end
-          break
-        }
-      }
-    }
-    return(cuts)
-  }
-
-  if (n_cuts == 2) {
-    cuts <- generate_cuts(2, min_diff, max_day)
-    for (i in 1:2) {
-      start_day <- cuts$start[i]
-      end_day <- cuts$end[i]
-      cut_name <- paste0("Cut_", i, "_Days_", start_day, "-", end_day)
-      subset_list <- vector("list", data_length)
-      for (j in seq_along(data_list)) {
-        mat <- data_list[[j]]
-        if (length(mat[1,1,]) >= end_day) {
-          subset <- mat[,,start_day:end_day]
-        } else {
-          subset <- matrix(NA, nrow = (end_day - start_day + 1), ncol = ncol(mat))
-        }
-        subset_list[[j]] <- t(subset)
-      }
-      extracted_data[[cut_name]] <- subset_list
-    }
-  } else if (n_cuts == 1) {
-    cut <- generate_cuts(1, min_diff, max_day)
-    start_day <- cut$start[1]
-    end_day <- cut$end[1]
-    if (title == "before") {
-      cut_name <- paste0("Cut_before_Days_1-", end_day)
-      subset_list <- vector("list", data_length)
-      for (j in seq_along(data_list)) {
-        mat <- data_list[[j]]
-        if (length(mat[1,1,]) >= end_day) {
-          subset <- mat[,,1:end_day]
-        } else {
-          subset <- matrix(NA, nrow = end_day, ncol = ncol(mat))
-        }
-        subset_list[[j]] <- t(subset)
-      }
-      extracted_data[[cut_name]] <- subset_list
-    } else if (title == "after") {
-      cut_name <- paste0("Cut_after_Days_", start_day, "-", max_day)
-      subset_list <- vector("list", data_length)
-      for (j in seq_along(data_list)) {
-        mat <- data_list[[j]]
-        if (length(mat[1,1,]) >= start_day) {
-          subset <- mat[,,start_day:max_day-1]
-        } else {
-          subset <- matrix(NA, nrow = (max_day - start_day + 1), ncol = ncol(mat))
-        }
-        subset_list[[j]] <- t(subset)
-      }
-      extracted_data[[cut_name]] <- subset_list
-    }
-  }
-  return(subset_list)
-}
-
-split_data(2)
-
-theta    <- theta[is_not_null, ]
 N <- length(is_not_null)
-matrices=(split_data(2))
-# Create a 3D array [N, days, features]
-arrays_1d <- array(dim = c(N, dim(matrices[[1]][2], dim(matrices[[1]])[3])))
-for (i in seq_along(matrices)) {
-  arrays_1d[i, , ] <- matrices[[i]][1, , ]
-}
 
-# Extract only the 'infected' feature (assuming it's the first feature)
-arrays_1d <- arrays_1d[, , 1, drop = FALSE]  # Shape: [N, 60, 1]
+# Setting up the data for tensorflow. Need to figure out how we would configure
+# this to store an array of shape 3 x 100 (three rows, S I R) and create the
+# convolution.
 
-# Adjust 'crate' parameter using logistic transformation
+# Convolutional Neural Network
+library(keras3)
+
+# (N obs, rows, cols)
+# Important note, it is better for the model to handle changes rather than
+# total numbers. For the next step, we need to do it using % change, maybe...
+arrays_1d <- array(dim = c(N, dim(matrices[[1]][1,,])))
+for (i in seq_along(matrices))
+  arrays_1d[i,,] <- matrices[[i]][1,,]
+#   t(matrices[[i]][-nrow(matrices[[i]]),]) + 1e-20
+# )[,1:49]
+
+# t(diff(t(matrices[[i]])))/(
+#   matrices[[i]][,-ncol(matrices[[i]])] + 1e-20
+# )[,1:50]
+
 theta2 <- copy(theta)
 theta2[, crate := plogis(crate / 10)]
 
-# Save the prepared data
+# Saving the data
 saveRDS(
   list(
     theta = theta2,
@@ -345,83 +163,148 @@ saveRDS(
   file = "RNN-MODELS/sir.rds",
   compress = TRUE
 )
-
-# Load the data (optional, if running in separate sessions)
-sim_results <- readRDS("RNN-MODELS/sir.rds")
+sim_results=readRDS("RNN-MODELS/sir.rds")
 theta <- sim_results$theta
 arrays_1d <- sim_results$simulations
-N <- dim(arrays_1d)[1]
+matrices
+sources=theta
+min_window_size=15
+max_window_size=59
+#spiliting the dataset
 
-# Split the data into training and testing sets
-set.seed(331)  # For reproducibility
-N_train <- floor(N * 0.7)
-id_train <- 1:N_train
-train <- list(
-  x = arrays_1d[id_train, , ],
-  y = as.matrix(theta)[id_train, ]
-)
+process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size) {
+  all_windows <- list()
 
-N_test <- N - N_train
-id_test <- (N_train + 1):N
-test <- list(
-  x = arrays_1d[id_test, , ],
-  y = as.matrix(theta2)[id_test, ]
-)
+  for (matrix_idx in seq_along(matrices)) {
+    matrix <- matrices[[matrix_idx]]
 
-# Define the window to keep (e.g., day 20-40)
-keep_start <- 20
-keep_end <- 40
+    rows <- dim(matrix)[3]
+    cols <- dim(matrix)[2]
+    source <- sources[matrix_idx,]
 
-# Function to Pad Sequences: Keep only specified window and pad the rest with -1
-pad_sequences <- function(x, keep_start, keep_end, max_days) {
-  x_padded <- array(-1, dim = c(dim(x)[1], max_days, dim(x)[3]))
-  x_padded[, keep_start:keep_end, ] <- x[, keep_start:keep_end, ]
-  return(x_padded)
+    for (window_size in min_window_size:max_window_size) {
+      num_windows_for_size <- rows - window_size + 1
+
+      third <- floor(num_windows_for_size / 3) # Use floor to handle integer division
+
+      for (i in 1:third) {
+        start_col <- sample(0:(third - 1), 1) # R's sample handles random integers differently
+        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+        # R indexing starts at 1
+        all_windows <- append(all_windows, list(list(window = window, source = source))) # Nested lists for (window, source) tuple
+      }
+
+      for (i in 1:third) {
+        start_col <- sample((rows - window_size - third):(rows - window_size), 1)
+        window <- t(matrix[, ,(start_col + 1):(start_col + window_size)])
+        all_windows <- append(all_windows, list(list(window = window, source = source)))
+      }
+
+      for (i in 1:(num_windows_for_size - 2 * third)) {
+        start_col <- sample(third:(rows - window_size - third), 1)
+        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+        all_windows <- append(all_windows, list(list(window = window, source = source)))
+      }
+    }
+  }
+
+  return(all_windows)
 }
 
-# Apply padding to training and testing data
-train_x_padded <- pad_sequences(train$x, keep_start, keep_end, ndays)
-test_x_padded  <- pad_sequences(test$x, keep_start, keep_end, ndays)
 
-# Verify the padding for the first sample (optional)
-# print(train_x_padded[1,,])
 
-# Build the LSTM model
-model <- keras_model_sequential() %>%
-  layer_masking(mask_value = -1, input_shape = c(ndays, 1)) %>%  # Mask padded values
-  layer_lstm(units = 64, return_sequences = FALSE) %>%          # LSTM layer
-  layer_dense(units = 64, activation = 'relu') %>%              # Fully connected layer
-  layer_dropout(rate = 0.5) %>%                                 # Dropout for regularization
-  layer_dense(units = ncol(theta2), activation = 'linear')      # Output layer
+window=13
+pad_window <- function(window, target_rows = 59) {
+  current_rows <- nrow(window)
 
-# Compile the model
-model %>% compile(
-  optimizer = 'adam',
-  loss = 'mse',
-  metrics = list('mae')
-)
+  if (current_rows < target_rows) {
+    padding_rows <- target_rows - current_rows
+    padding <- matrix(-1, nrow = padding_rows, ncol = ncol(window))
 
-# Train the model
-history <- model %>% fit(
-  x = train_x_padded,
-  y = train$y,
-  epochs = 100,
-  batch_size = 32,
-  validation_split = 0.2,
-  verbose = 2
-)
+    if (!is.null(colnames(window))) {
+      colnames(padding) <- colnames(window)
+    }
 
-# Save the trained model
-model %>% save_model_hdf5('RNN-MODELS/sir_lstm_model.h5')
+    window <- rbind(window, padding)
+  }
 
-# Load the model (if needed)
-# model <- load_model_hdf5("RNN-MODELS/sir_lstm_model.h5")
+  return(window)
+}
 
-# Predict on test data
-pred <- model %>% predict(test_x_padded)
-pred_dt <- as.data.table(pred)
-setnames(pred_dt, colnames(theta2))
+# 2. generate_all_windows Function
+generate_all_windows <- function(matrix, source, min_window_size, max_window_size, target_rows = 59) {
+  windows <- list()
 
-# Calculate Mean Absolute Errors (MAEs)
-maes <- colMeans(abs(pred_dt - as.matrix(test$y)))
-print(maes)
+  rows <- dim(matrix)[3]
+  cols <- dim(matrix)[2]
+
+  for (window_size in min_window_size:max_window_size) {
+    num_windows_for_size <- rows - window_size + 1
+
+    if (num_windows_for_size <= 0) {
+      next
+    }
+
+    third <- floor(num_windows_for_size / 3)
+
+    # First third windows
+    for (i in 1:third) {
+      start_col <- sample(0:(third - 1), 1)
+      window_cols <- (start_col + 1):(start_col + window_size)
+
+      if (max(window_cols) > rows) next
+      window <- t(matrix[, , window_cols])
+
+      window <- pad_window(window, target_rows)
+
+      windows <- append(windows, list(list(window = window, source = source)))
+    }
+
+    # Second third windows
+    for (i in 1:third) {
+      start_col <- sample((rows - window_size - third + 1):(rows - window_size), 1)
+      window_cols <- (start_col + 1):(start_col + window_size)
+
+      if (max(window_cols) > rows || start_col < 0) next
+      window <- t(matrix[, , window_cols])
+
+      window <- pad_window(window, target_rows)
+
+      windows <- append(windows, list(list(window = window, source = source)))
+    }
+
+    # Remaining windows
+    remaining_windows <- num_windows_for_size - 2 * third
+    if (remaining_windows > 0) {
+      for (i in 1:remaining_windows) {
+        start_col <- sample(third:(rows - window_size - third), 1)
+        window_cols <- (start_col + 1):(start_col + window_size)
+
+        if (max(window_cols) > rows || start_col < 0) next
+        window <- t(matrix[, , window_cols])
+
+        window <- pad_window(window, target_rows)
+
+        windows <- append(windows, list(list(window = window, source = source)))
+      }
+    }
+  }
+
+  return(windows)
+}
+
+# 3. process_sliding_windows Function
+process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size, target_rows = 59) {
+  all_windows <- list()
+
+  for (matrix_idx in seq_along(matrices)) {
+    matrix <- matrices[[matrix_idx]]
+    source <- sources[matrix_idx, ]
+
+    windows <- generate_all_windows(matrix, source, min_window_size, max_window_size, target_rows)
+
+    all_windows <- append(all_windows, windows)
+  }
+
+  return(all_windows)
+}
