@@ -278,10 +278,103 @@ split_pad <- process_sliding_windows_mclapply(
   ncores           = 20  # choose cores
 )
 
+# Option 1: Modify 'split_pad' *after* it's created
+for (i in seq_along(split_pad)) {
+  # Keep only the first column (as a column matrix)
+  split_pad[[i]]$window <- split_pad[[i]]$window[, 1, drop = FALSE]
+}
+
 saveRDS(split_pad, file = "RNN-MODELS/split_pad.rds", compress = TRUE)
+length(split_pad)
+input_data=split_pad
 
 
+input_data2 <- array(unlist(input_data), dim = c(2082017, 59, 1))
 
+# Extract the target data
+target_data <- do.call(rbind, lapply(input_data, function(x) x$source))
+
+# Check the shapes
+print(dim(input_data2))  # Should be [2082017, 59, 1]
+print(dim(target_data))  # Should be [2082017, 4]
+
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 50, input_shape = c(59, 1)) %>%
+  layer_dense(units = 4)
+
+# Compile the model
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mse'
+)
+
+summary(model)
+
+set.seed(123)
+
+
+N <- dim(input_data2)[1]
+shuffled_indices <- sample(N)
+
+# 3. Shuffle data
+shuffled_input  <- input_data2[shuffled_indices, , , drop = FALSE]
+shuffled_target <- target_data[shuffled_indices, , drop = FALSE]
+
+# 4. Define train/test split
+train_ratio <- 0.8
+train_size <- floor(train_ratio * N)
+
+# 5. Split
+train_input  <- shuffled_input[1:train_size, , , drop = FALSE]
+train_target <- shuffled_target[1:train_size, , drop = FALSE]
+
+test_input  <- shuffled_input[(train_size + 1):N, , , drop = FALSE]
+test_target <- shuffled_target[(train_size + 1):N, , drop = FALSE]
+
+train_target <- as.matrix(train_target)
+test_target  <- as.matrix(test_target)
+# 6. Confirm shapes
+dim(train_input)   # e.g. c(train_size, 59, 1)
+dim(train_target)  # e.g. c(train_size, num_targets)
+dim(test_input)    # e.g. c(N - train_size, 59, 1)
+dim(test_target)
+
+model <- keras3::keras_model_sequential() %>%
+  keras3::layer_lstm(units = 50, input_shape = c(59, 1)) %>%  # LSTM layer with 50 units
+  keras3::layer_dense(units = 4)  # Output layer with 4 units
+
+# Compile the model
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mse',
+  metric    = 'accuracy'
+)
+
+# Train the model
+history <- model %>% fit(
+  x = train_input,
+  y = train_target,
+  epochs = 3,  # Number of epochs
+  batch_size = 32,  # Batch size
+  validation_data = list(test_input, test_target)
+)
+evaluation <- model %>% evaluate(test_input, test_target)
+print(evaluation)
+predictions <- model %>% predict(test_input)
+
+# Print the first few predictions
+print(head(predictions))
+summary(model)
+model$save('lstm_model_2e3.keras')
+MAEs <- abs(predictions - as.matrix(test_target)) |>
+  colMeans() |>
+  print()
+
+saveRDS(MAEs, file = "MAEs.rds")
+saveRDS(predictions, file = "predictions.rds")
+saveRDS(evaluation, file = "evaluation.rds")
+
+model$export('lstm_model_2e3.keras')
 
 #
 # pad_window <- function(window, target_rows = 59) {
