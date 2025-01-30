@@ -5,18 +5,106 @@ library(parallel)
 library(keras3)
 library(tensorflow)
 library(abind)
-#function to prepare datasets
-source("RNN-MODELS/dataprep.R")
-# function to generate parameters
-source("RNN-MODELS/generate_theta.R")
-# function to simulate dataset
-source("RNN-MODELS/run_simulations.R")
-# Set TensorFlow backend
-#use_session_with_seed(331, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
+use_session_with_seed(331, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
 
+# Function to Generate Theta Parameters for SIR Model Simulation
+generate_theta <- function(N, n) {
+  set.seed(1231)
+  theta <- data.table::data.table(
+    preval = sample((100:2000) / n, N, replace = TRUE),
+    crate  = stats::rgamma(N, shape = 5, rate = 1),
+    ptran  = stats::rbeta(N, shape1 = 3, shape2 = 7),
+    prec   = stats::rbeta(N, shape1 = 10, shape2 = 10)
+  )
+  return(theta)
+}
+
+# Function to Prepare Data for TensorFlow Model: General SIR Data Preparation
+prepare_data <- function(m, max_days = 60) {
+  err <- tryCatch({
+    ans <- list(
+      repnum    = epiworldR::plot_reproductive_number(m, plot = FALSE),
+      incidence = epiworldR::plot_incidence(m, plot = FALSE),
+      gentime   = epiworldR::plot_generation_time(m, plot = FALSE)
+    )
+
+    ans <- lapply(ans, data.table::as.data.table)
+    ans$repnum$avg <- data.table::nafill(ans$repnum$avg, type = "locf")
+    ans$gentime$avg <- data.table::nafill(ans$gentime$avg, type = "locf")
+
+    ans$repnum    <- ans$repnum[ans$repnum$date <= max_days, ]
+    ans$gentime   <- ans$gentime[ans$gentime$date <= max_days, ]
+    ans$incidence <- ans$incidence[as.integer(rownames(ans$incidence)) <= (max_days + 1), ]
+
+    ref_table <- data.table::data.table(
+      date = 0:max_days
+    )
+
+    ans[["repnum"]] <- data.table::merge.data.table(
+      ref_table, ans[["repnum"]], by = "date", all.x = TRUE
+    )
+    ans[["gentime"]] <- data.table::merge.data.table(
+      ref_table, ans[["gentime"]], by = "date", all.x = TRUE
+    )
+
+    ans <- data.table::data.table(
+      infected    = ans[["incidence"]][["Infected"]],
+      recovered   = ans[["incidence"]][["Recovered"]],
+      repnum      = ans[["repnum"]][["avg"]],
+      gentime     = ans[["gentime"]][["avg"]],
+      repnum_sd   = ans[["repnum"]][["sd"]],
+      gentime_sd  = ans[["gentime"]][["sd"]]
+    )
+
+    nafill_cols <- c("infected", "recovered", "repnum", "gentime", "repnum_sd", "gentime_sd")
+    for (col in nafill_cols) {
+      ans[[col]] <- data.table::nafill(ans[[col]], type = "locf")
+    }
+
+    # Compute first differences to capture changes
+    dprep <- t(diff(as.matrix(ans[-1, ])))
+    ans_array <- array(dim = c(1, dim(dprep)))
+    ans_array[1, , ] <- dprep
+
+    # Reshape for TensorFlow
+    tensorflow::array_reshape(
+      ans_array,
+      dim = c(1, dim(dprep))
+    )
+  }, error = function(e) e)
+
+  if (inherits(err, "error")) {
+    return(err)
+  }
+
+  return(ans_array)
+}
+
+# Function to Run SIR Model Simulations in Parallel
+run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
+  matrices <- parallel::mclapply(1:N, FUN = function(i) {
+    set.seed(seeds[i])
+    m <- epiworldR::ModelSIRCONN(
+      "mycon",
+      prevalence        = theta$preval[i],
+      contact_rate      = theta$crate[i],
+      transmission_rate = theta$ptran[i],
+      recovery_rate     = theta$prec[i],
+      n                 = n
+    )
+
+    verbose_off(m)
+    run(m, ndays = ndays)
+    ans <- prepare_data(m, max_days = ndays)
+
+    return(ans)
+  }, mc.cores = ncores)
+
+  return(matrices)
+}
 
 # Parameters
-N <- 2e4           # Number of simulations
+N <- 2e3          # Number of simulations
 n <- 5000          # Population size per simulation
 ndays <- 60        # Number of days to simulate
 ncores <- 20       # Number of cores for parallel processing
@@ -25,6 +113,7 @@ seeds <- sample(1:1e6, N, replace = FALSE)  # Unique seeds for reproducibility
 # Generate theta and run simulations
 theta <- generate_theta(N, n)
 matrices <- run_simulations(N, n, ndays, ncores, theta, seeds)
+
 
 # Filter out simulations that resulted in errors or contain NA values
 is_not_null <- intersect(
@@ -80,47 +169,6 @@ arrays_1d <- sim_results$simulations
 sources=theta
 min_window_size=15
 max_window_size=59
-#spiliting the dataset
-
-process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size) {
-  all_windows <- list()
-
-  for (matrix_idx in seq_along(matrices)) {
-    matrix <- matrices[[matrix_idx]]
-
-    rows <- dim(matrix)[3]
-    cols <- dim(matrix)[2]
-    source <- sources[matrix_idx,]
-
-    for (window_size in min_window_size:max_window_size) {
-      num_windows_for_size <- rows - window_size + 1
-
-      third <- floor(num_windows_for_size / 3) # Use floor to handle integer division
-
-      for (i in 1:third) {
-        start_col <- sample(0:(third - 1), 1) # R's sample handles random integers differently
-        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
-        # R indexing starts at 1
-        all_windows <- append(all_windows, list(list(window = window, source = source))) # Nested lists for (window, source) tuple
-      }
-
-      for (i in 1:third) {
-        start_col <- sample((rows - window_size - third):(rows - window_size), 1)
-        window <- t(matrix[, ,(start_col + 1):(start_col + window_size)])
-        all_windows <- append(all_windows, list(list(window = window, source = source)))
-      }
-
-      for (i in 1:(num_windows_for_size - 2 * third)) {
-        start_col <- sample(third:(rows - window_size - third), 1)
-        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
-        all_windows <- append(all_windows, list(list(window = window, source = source)))
-      }
-    }
-  }
-
-  return(all_windows)
-}
-
 
 
 
@@ -203,42 +251,6 @@ generate_all_windows <- function(matrix, source, min_window_size, max_window_siz
   return(windows)
 }
 
-library(parallel)
-
-process_sliding_windows_parallel <- function(matrices, sources, min_window_size, max_window_size, target_rows = 59) {
-  num_cores <- detectCores() - 1
-  cl <- makeCluster(num_cores)
-
-  clusterExport(cl, varlist = c("generate_all_windows", "pad_window"))
-  clusterEvalQ(cl, library(matrixStats))  # if needed
-
-  all_windows <- parLapply(cl, seq_along(matrices), function(i) {
-    matrix <- matrices[[i]]
-    source <- sources[i, ]
-    generate_all_windows(matrix, source, min_window_size, max_window_size, target_rows)
-  })
-
-  stopCluster(cl)
-
-  # Flatten the list of lists
-  all_windows <- do.call(c, all_windows)
-
-  return(all_windows)
-}
-
-# Use the parallel version
-split_pad <- process_sliding_windows_parallel(
-  matrices = matrices,
-  sources = sources,
-  min_window_size = 15,
-  max_window_size = 59,
-  target_rows = 59
-)
-saveRDS(split_pad,
-        file = "RNN-MODELS/split_pad.rds",
-        compress = TRUE
-)
-
 # 3. process_sliding_windows Function
 process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size, target_rows = 59) {
   all_windows <- list()
@@ -257,6 +269,154 @@ process_sliding_windows <- function(matrices, sources, min_window_size, max_wind
 split_pad=process_sliding_windows(matrices=matrices,sources=sources,
                                   min_window_size=15,max_window_size = 59,target_rows = 59)
 saveRDS(split_pad,
-  file = "RNN-MODELS/split_pad.rds",
-  compress = TRUE
+        file = "RNN-MODELS/split_pad.rds",
+        compress = TRUE
 )
+
+#spiliting the dataset
+#
+#
+# process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size) {
+#   all_windows <- list()
+# matrix_idx=1
+#   for (matrix_idx in seq_along(matrices)) {
+#     matrix <- matrices[[matrix_idx]]
+#
+#     rows <- dim(matrix)[3]
+#     cols <- dim(matrix)[2]
+#     source <- sources[matrix_idx,]
+#
+#     for (window_size in min_window_size:max_window_size) {
+#       num_windows_for_size <- rows - window_size + 1
+#
+#       third <- floor(num_windows_for_size / 3) # Use floor to handle integer division
+#
+#       for (i in 1:third) {
+#         start_col <- sample(0:(third - 1), 1) # R's sample handles random integers differently
+#         window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+#         # R indexing starts at 1
+#         all_windows <- append(all_windows, list(list(window = window, source = source))) # Nested lists for (window, source) tuple
+#       }
+#
+#       for (i in 1:third) {
+#         start_col <- sample((rows - window_size - third):(rows - window_size), 1)
+#         window <- t(matrix[, ,(start_col + 1):(start_col + window_size)])
+#         all_windows <- append(all_windows, list(list(window = window, source = source)))
+#       }
+#
+#       for (i in 1:(num_windows_for_size - 2 * third)) {
+#         start_col <- sample(third:(rows - window_size - third), 1)
+#         window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+#         all_windows <- append(all_windows, list(list(window = window, source = source)))
+#       }
+#     }
+#   }
+#
+#   return(all_windows)
+# }
+# process_sliding_windows(matrices=arrays_1d,sources,min_window_size=15,max_window_size = 59)
+
+
+
+process_sliding_windows_parallel <- function(matrices, sources, min_window_size, max_window_size, ncores) {
+  # Run the same code used in process_sliding_windows for each matrix, but in parallel.
+  all_windows_list <- parallel::mclapply(seq_along(matrices), function(matrix_idx) {
+    matrix <- matrices[[matrix_idx]]
+
+    rows <- dim(matrix)[3]
+    cols <- dim(matrix)[2]
+    source <- sources[matrix_idx,]
+
+    local_windows <- list()
+    for (window_size in min_window_size:max_window_size) {
+      num_windows_for_size <- rows - window_size + 1
+      third <- floor(num_windows_for_size / 3)  # Same logic: integer division
+
+      # 1) First set of windows
+      for (i in 1:third) {
+        start_col <- sample(0:(third - 1), 1)
+        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+        local_windows <- append(local_windows, list(list(window = window, source = source)))
+      }
+
+      # 2) Second set of windows
+      for (i in 1:third) {
+        start_col <- sample((rows - window_size - third):(rows - window_size), 1)
+        window <- t(matrix[,, (start_col + 1):(start_col + window_size)])
+        local_windows <- append(local_windows, list(list(window = window, source = source)))
+      }
+
+      # 3) Remaining windows
+      for (i in 1:(num_windows_for_size - 2 * third)) {
+        start_col <- sample(third:(rows - window_size - third), 1)
+        window <- (matrix[,, (start_col + 1):(start_col + window_size)])
+        local_windows <- append(local_windows, list(list(window = window, source = source)))
+      }
+    }
+
+    return(local_windows)
+  }, mc.cores = ncores)
+
+  # Combine (flatten) all lists of windows into a single list
+  all_windows <- do.call(c, all_windows_list)
+  return(all_windows)
+}
+
+all_windows=process_sliding_windows_parallel(matrices, sources, min_window_size, max_window_size, ncores)
+
+# 1. Define the padarray() function in your script
+padarray <- function(x, pad_dims, pad_value = 0, pad_direction = "post") {
+  old_dims <- dim(x)
+  new_dims <- old_dims + pad_dims
+  new_matrix <- matrix(pad_value, nrow = new_dims[1], ncol = new_dims[2])
+  if (pad_direction == "post") {
+    new_matrix[1:old_dims[1], 1:old_dims[2]] <- x
+  } else {
+    stop("Only 'post' padding is implemented.")
+  }
+  return(new_matrix)
+}
+
+# 2. Define or load your pad_windows() function exactly as before:
+pad_windows <- function(all_windows, target_cols = 59) {
+  padded_windows <- list()
+  sources <- list()
+
+  for (i in seq_along(all_windows)) {
+    window <- all_windows[[i]][[1]]
+    source <- all_windows[[i]][[2]]
+
+    window <- as.matrix(window)
+    rows <- nrow(window)
+    cols <- ncol(window)
+
+    padding_size <- target_cols - cols
+
+    if (padding_size > 0) {
+      padded_window <- padarray(window, c(0, padding_size), -1, "post")
+    } else {
+      padded_window <- window
+    }
+
+    padded_windows[[i]] <- padded_window
+    sources[[i]] <- source
+  }
+
+  padded_windows <- array(
+    unlist(padded_windows),
+    dim = c(
+      length(padded_windows),
+      nrow(padded_windows[[1]]),
+      ncol(padded_windows[[1]])
+    )
+  )
+
+  sources <- unlist(sources)
+
+  return(list(padded_windows = padded_windows, sources = sources))
+}
+
+# 3. Now call pad_windows() without error:
+# my_result <- pad_windows(my_all_windows)
+
+padded_winodws=pad_windows(all_windows, target_cols = 59)
