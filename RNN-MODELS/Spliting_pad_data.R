@@ -5,105 +5,15 @@ library(parallel)
 library(keras3)
 library(tensorflow)
 library(abind)
-
+#function to prepare datasets
+source("RNN-MODELS/dataprep.R")
+# function to generate parameters
+source("RNN-MODELS/generate_theta.R")
+# function to simulate dataset
+source("RNN-MODELS/run_simulations.R")
 # Set TensorFlow backend
-use_session_with_seed(331, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
+#use_session_with_seed(331, disable_gpu = FALSE, disable_parallel_cpu = FALSE)
 
-# Function to Generate Theta Parameters for SIR Model Simulation
-generate_theta <- function(N, n) {
-  set.seed(1231)
-  theta <- data.table::data.table(
-    preval = sample((100:2000) / n, N, replace = TRUE),
-    crate  = stats::rgamma(N, shape = 5, rate = 1),
-    ptran  = stats::rbeta(N, shape1 = 3, shape2 = 7),
-    prec   = stats::rbeta(N, shape1 = 10, shape2 = 10)
-  )
-  return(theta)
-}
-
-# Function to Prepare Data for TensorFlow Model: General SIR Data Preparation
-prepare_data <- function(m, max_days = 60) {
-  err <- tryCatch({
-    ans <- list(
-      repnum    = epiworldR::plot_reproductive_number(m, plot = FALSE),
-      incidence = epiworldR::plot_incidence(m, plot = FALSE),
-      gentime   = epiworldR::plot_generation_time(m, plot = FALSE)
-    )
-
-    ans <- lapply(ans, data.table::as.data.table)
-    ans$repnum$avg <- data.table::nafill(ans$repnum$avg, type = "locf")
-    ans$gentime$avg <- data.table::nafill(ans$gentime$avg, type = "locf")
-
-    ans$repnum    <- ans$repnum[ans$repnum$date <= max_days, ]
-    ans$gentime   <- ans$gentime[ans$gentime$date <= max_days, ]
-    ans$incidence <- ans$incidence[as.integer(rownames(ans$incidence)) <= (max_days + 1), ]
-
-    ref_table <- data.table::data.table(
-      date = 0:max_days
-    )
-
-    ans[["repnum"]] <- data.table::merge.data.table(
-      ref_table, ans[["repnum"]], by = "date", all.x = TRUE
-    )
-    ans[["gentime"]] <- data.table::merge.data.table(
-      ref_table, ans[["gentime"]], by = "date", all.x = TRUE
-    )
-
-    ans <- data.table::data.table(
-      infected    = ans[["incidence"]][["Infected"]],
-      recovered   = ans[["incidence"]][["Recovered"]],
-      repnum      = ans[["repnum"]][["avg"]],
-      gentime     = ans[["gentime"]][["avg"]],
-      repnum_sd   = ans[["repnum"]][["sd"]],
-      gentime_sd  = ans[["gentime"]][["sd"]]
-    )
-
-    nafill_cols <- c("infected", "recovered", "repnum", "gentime", "repnum_sd", "gentime_sd")
-    for (col in nafill_cols) {
-      ans[[col]] <- data.table::nafill(ans[[col]], type = "locf")
-    }
-
-    # Compute first differences to capture changes
-    dprep <- t(diff(as.matrix(ans[-1, ])))
-    ans_array <- array(dim = c(1, dim(dprep)))
-    ans_array[1, , ] <- dprep
-
-    # Reshape for TensorFlow
-    tensorflow::array_reshape(
-      ans_array,
-      dim = c(1, dim(dprep))
-    )
-  }, error = function(e) e)
-
-  if (inherits(err, "error")) {
-    return(err)
-  }
-
-  return(ans_array)
-}
-
-# Function to Run SIR Model Simulations in Parallel
-run_simulations <- function(N, n, ndays, ncores, theta, seeds) {
-  matrices <- parallel::mclapply(1:N, FUN = function(i) {
-    set.seed(seeds[i])
-    m <- epiworldR::ModelSIRCONN(
-      "mycon",
-      prevalence        = theta$preval[i],
-      contact_rate      = theta$crate[i],
-      transmission_rate = theta$ptran[i],
-      recovery_rate     = theta$prec[i],
-      n                 = n
-    )
-
-    verbose_off(m)
-    run(m, ndays = ndays)
-    ans <- prepare_data(m, max_days = ndays)
-
-    return(ans)
-  }, mc.cores = ncores)
-
-  return(matrices)
-}
 
 # Parameters
 N <- 2e4           # Number of simulations
@@ -166,7 +76,7 @@ saveRDS(
 sim_results=readRDS("RNN-MODELS/sir.rds")
 theta <- sim_results$theta
 arrays_1d <- sim_results$simulations
-matrices
+
 sources=theta
 min_window_size=15
 max_window_size=59
@@ -213,7 +123,7 @@ process_sliding_windows <- function(matrices, sources, min_window_size, max_wind
 
 
 
-window=13
+
 pad_window <- function(window, target_rows = 59) {
   current_rows <- nrow(window)
 
@@ -293,6 +203,42 @@ generate_all_windows <- function(matrix, source, min_window_size, max_window_siz
   return(windows)
 }
 
+library(parallel)
+
+process_sliding_windows_parallel <- function(matrices, sources, min_window_size, max_window_size, target_rows = 59) {
+  num_cores <- detectCores() - 1
+  cl <- makeCluster(num_cores)
+
+  clusterExport(cl, varlist = c("generate_all_windows", "pad_window"))
+  clusterEvalQ(cl, library(matrixStats))  # if needed
+
+  all_windows <- parLapply(cl, seq_along(matrices), function(i) {
+    matrix <- matrices[[i]]
+    source <- sources[i, ]
+    generate_all_windows(matrix, source, min_window_size, max_window_size, target_rows)
+  })
+
+  stopCluster(cl)
+
+  # Flatten the list of lists
+  all_windows <- do.call(c, all_windows)
+
+  return(all_windows)
+}
+
+# Use the parallel version
+split_pad <- process_sliding_windows_parallel(
+  matrices = matrices,
+  sources = sources,
+  min_window_size = 15,
+  max_window_size = 59,
+  target_rows = 59
+)
+saveRDS(split_pad,
+        file = "RNN-MODELS/split_pad.rds",
+        compress = TRUE
+)
+
 # 3. process_sliding_windows Function
 process_sliding_windows <- function(matrices, sources, min_window_size, max_window_size, target_rows = 59) {
   all_windows <- list()
@@ -308,3 +254,9 @@ process_sliding_windows <- function(matrices, sources, min_window_size, max_wind
 
   return(all_windows)
 }
+split_pad=process_sliding_windows(matrices=matrices,sources=sources,
+                                  min_window_size=15,max_window_size = 59,target_rows = 59)
+saveRDS(split_pad,
+  file = "RNN-MODELS/split_pad.rds",
+  compress = TRUE
+)
