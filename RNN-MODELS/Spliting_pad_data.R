@@ -376,6 +376,70 @@ saveRDS(evaluation, file = "evaluation.rds")
 
 model$export('lstm_model_2e3.keras')
 
+
+#complex model
+library(keras3)
+
+model2 <- keras_model_sequential() %>%
+  # 1) First LSTM layer
+  layer_lstm(
+    units = 64,
+    input_shape = c(59, 1),  # 59 timesteps, 1 feature
+    return_sequences = TRUE, # Keep output sequence for next LSTM
+    dropout = 0.2,           # Dropout on inputs
+    recurrent_dropout = 0.2  # Dropout on recurrent connections
+  ) %>%
+  # 2) Second LSTM layer
+  layer_lstm(
+    units = 32,
+    dropout = 0.2,
+    recurrent_dropout = 0.2
+  ) %>%
+  # 3) A dense hidden layer to combine features extracted by LSTMs
+  layer_dense(
+    units = 16,
+    activation = "relu"
+  ) %>%
+  # 4) Optional additional dropout
+  layer_dropout(rate = 0.2) %>%
+  # 5) Final output layer with 4 units
+  layer_dense(units = 4, activation = "linear")
+
+# Compile the model (example with MSE loss and MAE metric)
+model2 %>% compile(
+  optimizer = "adam",
+  loss = "mse",
+  metrics = "accuracy"
+)
+model2 %>% fit(
+  x = train_input,      # shape (num_samples, 59, 1)
+  y = train_target,     # shape (num_samples, 4)
+  epochs = 1,
+  batch_size = 32,
+  validation_data = list(test_input, test_target)
+)
+
+# Print summary to see layer details
+summary(model2)
+evaluation2 <- model2 %>% evaluate(test_input, test_target)
+print(evaluation)
+predictions2 <- model2 %>% predict(test_input)
+
+# Print the first few predictions
+print(head(predictions2))
+summary(model2)
+model2$save('lstm_model2_2e3.keras')
+MAEs2 <- abs(predictions2 - as.matrix(test_target)) |>
+  colMeans() |>
+  print()
+
+saveRDS(MAE2s, file = "MAE2s.rds")
+saveRDS(predictions2, file = "predictions2.rds")
+saveRDS(evaluation, file = "evaluation.rds")
+
+model$export('lstm_model2_2e3.keras')
+
+
 #
 # pad_window <- function(window, target_rows = 59) {
 #   current_rows <- nrow(window)
