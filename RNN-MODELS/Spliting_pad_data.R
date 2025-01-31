@@ -437,7 +437,54 @@ saveRDS(MAE2s, file = "MAE2s.rds")
 saveRDS(predictions2, file = "predictions2.rds")
 saveRDS(evaluation, file = "evaluation.rds")
 
-model$export('lstm_model2_2e3.keras')
+model2$export('lstm_model2_2e3.keras')
+
+## model with masking:
+
+
+model3 <- keras_model_sequential() %>%
+  layer_masking(mask_value = -1, input_shape = c(59, 1)) %>% # Mask values of -1
+  layer_lstm(units = 50) %>%  # LSTM layer with 50 units
+  layer_dense(units = 4)       # Output layer with 4 units
+
+# Compile the model
+model3 %>% compile(
+  optimizer = 'adam',
+  loss = 'mse',  # Mean Squared Error for regression
+  metrics = "accuracy"
+)
+
+# Train the model
+model3 %>% fit(
+  x = train_input,
+  y = train_target,
+  epochs = 1,  # Number of epochs
+  batch_size = 32,  # Batch size
+  validation_data = list(test_input, test_target)
+)
+
+# Plot training history
+evaluation3 <- model3 %>% evaluate(test_input, test_target)
+print(evaluation3)
+predictions3 <- model3 %>% predict(test_input)
+
+# Print the first few predictions
+print(head(predictions3))
+summary(model3)
+model3$save('lstm_model3_2e3.keras')
+MAEs3 <- abs(predictions3 - as.matrix(test_target)) |>
+  colMeans() |>
+  print()
+
+saveRDS(MAEs3, file = "MAEs3.rds")
+saveRDS(predictions3, file = "predictions3.rds")
+saveRDS(evaluation3, file = "evaluation3.rds")
+
+
+
+
+
+
 
 
 #
