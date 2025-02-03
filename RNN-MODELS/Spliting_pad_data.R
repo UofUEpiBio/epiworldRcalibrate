@@ -7,17 +7,47 @@ library(tensorflow)
 library(abind)
 
 
-# Function to Generate Theta Parameters for SIR Model Simulation
-generate_theta <- function(N, n) {
-  set.seed(1231)
-  theta <- data.table::data.table(
-    preval = sample((100:2000) / n, N, replace = TRUE),
-    crate  = stats::rgamma(N, shape = 5, rate = 1),
-    ptran  = stats::rbeta(N, shape1 = 3, shape2 = 7),
-    prec   = stats::rbeta(N, shape1 = 10, shape2 = 10)
-  )
-  return(theta)
+#Function to Generate Theta Parameters for SIR Model Simulation
+# generate_theta <- function(N, n) {
+#   set.seed(1231)
+#   theta <- data.table::data.table(
+#     preval = sample((100:2000) / n, N, replace = TRUE),
+#     crate  = stats::rgamma(N, shape = 5, rate = 1),
+#     ptran  = stats::rbeta(N, shape1 = 1, shape2 = 19),
+#     prec   = stats::rbeta(N, shape1 = 10, shape2 = 10)
+#   )
+#   return(theta)
+# }
+
+N=2e4
+n=5000
+# Parameters for ptran
+mean_ptran <- 0.3
+alpha_ptran <- 4   # Higher alpha for more concentrated values
+beta_ptran <- alpha_ptran * (1 / mean_ptran - 1)
+
+
+ptran <- rbeta(N, alpha_ptran, beta_ptran)
+ptran <- ptran[ptran > 0.05 & ptran < 0.95]  # Truncate extreme values
+while (length(ptran) < N) {                  # Resample to maintain N
+  new_values <- rbeta(N - length(ptran), alpha_ptran, beta_ptran)
+  ptran <- c(ptran, new_values[new_values > 0.05 & new_values < 0.95])
 }
+
+
+# Dataset generation
+theta <- data.table(
+  preval = sample((100:2000) / n, N, TRUE),
+  crate  = rgamma(N, shape = 5, rate = 1),    # Gamma distribution with mean 5
+  ptran  = ptran,                             # Improved Beta distribution
+  prec   = stats::rbeta(N, shape1 = 10, shape2 = 10)                               # Improved Beta distribution
+)
+
+# Check distribution of ptran and prec
+hist(theta$ptran, breaks = 30, main = "Histogram of ptran", xlab = "ptran")
+hist(theta$prec, breaks = 30, main = "Histogram of prec", xlab = "prec")
+summary(theta$ptran)
+summary(theta$prec)
 
 # Function to Prepare Data for TensorFlow Model: General SIR Data Preparation
 prepare_data <- function(m, max_days = 60) {
@@ -111,10 +141,8 @@ ncores <- 20       # Number of cores for parallel processing
 seeds <- sample(1:1e6, N, replace = FALSE)  # Unique seeds for reproducibility
 
 # Generate theta and run simulations
-theta <- generate_theta(N, n)
+#theta <- generate_theta(N, n)
 matrices <- run_simulations(N, n, ndays, ncores, theta, seeds)
-
-
 # Filter out simulations that resulted in errors or contain NA values
 is_not_null <- intersect(
   which(!sapply(matrices, inherits, what = "error")),
@@ -223,59 +251,11 @@ augment_ts <- function(
 }
 
 
-
-
 augment_ts <- function(
     x, n,
     min_size = NULL,
     max_size = NULL,
-    fill = -1,
-    ncpus = parallel::detectCores() - 1L
-) {
-  # If x is a list, apply augment_ts to each vector in parallel
-  if (is.list(x)) {
-    return(parallel::mclapply(
-      x, augment_ts, n = n,
-      min_size = min_size, max_size = max_size,
-      fill = fill, ncpus = 1L,
-      mc.cores = ncpus
-    ))
-  }
-
-  # Ensure x is a numeric vector
-  if (!is.numeric(x)) stop("x must be a numeric vector.")
-
-  # Set default window sizes based on vector length
-  if (is.null(min_size)) min_size <- max(10, floor(length(x) / 2))  # Ensure min_size is at least 10
-  if (is.null(max_size)) max_size <- length(x) - 1L  # Avoid max_size being full length
-
-  # Avoid invalid window sizes
-  if (min_size >= length(x)) min_size <- floor(length(x) / 2)
-  if (max_size >= length(x)) max_size <- length(x) - 1L
-  if (min_size > max_size) min_size <- max_size - 1L
-
-  # 1. Generate random sizes
-  sizes <- sample(min_size:max_size, n, replace = TRUE)
-
-  # 2. Generate random start indices
-  idxs <- sample(1:(length(x) - min(sizes)), n, replace = TRUE)
-
-  # 3. Extract the windows and pad with `fill`
-  windows <- lapply(seq_along(idxs), function(i) {
-    idx <- idxs[i]
-    size <- sizes[i]
-    window <- x[idx:(idx + size - 1)]  # Extract sub-sequence
-    padded <- c(window, rep(fill, length(x) - size))  # Pad with `fill`
-    return(padded)
-  })
-
-  return(windows)
-}
-augment_ts <- function(
-    x, n,
-    min_size = NULL,
-    max_size = NULL,
-    fill = -1,
+    fill = -1.1,
     ncpus = parallel::detectCores() - 1L
 ) {
   # If x is a list, apply augment_ts to each vector in parallel
@@ -371,7 +351,7 @@ temporal_input <- layer_input(shape = c(59, 1), name = "temporal_input")  # Inpu
 
 # Apply Masking to Ignore Padded Timesteps
 masked_temporal_input <- temporal_input %>%
-  layer_masking(mask_value = -1)  # Ignores -1 values as padding
+  layer_masking(mask_value = -1.1)  # Ignores -1 values as padding
 
 # Define RNN Layer (Handles Variable-Length Inputs)
 rnn_output <- masked_temporal_input %>%
@@ -399,7 +379,7 @@ model %>% compile(
 model %>% fit(
   x = train_x,  # Your prepared time-series training set
   y = train_y,  # Corresponding target labels
-  epochs = 50,
+  epochs = 100,
   batch_size = 32,
   validation_split = 0.2  # Optional: Splitting training data for validation
 )
@@ -412,7 +392,7 @@ predictions_RNN <- model %>% predict(test_x)
 # Print the first few predictions
 print(head(predictions_RNN))
 summary(model)
-model$save('RNN_model_2e4.keras')
+model$save('RNN_model_2e4_pad1.1.keras')
 MAEs_RNN <- abs(predictions_RNN - as.matrix(test_y)) |>
   colMeans() |>
   print()
@@ -490,7 +470,8 @@ predictions_RNN2 <- model3 %>% predict(test_x)
 
 # **Print the first few predictions**
 print(head(predictions_RNN2))
-
+predictions_RNN2[250,]
+test_y[250,]
 # **Save the Model**
 model3$save("RNN_Improved.keras")
 
@@ -514,7 +495,7 @@ temporal_input <- layer_input(shape = c(59, 1), name = "temporal_input")  # Inpu
 
 # Apply Masking to Ignore Padded Timesteps
 masked_temporal_input <- temporal_input %>%
-  layer_masking(mask_value = -1)  # Ignores -1 values as padding
+  layer_masking(mask_value = -1.1)  # Ignores -1 values as padding
 
 # **First LSTM Layer with Regularization**
 lstm_output1 <- masked_temporal_input %>%
