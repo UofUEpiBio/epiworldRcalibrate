@@ -75,7 +75,7 @@ prepare_data <- function(m, max_days =60) {
   }
 
   # Returning without the first observation (which is mostly zero)
-  dprep <- t(diff(as.matrix(ans[-1,])))
+  dprep <- t((as.matrix(ans[-1,])))
 
   ans <- array(dim = c(1, dim(dprep)))
   ans[1,,] <- dprep
