@@ -10,11 +10,9 @@ library(abind)
 set.seed(1231)
 
 # Parameters
-# Load necessary libraries
-library(data.table)
 
 # Set the number of simulations
-N <- 2e4
+N <- 1e4
 
 # Generate 'n' first
 n_values <- sample(5000:10000, N, replace = TRUE)
@@ -74,7 +72,7 @@ prepare_data <- function(m, max_days = 60) {
       ans[[col]] <- data.table::nafill(ans[[col]], type = "locf")
     }
 
-    dprep <- t(diff(as.matrix(ans[-1, ])))
+    dprep <- t((as.matrix(ans[-1, ])))
     ans_array <- array(dim = c(1, dim(dprep)))
     ans_array[1, , ] <- dprep
 
@@ -130,62 +128,71 @@ is_not_null <- intersect(
 matrices <- matrices[is_not_null]
 theta    <- theta[is_not_null,]
 length(matrices)
-data <- lapply(matrices, function(mat) c(mat))
-augment_ts_with_theta <- function(x, theta, n_splits = 10, min_size = 15, max_size = 59, fill = -1.1) {
-  # Ensure x is a list of numeric vectors
-  if (!is.list(x) || length(x) != nrow(theta)) stop("x must be a list of numeric vectors, matching theta rows.")
 
-  set.seed(42)  # For reproducibility
-
-  # Define different start positions for splits
-  split_positions <- lapply(1:length(x), function(i) {
-    starts <- sample(1:(max_size - min_size), n_splits, replace = TRUE)
-    ends <- starts + sample(min_size:(max_size - starts), n_splits, replace = TRUE)
-    return(data.frame(start = starts, end = ends))
-  })
-
-  # Store augmented datasets and corresponding thetas
-  split_data <- list()
-  split_thetas <- list()
-
-  # Iterate through each dataset and split it into 10 versions
-  for (i in seq_along(x)) {
-    single_ts <- x[[i]]  # Current dataset
-    current_theta <- theta[i, ]  # Current theta row
-
-    for (j in 1:n_splits) {
-      start_idx <- split_positions[[i]]$start[j]
-      end_idx <- split_positions[[i]]$end[j]
-
-      # Ensure the range does not exceed dataset length
-      len_x <- length(single_ts)
-      if (end_idx > len_x) end_idx <- len_x
-
-      # Create a full -1.1 filled array
-      padded <- rep(fill, max_size)
-
-      # Insert the extracted subrange into the beginning, fill remaining with -1.1
-      extracted_values <- single_ts[start_idx:end_idx]
-      padded[1:length(extracted_values)] <- extracted_values
-
-      # Store the augmented dataset
-      split_data[[length(split_data) + 1]] <- padded
-      split_thetas[[length(split_thetas) + 1]] <- current_theta  # Repeat theta
-    }
-  }
-
-  # Convert split_thetas list to a proper data.table
-  theta_expanded <- rbindlist(split_thetas, use.names = TRUE, fill = TRUE)
-
-  return(list(data = split_data, theta = theta_expanded))
+data <- list()
+for (i in seq_along(matrices)) {
+  data[[i]] <- matrices[[i]][, 1, , drop = FALSE]  # Extract first column across all layers
 }
 
-# Apply the function
-split_results <- augment_ts_with_theta(data, theta, n_splits = 10)
+data2 <- lapply(data, function(mat) c(mat))
+augment_ts <- function(
+    x, n,
+    min_size = NULL,
+    max_size = NULL,
+    fill = -1,
+    ncpus = parallel::detectCores() - 1L
+) {
+  # If x is a list, apply augment_ts to each vector in parallel
+  if (is.list(x)) {
+    return(parallel::mclapply(
+      x, augment_ts, n = n,
+      min_size = min_size, max_size = max_size,
+      fill = fill, ncpus = 1L,
+      mc.cores = ncpus
+    ))
+  }
 
-# Extract split datasets and corresponding theta values
-split_pad <- split_results$data
-theta_pad <- split_results$theta
+  # Ensure x is a numeric vector
+  if (!is.numeric(x)) stop("x must be a numeric vector.")
+
+  len_x <- length(x)  # Get the length of the time series
+
+  # Set default window sizes
+  if (is.null(min_size)) min_size <- max(10, floor(len_x / 2))  # Ensure min_size is at least 10
+  if (is.null(max_size)) max_size <- len_x - 1L  # Ensure max_size does not exceed len_x
+
+  # Prevent invalid sizes
+  if (min_size >= len_x) min_size <- floor(len_x / 2)
+  if (max_size >= len_x) max_size <- len_x - 1L
+  if (min_size > max_size) min_size <- max_size - 1L
+
+  # 1. Generate random sizes
+  sizes <- sample(min_size:max_size, n, replace = TRUE)
+
+  # 2. Generate safe start indices to prevent exceeding vector length
+  idxs <- sapply(sizes, function(size) {
+    sample(1:(len_x - size + 1), 1)  # Ensure start index allows a full window
+  })
+
+  # 3. Extract the windows and pad with `fill`
+  windows <- lapply(seq_along(idxs), function(i) {
+    idx <- idxs[i]
+    size <- sizes[i]
+    window <- x[idx:(idx + size - 1)]  # Extract valid sub-sequence
+    padded <- c(window, rep(fill, len_x - size))  # Correctly pad with `fill`
+    return(padded)
+  })
+
+  return(windows)
+}
+
+augmented_data <- augment_ts(data2,n=10, min_size = 15,max_size = 59)
+# x <- replicate(1000, 1:100, simplify = FALSE)
+
+split_pad=unlist(augmented_data,recursive=FALSE)
+
+theta_expanded <- theta[rep(seq_len(.N), each = 10)]
+theta_pad <- theta_expanded
 
 # Save processed dataset and thetas
 saveRDS(list(data = split_pad, theta = theta_pad), file = "RNN-MODELS/split_pad_with_theta.rds", compress = TRUE)
@@ -247,9 +254,9 @@ test_y  <- target_data[-train_indices, , drop = FALSE]
 # Define Temporal Input (Time-Series Data)
 temporal_input <- layer_input(shape = c(59, 1), name = "temporal_input")
 
-# Apply Masking to Ignore Padded Timesteps (-1.1)
+# Apply Masking to Ignore Padded Timesteps (-1)
 masked_temporal_input <- temporal_input %>%
-  layer_masking(mask_value = -1.1)
+  layer_masking(mask_value = -1)
 
 # RNN Layer for Processing Time-Series Data
 rnn_output <- masked_temporal_input %>%
@@ -296,10 +303,223 @@ MAEs_RNN <- abs(predictions_RNN - as.matrix(test_y)) |>
   colMeans() |>
   print()
 # Save Model
-model$save('RNN_model_with_metadata.keras')
+model$save('RNN_model_with_metadata_10k.keras')
 
 # Save Results
-saveRDS(predictions_RNN, file = "predictions_RNN_with_metadata.rds")
-saveRDS(evaluation_RNN, file = "evaluation_RNN_with_metadata.rds")
-saveRDS(MAEs_RNN, file = "MAEs_RNN_with_metadata.rds")
+saveRDS(predictions_RNN, file = "predictions_RNN_with_metadata_10k.rds")
+saveRDS(evaluation_RNN, file = "evaluation_RNN_with_metadata_10k.rds")
+saveRDS(MAEs_RNN, file = "MAEs_RNN_with_metadata_10k.rds")
+
+
+pred=as.data.table(predictions_RNN)
+
+pred[, id := 1L:.N]
+pred=as.matrix(pred)
+pred[, 2] <- qlogis(as.numeric(pred[, 2]))
+
+pred <- as.data.table(pred)
+
+# Convert `id` column to integer (if needed)
+pred[, id := as.integer(id)]
+names(pred)=c("recov","crate","ptran","id")
+# Melt properly using `data.table::melt()`
+pred_long <- melt(pred, id.vars = "id",, value.name = "value")
+
+
+
+theta_long <- test_y |> as.data.table()
+setnames(theta_long, names(theta_long))
+theta_long[, id := 1L:.N]
+theta_long[, crate := qlogis(crate)]
+theta_long <- melt(theta_long, id.vars = "id")
+
+alldat <- rbind(
+  cbind(pred_long, Type = "Predicted"),
+  cbind(theta_long, Type = "Observed")
+)
+
+library(ggplot2)
+ggplot(alldat, aes(x = value, colour = Type)) +
+  facet_wrap(~variable, scales = "free") +
+  geom_boxplot()
+
+alldat_wide <- dcast(alldat, id + variable ~ Type, value.var = "value")
+
+vnames <- data.table(
+  variable = c("recov","crate","ptran"),
+  Name     = paste(
+    c("P(recovery)", "Contact Rate", "P(transmit)"),
+    sprintf("(MAE: %.2f)", MAEs_RNN)
+  )
+)
+
+alldat_wide <- merge(alldat_wide, vnames, by = "variable")
+N_train=train_indices
+N=length(split_pad)
+ggplot(alldat_wide, aes(x = Observed, y = Predicted)) +
+  facet_wrap(~ Name, scales = "free") +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(alpha = .2) +
+  labs(
+    title    = "Observed vs Predicted (validation set)",
+    subtitle = sprintf(
+      "The model includes %i simulated datasets, of which %i were used for training.",
+      N,
+      N_train
+    ),
+    caption  = "Predictions made using a CNN as implemented with loss function MAE."
+
+  )
+
+
+
+tensorflow::tf$keras$backend$clear_session()
+### LSTM
+
+
+# Define Temporal Input (Time-Series Data)
+temporal_input <- layer_input(shape = c(59, 1), name = "temporal_input")
+
+# Apply Masking to Ignore Padded Timesteps (-1)
+masked_temporal_input <- temporal_input %>%
+  layer_masking(mask_value = -1)
+
+# **Replace SimpleRNN with LSTM**
+lstm_output <- masked_temporal_input %>%
+  layer_lstm(units = 64, activation = "tanh", return_sequences = FALSE, kernel_regularizer = regularizer_l2(0.001)) %>%
+  layer_dropout(rate = 0.3)  # Increased dropout for better generalization
+
+# Define Metadata Input (Static Features: n, preval)
+metadata_input <- layer_input(shape = c(2), name = "metadata_input")
+
+# Concatenate LSTM and Metadata Processing
+merged <- layer_concatenate(list(lstm_output, metadata_input))
+
+# Fully Connected Layers After Concatenation
+final_output <- merged %>%
+  layer_dense(units = 8, activation = "relu") %>%
+  layer_dense(units = 3, activation = "linear", name = "output")  # Predicting (recov, crate, ptran)
+
+# Define the Model
+model <- keras_model(inputs = list(temporal_input, metadata_input), outputs = final_output)
+
+# Compile the Model
+model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "mse",
+  metrics = c("mae", "mse")
+)
+
+# Train the Model
+history <- model %>% fit(
+  x = train_x,
+  y = train_y,
+  epochs = 50,  # Adjust based on loss
+  batch_size = 32,
+  validation_split = 0.2
+)
+
+# Evaluate Model
+evaluation_LSTM <- model %>% evaluate(test_x, test_y)
+print(evaluation_LSTM)
+
+# Predict Using the Model
+predictions_LSTM <- model %>% predict(test_x)
+
+# Calculate Mean Absolute Errors (MAE)
+MAEs_LSTM <- abs(predictions_LSTM - as.matrix(test_y)) |>
+  colMeans() |>
+  print()
+
+# Save Model
+model$save('LSTM_model_with_metadata_10k.keras')
+
+# Save Results
+saveRDS(predictions_LSTM, file = "predictions_LSTM_with_metadata_10k.rds")
+saveRDS(evaluation_LSTM, file = "evaluation_LSTM_with_metadata_10k.rds")
+saveRDS(MAEs_LSTM, file = "MAEs_LSTM_with_metadata_10k.rds")
+
+pred=as.data.table(predictions_LSTM)
+pred=as.matrix(pred)
+pred[, id := 1L:.N]
+pred[, 2] <- qlogis(as.numeric(pred[, 2]))
+
+pred <- as.data.table(pred)
+
+# Convert `id` column to integer (if needed)
+pred[, id := as.integer(id)]
+names(pred)=c("recov","crate","ptran","id")
+# Melt properly using `data.table::melt()`
+pred_long <- melt(pred, id.vars = "id",, value.name = "value")
+
+
+
+theta_long <- test_y |> as.data.table()
+setnames(theta_long, names(theta_long))
+theta_long[, id := 1L:.N]
+theta_long[, crate := qlogis(crate)]
+theta_long <- melt(theta_long, id.vars = "id")
+
+alldat <- rbind(
+  cbind(pred_long, Type = "Predicted"),
+  cbind(theta_long, Type = "Observed")
+)
+
+library(ggplot2)
+ggplot(alldat, aes(x = value, colour = Type)) +
+  facet_wrap(~variable, scales = "free") +
+  geom_boxplot()
+
+alldat_wide <- dcast(alldat, id + variable ~ Type, value.var = "value")
+
+vnames <- data.table(
+  variable = c("recov","crate","ptran"),
+  Name     = paste(
+    c("P(recovery)", "Contact Rate", "P(transmit)"),
+    sprintf("(MAE: %.2f)", MAEs_LSTM)
+  )
+)
+
+alldat_wide <- merge(alldat_wide, vnames, by = "variable")
+N_train=train_indices
+N=length(split_pad)
+ggplot(alldat_wide, aes(x = Observed, y = Predicted)) +
+  facet_wrap(~ Name, scales = "free") +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_point(alpha = .2) +
+  labs(
+    title    = "Observed vs Predicted (validation set)",
+    subtitle = sprintf(
+      "The model includes %i simulated datasets, of which %i were used for training.",
+      N,
+      N_train
+    ),
+    caption  = "Predictions made using a CNN as implemented with loss function MAE."
+
+  )
+
+ggsave(filename = "calibration/sir_infections_only.png", width = 1280, height = 800, units = "px", scale = 3)
+
+library(ggplot2)
+library(data.table)
+
+# Ensure `alldat_wide` is a data.table
+setDT(alldat_wide)
+
+library(ggplot2)
+library(data.table)
+
+# Ensure `alldat_wide` is a data.table
+setDT(alldat_wide)
+
+# Create the plot with better visibility
+ggplot(alldat_wide, aes(x = Observed, y = Predicted, color = variable)) +
+  geom_point(alpha = 0.6, size = 1.5) +  # Scatter plot with larger points
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black", size = 1.2) +  # Thick dashed line
+  facet_wrap(~ Name, scales = "free") +  # Separate plots per variable with MAE
+  labs(title = "Observed vs. Predicted Values",
+       x = "Observed",
+       y = "Predicted") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 
