@@ -410,7 +410,7 @@ merged <- layer_concatenate(list(lstm_output, metadata_input))
 # Fully Connected Layers After Concatenation
 final_output <- merged %>%
   layer_dense(units = 8, activation = "relu") %>%
-  layer_dense(units = 3, activation = "linear", name = "output")  # Predicting (recov, crate, ptran)
+  layer_dense(units = 4, activation = "linear", name = "output")  # Predicting (recov, crate, ptran)
 
 # Define the Model
 model <- keras_model(inputs = list(temporal_input, metadata_input), outputs = final_output)
@@ -432,35 +432,36 @@ history <- model %>% fit(
 )
 
 # Evaluate Model
-evaluation_LSTM <- model %>% evaluate(test_x, test_y)
-print(evaluation_LSTM)
+evaluation_LSTM_seir<- model %>% evaluate(test_x, test_y)
+print(evaluation_LSTM_seir)
 
 # Predict Using the Model
-predictions_LSTM <- model %>% predict(test_x)
+predictions_LSTM_seir <- model %>% predict(test_x)
 
 # Calculate Mean Absolute Errors (MAE)
-MAEs_LSTM <- abs(predictions_LSTM - as.matrix(test_y)) |>
+MAEs_LSTM_seir <- abs(predictions_LSTM_seir - as.matrix(test_y)) |>
   colMeans() |>
   print()
 
 # Save Model
-model$save('LSTM_model_with_metadata_10k.keras')
+model$save('LSTM_model_with_metadata_seir.keras')
 
 # Save Results
-saveRDS(predictions_LSTM, file = "predictions_LSTM_with_metadata_10k.rds")
-saveRDS(evaluation_LSTM, file = "evaluation_LSTM_with_metadata_10k.rds")
-saveRDS(MAEs_LSTM, file = "MAEs_LSTM_with_metadata_10k.rds")
+saveRDS(predictions_LSTM_seir, file = "predictions_LSTM_with_metadata_seir.rds")
+saveRDS(evaluation_LSTM_seir, file = "evaluation_LSTM_with_metadata_seir.rds")
+saveRDS(MAEs_LSTM_seir, file = "MAEs_LSTM_with_metadata_seir.rds")
 
-pred=as.data.table(predictions_LSTM)
-pred=as.matrix(pred)
+pred=as.data.table(predictions_LSTM_seir)
+
 pred[, id := 1L:.N]
+pred=as.matrix(pred)
 pred[, 2] <- qlogis(as.numeric(pred[, 2]))
-
+pred[, 4] <- qlogis(as.numeric(pred[, 4]))
 pred <- as.data.table(pred)
 
 # Convert `id` column to integer (if needed)
 pred[, id := as.integer(id)]
-names(pred)=c("recov","crate","ptran","id")
+names(pred)=c("recov","crate","ptran","incubation_days","id")
 # Melt properly using `data.table::melt()`
 pred_long <- melt(pred, id.vars = "id",, value.name = "value")
 
@@ -470,6 +471,7 @@ theta_long <- test_y |> as.data.table()
 setnames(theta_long, names(theta_long))
 theta_long[, id := 1L:.N]
 theta_long[, crate := qlogis(crate)]
+theta_long[, incubation_days := qlogis(incubation_days)]
 theta_long <- melt(theta_long, id.vars = "id")
 
 alldat <- rbind(
@@ -485,10 +487,10 @@ ggplot(alldat, aes(x = value, colour = Type)) +
 alldat_wide <- dcast(alldat, id + variable ~ Type, value.var = "value")
 
 vnames <- data.table(
-  variable = c("recov","crate","ptran"),
+  variable = c("recov","crate","ptran","incubation_days"),
   Name     = paste(
-    c("P(recovery)", "Contact Rate", "P(transmit)"),
-    sprintf("(MAE: %.2f)", MAEs_LSTM)
+    c("P(recovery)", "Contact Rate", "P(transmit)","incubation days"),
+    sprintf("(MAE: %.2f)", MAEs_LSTM_seir)
   )
 )
 
@@ -510,29 +512,6 @@ ggplot(alldat_wide, aes(x = Observed, y = Predicted)) +
 
   )
 
-ggsave(filename = "calibration/sir_infections_only.png", width = 1280, height = 800, units = "px", scale = 3)
 
-library(ggplot2)
-library(data.table)
-
-# Ensure `alldat_wide` is a data.table
-setDT(alldat_wide)
-
-library(ggplot2)
-library(data.table)
-
-# Ensure `alldat_wide` is a data.table
-setDT(alldat_wide)
-
-# Create the plot with better visibility
-ggplot(alldat_wide, aes(x = Observed, y = Predicted, color = variable)) +
-  geom_point(alpha = 0.6, size = 1.5) +  # Scatter plot with larger points
-  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black", size = 1.2) +  # Thick dashed line
-  facet_wrap(~ Name, scales = "free") +  # Separate plots per variable with MAE
-  labs(title = "Observed vs. Predicted Values",
-       x = "Observed",
-       y = "Predicted") +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
+ggsave(filename = "RNN-MODELS/seir_lstm_infections_only.png", width = 1280, height = 800, units = "px", scale = 3)
 
