@@ -232,10 +232,12 @@ set.seed(123)
 
 
 # Normalize Metadata Features (n, preval) Using Min-Max Scaling
-min_values <- apply(data2[[2]], 2, min)
-max_values <- apply(data2[[2]], 2, max)
-scaled_metadata <- scale(data2[[2]], center = min_values, scale = max_values - min_values)
-
+# min_values <- apply(data2[[2]], 2, min)
+# max_values <- apply(data2[[2]], 2, max)
+# scaled_metadata <- scale(data2[[2]], center = min_values, scale = max_values - min_values)
+# scaled_metadata=data2[[2]]/1e6
+scaled_metadata=as.matrix(data2[[2]])
+scaled_metadata[,1]=scaled_metadata[,1]/1e6
 # Convert `data2[[1]]` into an array format (assuming it's a list of numeric vectors)
 time_series_data <- array(unlist(data2[[1]]), dim = c(length(data2[[1]]), 59, 1))
 
