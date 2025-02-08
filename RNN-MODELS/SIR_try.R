@@ -186,7 +186,7 @@ augment_ts <- function(
   return(windows)
 }
 
-augmented_data <- augment_ts(data2,n=10, min_size = 15,max_size = 59)
+augmented_data <- augment_ts(data2,n=10, min_size = 15,max_size = 60)
 # x <- replicate(1000, 1:100, simplify = FALSE)
 
 split_pad=unlist(augmented_data,recursive=FALSE)
@@ -209,7 +209,7 @@ print(theta_pad[10, ]) # Another corresponding theta
 
 
 # Prepare data for TensorFlow
-input_data2 <- array(unlist(split_pad), dim = c(length(split_pad), 59, 1))
+input_data2 <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
 # target_data <- as.matrix(theta_pad[,c(3,4,6)])
 # target_data[,1] = plogis(target_data[,1]/10)
 # hist(target_data[,1])
@@ -219,9 +219,9 @@ set.seed(123)
 # Filter only required columns for model training
 theta_filtered <- theta_pad[, .(n, preval)]  # Model Inputs
 theta_target   <- theta_pad[, .(recov, crate, ptran)]  # Model Outputs
-theta_target[,2] <- plogis(as.matrix(theta_target[,2]/10))
+theta_target[,2] <- plogis(as.matrix(theta_target[,2]/12.5))
 # Convert to matrices for TensorFlow
-input_data <- array(unlist(split_pad), dim = c(length(split_pad), 59, 1))
+input_data <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
 target_data <- as.matrix(theta_target)
 input_data <- split_pad
 # Ensure input metadata is properly used
@@ -239,7 +239,7 @@ set.seed(123)
 scaled_metadata=as.matrix(data2[[2]])
 scaled_metadata[,1]=scaled_metadata[,1]/1e6
 # Convert `data2[[1]]` into an array format (assuming it's a list of numeric vectors)
-time_series_data <- array(unlist(data2[[1]]), dim = c(length(data2[[1]]), 59, 1))
+time_series_data <- array(unlist(data2[[1]]), dim = c(length(data2[[1]]), 60, 1))
 
 # Split Data into Train/Test Sets (80-20)
 set.seed(123)
@@ -254,7 +254,7 @@ train_y <- target_data[train_indices, , drop = FALSE]
 test_y  <- target_data[-train_indices, , drop = FALSE]
 
 # Define Temporal Input (Time-Series Data)
-temporal_input <- layer_input(shape = c(59, 1), name = "temporal_input")
+temporal_input <- layer_input(shape = c(60, 1), name = "temporal_input")
 
 # Apply Masking to Ignore Padded Timesteps (-1)
 masked_temporal_input <- temporal_input %>%
@@ -289,7 +289,7 @@ model %>% compile(
  model %>% fit(
   x = train_x,
   y = train_y,
-  epochs = 50,
+  epochs = 40,
   batch_size = 32,
   validation_split = 0.2
 )
@@ -297,22 +297,23 @@ model %>% compile(
 # Evaluate Model
 evaluation_RNN <- model %>% evaluate(test_x, test_y)
 print(evaluation_RNN)
-
+(test_x)
 # Predict Using the Model
 predictions_RNN <- model %>% predict(test_x)
-
+min(predictions_RNN[,2])
+test_y
 MAEs_RNN <- abs(predictions_RNN - as.matrix(test_y)) |>
   colMeans() |>
   print()
 # Save Model
-model$save('RNN_model_with_metadata_10k.keras')
-
+model$save('RNN_model_with_metadata_10k_60days.keras')
+summary(model)
 # Save Results
 saveRDS(predictions_RNN, file = "predictions_RNN_with_metadata_10k.rds")
 saveRDS(evaluation_RNN, file = "evaluation_RNN_with_metadata_10k.rds")
 saveRDS(MAEs_RNN, file = "MAEs_RNN_with_metadata_10k.rds")
 
-
+theta_target[N*10-N_train:N*10,]
 pred=as.data.table(predictions_RNN)
 
 pred[, id := 1L:.N]
@@ -500,6 +501,8 @@ ggplot(alldat_wide, aes(x = Observed, y = Predicted)) +
 
   )
 
+
+
 ggsave(filename = "calibration/sir_infections_only.png", width = 1280, height = 800, units = "px", scale = 3)
 
 library(ggplot2)
@@ -525,3 +528,31 @@ ggplot(alldat_wide, aes(x = Observed, y = Predicted, color = variable)) +
   theme_minimal() +
   theme(legend.position = "bottom")
 
+
+
+theta_long$dataset <- "Observed"
+pred_long$dataset <- "Predicted"
+
+# Bind them into a single dataframe
+plot_data <- bind_rows(theta_long, pred_long)
+library(dplyr)
+# Plot
+ggplot(plot_data, aes(x = id, y = value, color = dataset, linetype = dataset)) +
+  geom_line(size = 0.8) +
+  facet_wrap(~variable, scales = "free_y") +  # Separate plots for each variable
+  scale_color_manual(values = c("Observed" = "blue", "Predicted" = "red")) +
+  scale_linetype_manual(values = c("Observed" = "solid", "Predicted" = "dashed")) +
+  labs(title = "Comparison of Observed and Predicted Values",
+       x = "ID",
+       y = "Value",
+       color = "Dataset",
+       linetype = "Dataset") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )

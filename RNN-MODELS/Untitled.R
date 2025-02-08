@@ -26,7 +26,7 @@ get_stats <- function(res, drange) {
 }
 
 # Pad/truncate an incidence vector to length L, reshape and predict parameters.
-predict_params <- function(inc_vec, model, L = 59, n = 8000, prev = 0.25) {
+predict_params <- function(inc_vec, model, L = 60, n = 8000, prev = 0.25) {
   if (length(inc_vec) < L) {
     inc_vec <- c(inc_vec, rep(-1, L - length(inc_vec)))
   } else {
@@ -39,7 +39,7 @@ predict_params <- function(inc_vec, model, L = 59, n = 8000, prev = 0.25) {
   data.frame(prec = pred[1, "prec"],
              crate = pred[1, "crate"],
              ptran = pred[1, "ptran"],
-             True_crate = qlogis(pred[1, "crate"]) * 10)
+             True_crate = qlogis(pred[1, "crate"]) * 12.5)
 }
 
 # Create a new simulation model using predicted parameters.
@@ -49,7 +49,7 @@ create_model <- function(name, pred, n = 8000, prev = 0.25) {
 }
 
 # --- Main Script ---
-
+plogis(20/12.5)
 n <- 8000; ndays <- 60
 
 # Initial simulation.
@@ -66,11 +66,11 @@ base_stats <- as.data.table(base_res$total_hist)[state == "Infected", .(total = 
 parts <- list(
   part1 = incidence[1:20],
   part2 = incidence[10:40],
-  part3 = incidence[30:59]
+  part3 = incidence[30:60]
 )
 
 # Load Keras model.
-kmodel <- tensorflow::tf$keras$models$load_model(normalizePath("~/epiworldRcalibrate/epiworldRcalibrate/RNN-MODELS/RNN_model_with_metadata_10k.keras"))
+kmodel <- tensorflow::tf$keras$models$load_model(normalizePath("~/epiworldRcalibrate/epiworldRcalibrate/RNN-MODELS/RNN_model_with_metadata_10k_60days.keras"))
 
 # Process each incidence part.
 for (i in seq_along(parts)) {
