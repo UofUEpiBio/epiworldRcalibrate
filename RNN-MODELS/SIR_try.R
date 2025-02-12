@@ -12,16 +12,20 @@ set.seed(1231)
 # Parameters
 
 # Set the number of simulations
-N <- 1e4
+N <- 2e4
+ndays <- 60
+min_days <- 40
+nsplits <- 3
+masking_default <- -1.5
 
 # Generate 'n' first
-n_values <- sample(5000:10000, N, replace = TRUE)
+n_values <- rep(10000, N) # sample(5000:10000, N, replace = TRUE)
 
 # Now create 'theta' and use 'n_values' correctly
 theta <- data.table(
   n      = n_values,  # Population size from U(5000,10000)
   preval = sample(100:2000, N, replace = TRUE) / n_values,  # Use the correct 'n' values
-  crate  = runif(N, 5, 20),  # Contact rate from U(5,20)
+  crate  = runif(N, 5, 10),  # Contact rate from U(5,20)
   recov  = 1 / runif(N, 4, 14),  # Recovery rate as 1/U(4,14)
   R0     = runif(N, 1, 5)  # Basic reproduction number from U(1,5)
 )
@@ -37,7 +41,7 @@ head(theta)
 # theta <- theta[ptran > 0.05 & ptran < 0.95]
 
 # Function to Prepare Data for TensorFlow Model: General SIR Data Preparation
-prepare_data <- function(m, max_days = 60) {
+prepare_data <- function(m, max_days = ndays) {
   ans <- tryCatch({
     ans <- list(
       repnum    = epiworldR::plot_reproductive_number(m, plot = FALSE),
@@ -72,7 +76,7 @@ prepare_data <- function(m, max_days = 60) {
       ans[[col]] <- data.table::nafill(ans[[col]], type = "locf")
     }
 
-    dprep <- t((as.matrix(ans[-1, ])))
+    dprep <- t(diff(as.matrix(ans[-1, ])))
     ans_array <- array(dim = c(1, dim(dprep)))
     ans_array[1, , ] <- dprep
 
@@ -88,7 +92,7 @@ prepare_data <- function(m, max_days = 60) {
 
 # Function to Run SIR Model Simulations in Parallel
 run_simulations <- function(N, theta) {
-  ncores <- parallel::detectCores() - 1
+  ncores <- Sys.getenv("SLURM_NTASKS") |> as.integer() # parallel::detectCores() - 1
   seeds <- sample(1:1e6, N, replace = FALSE)
 
   matrices <- parallel::mclapply(1:N, function(i) {
@@ -103,8 +107,8 @@ run_simulations <- function(N, theta) {
     )
 
     verbose_off(m)
-    run(m, ndays = 60)
-    ans <- prepare_data(m, max_days = 60)
+    run(m, ndays = ndays)
+    ans <- prepare_data(m, max_days = ndays)
 
     return(ans)
   }, mc.cores = ncores)
@@ -115,9 +119,9 @@ run_simulations <- function(N, theta) {
 # Run Simulations
 matrices <- run_simulations(N, theta)
 # Remove NULL values from matrices
-valid_indices <- which(!sapply(matrices, is.null))
-matrices <- matrices[valid_indices]
-theta <- theta[valid_indices, ]  # Ensure theta stays in sync with matrices
+# valid_indices <- which(!sapply(matrices, is.null))
+# matrices <- matrices[valid_indices]
+# theta <- theta[valid_indices, ]  # Ensure theta stays in sync with matrices
 # Now
 
 # Filter out simulations with errors or NA values
@@ -139,7 +143,7 @@ augment_ts <- function(
     x, n,
     min_size = NULL,
     max_size = NULL,
-    fill = -1,
+    fill = masking_default,
     ncpus = parallel::detectCores() - 1L
 ) {
   # If x is a list, apply augment_ts to each vector in parallel
@@ -186,12 +190,17 @@ augment_ts <- function(
   return(windows)
 }
 
-augmented_data <- augment_ts(data2,n=10, min_size = 15,max_size = 60)
+augmented_data <- augment_ts(
+  data2,
+  n=nsplits,
+  min_size = floor(length(data2[[1]])/2),
+  max_size = length(data2[[1]])
+  )
 # x <- replicate(1000, 1:100, simplify = FALSE)
 
 split_pad=unlist(augmented_data,recursive=FALSE)
 
-theta_expanded <- theta[rep(seq_len(.N), each = 10)]
+theta_expanded <- theta[rep(seq_len(.N), each = nsplits)]
 theta_pad <- theta_expanded
 
 # Save processed dataset and thetas
@@ -207,9 +216,56 @@ print(split_pad[[10]]) # Another split dataset
 print(theta_pad[1, ])  # First corresponding theta
 print(theta_pad[10, ]) # Another corresponding theta
 
+arrays_1d <- array(dim = c(N, 1, ncol(matrices[[1]][1,,])))
+for (i in seq_along(matrices))
+  arrays_1d[i,,] <- matrices[[i]][1,,][1,]
+# arrays_1d <- arrays_1d[,1,,drop=FALSE]
+N <- dim(arrays_1d)[1]
 
+# Convert to a list of time-series vectors
+data_list <- lapply(1:N, function(i) as.vector(arrays_1d[i, , ]))
+
+# Apply time series augmentation
+augmented_data <- augment_ts(
+  data_list,
+  n = nsplits,
+  min_size = floor(ndays/2),
+  max_size = ndays
+  )
+
+# Flatten augmented data
+split_pad <- unlist(augmented_data, recursive = FALSE)
+
+# Determine the number of augmented samples
+N_aug <- length(split_pad)
+
+# Determine the length of each augmented time-series vector.
+# (This is analogous to using dim(matrices[[1]][1, , ]) in the teacher's code.)
+time_series_length <- length(split_pad[[1]])
+
+# Preallocate an array.
+# Here we mimic teacher's structure: (number of samples, number of rows, number of columns).
+arrays_1d <- array(dim = c(N_aug, 1, time_series_length))
+
+# Fill the array with your augmented data.
+for (i in seq_along(split_pad)) {
+  # Each augmented time series is inserted as a 1 x time_series_length matrix.
+  arrays_1d[i, , ] <- split_pad[[i]]
+}
+
+# Expand `theta` to match the augmented data
+theta_expanded <- theta[rep(seq_len(.N), each = nsplits)]
+theta_pad <- theta_expanded
+split_pad=arrays_1d
+# Save the augmented dataset
+#saveRDS(list(data = split_pad, theta = theta_pad), file = "calibration/augmented_sir.rds", compress = TRUE)
+
+# Check dataset sizes after augmentation
+cat("Total datasets after augmentation:", length(split_pad[,,1]), "\n")
+cat("Total theta entries after augmentation:", nrow(theta_pad), "\n")
+input_data2=split_pad
 # Prepare data for TensorFlow
-input_data2 <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
+# input_data2 <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
 # target_data <- as.matrix(theta_pad[,c(3,4,6)])
 # target_data[,1] = plogis(target_data[,1]/10)
 # hist(target_data[,1])
@@ -221,9 +277,9 @@ theta_filtered <- theta_pad[, .(n, preval)]  # Model Inputs
 theta_target   <- theta_pad[, .(recov, crate, ptran)]  # Model Outputs
 theta_target[,2] <- plogis(as.matrix(theta_target[,2]/12.5))
 # Convert to matrices for TensorFlow
-input_data <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
+# input_data <- array(unlist(split_pad), dim = c(length(split_pad), 60, 1))
 target_data <- as.matrix(theta_target)
-input_data <- split_pad
+# input_data <- split_pad
 # Ensure input metadata is properly used
 input_metadata <- as.matrix(theta_filtered)
 data2=list(split_pad, theta_filtered)
@@ -239,12 +295,12 @@ set.seed(123)
 scaled_metadata=as.matrix(data2[[2]])
 scaled_metadata[,1]=scaled_metadata[,1]/1e6
 # Convert `data2[[1]]` into an array format (assuming it's a list of numeric vectors)
-time_series_data <- array(unlist(data2[[1]]), dim = c(length(data2[[1]]), 60, 1))
-
+# time_series_data <- array(unlist(data2[[1]]), dim = c(length(data2[[1]]), 60, 1))
+# time_series_data=input_data
 # Split Data into Train/Test Sets (80-20)
 set.seed(123)
 num_samples <- nrow(target_data)
-train_indices <- sample(1:num_samples, size = floor(0.8 * num_samples))
+# train_indices <- sample(1:num_samples, size = floor(0.8 * num_samples))
 
 # Training & Testing Data (Passing both time-series and metadata)
 train_x <- list(time_series_data[train_indices, , , drop = FALSE], scaled_metadata[train_indices, , drop = FALSE])
@@ -253,12 +309,41 @@ test_x  <- list(time_series_data[-train_indices, , , drop = FALSE], scaled_metad
 train_y <- target_data[train_indices, , drop = FALSE]
 test_y  <- target_data[-train_indices, , drop = FALSE]
 
+arrays1_d=split_pad
+N_train <- floor(nrow(arrays_1d) * .7)
+id_train <- 1:N_train
+train <- list(
+  x = array_reshape(
+    arrays_1d[id_train,,], dim = c(N_train, dim(arrays_1d)[-1])
+  ),
+  y =  array_reshape(
+    as.matrix(theta_target)[id_train,], dim = c(N_train, ncol(theta_target)))
+)
+train$y[1,]
+train$x[1,,]
+
+hist(qlogis(train$y[,2])*12.5)
+N_test <- nrow(arrays_1d) - N_train
+id_test <- (N_train + 1):nrow(arrays_1d)
+
+test <- list(
+  x = array_reshape(arrays_1d[id_test,,], dim = c(N_test, dim(arrays_1d)[-1])),
+  y = array_reshape(as.matrix(theta_target)[id_test,], dim = c(N_test, ncol(theta_target)))
+)
+
+# # Ensure train$x is correctly shaped (batch, 60, 1)
+# train$x <- aperm(train$x, c(1, 3, 2))
+#
+# # Ensure test$x is correctly shaped (batch, 60, 1)
+# test$x <- aperm(test$x, c(1, 3, 2))
+
+input_shape = c(dim(arrays_1d)[-1])
 # Define Temporal Input (Time-Series Data)
-temporal_input <- layer_input(shape = c(60, 1), name = "temporal_input")
+temporal_input <- layer_input(shape = input_shape, name = "temporal_input")
 
 # Apply Masking to Ignore Padded Timesteps (-1)
 masked_temporal_input <- temporal_input %>%
-  layer_masking(mask_value = -1)
+  layer_masking(mask_value = masking_default)
 
 # RNN Layer for Processing Time-Series Data
 rnn_output <- masked_temporal_input %>%
@@ -266,17 +351,17 @@ rnn_output <- masked_temporal_input %>%
   layer_dropout(rate = 0.2)
 
 # Define Metadata Input (Static Features: n, preval)
-metadata_input <- layer_input(shape = c(2), name = "metadata_input")
+# metadata_input <- layer_input(shape = c(2), name = "metadata_input")
 
 # Concatenate RNN and Metadata Processing
-merged <- layer_concatenate(list(rnn_output, metadata_input))
+merged <- layer_concatenate(list(rnn_output))
 
 # Final Output Layer (Regression Task)
 final_output <- merged %>%
   layer_dense(units = 3, activation = "linear", name = "output")
 
 # Define the Model (Now it accepts two inputs)
-model <- keras_model(inputs = list(temporal_input, metadata_input), outputs = final_output)
+model <- keras_model(inputs = list(temporal_input), outputs = final_output)
 
 # Compile the Model
 model %>% compile(
@@ -287,26 +372,26 @@ model %>% compile(
 
 # Train the Model
  model %>% fit(
-  x = train_x,
-  y = train_y,
-  epochs = 40,
-  batch_size = 32,
+  x = train$x,
+  y = train$y,
+  epochs = 15,
+  # batch_size = 32,
   validation_split = 0.2
 )
 
+
 # Evaluate Model
-evaluation_RNN <- model %>% evaluate(test_x, test_y)
+evaluation_RNN <- model %>% evaluate(test$x, test$y)
 print(evaluation_RNN)
-(test_x)
 # Predict Using the Model
-predictions_RNN <- model %>% predict(test_x)
-min(predictions_RNN[,2])
-test_y
-MAEs_RNN <- abs(predictions_RNN - as.matrix(test_y)) |>
+predictions_RNN <- model %>% predict(test$x)
+max(predictions_RNN[,2])
+
+MAEs_RNN <- abs(predictions_RNN - as.matrix(test$y)) |>
   colMeans() |>
   print()
 # Save Model
-model$save('RNN_model_with_metadata_10k_60days.keras')
+model$save('RNN_model_with_metadata_10k_60days_corrected.keras')
 summary(model)
 # Save Results
 saveRDS(predictions_RNN, file = "predictions_RNN_with_metadata_10k.rds")
@@ -318,7 +403,7 @@ pred=as.data.table(predictions_RNN)
 
 pred[, id := 1L:.N]
 pred=as.matrix(pred)
-pred[, 2] <- qlogis(as.numeric(pred[, 2]))
+pred[, 2] <- qlogis(as.numeric(pred[, 2]))*12.5
 
 pred <- as.data.table(pred)
 
@@ -330,10 +415,11 @@ pred_long <- melt(pred, id.vars = "id",, value.name = "value")
 
 
 
-theta_long <- test_y |> as.data.table()
+theta_long <- test$y |> as.data.table()
+colnames(theta_long)=c("recov","crate","ptran")
 setnames(theta_long, names(theta_long))
 theta_long[, id := 1L:.N]
-theta_long[, crate := qlogis(crate)]
+theta_long[, crate := qlogis(crate)*12.5]
 theta_long <- melt(theta_long, id.vars = "id")
 
 alldat <- rbind(
@@ -357,8 +443,8 @@ vnames <- data.table(
 )
 
 alldat_wide <- merge(alldat_wide, vnames, by = "variable")
-N_train=train_indices
-N=length(split_pad)
+N_train=floor(14e*5*0.7)
+N=5*1e4
 ggplot(alldat_wide, aes(x = Observed, y = Predicted)) +
   facet_wrap(~ Name, scales = "free") +
   geom_abline(slope = 1, intercept = 0) +

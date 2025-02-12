@@ -56,7 +56,7 @@ incidence_part1 <- c(incidence_part1 ,rep(-1,60-length(incidence_part1 )))
 incidence_part2 <- c(incidence_part2 ,rep(-1,60-length(incidence_part2 )))
 incidence_part3 <- c(incidence_part3 ,rep(-1,60-length(incidence_part3 )))
 
-model=tensorflow::tf$keras$models$load_model(normalizePath("~/epiworldRcalibrate/epiworldRcalibrate/RNN-MODELS/RNN_model_with_metadata_10k.keras"))
+model=tensorflow::tf$keras$models$load_model(normalizePath("~/epiworldRcalibrate/epiworldRcalibrate/RNN-MODELS/RNN_model_with_metadata_10k_60days.keras"))
 
 
 # Ensure `incidence_part1` is in the correct format: (batch_size=1, time_steps=59, features=1)
