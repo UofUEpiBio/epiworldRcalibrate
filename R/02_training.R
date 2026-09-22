@@ -218,6 +218,21 @@ train_bilstm_calibrator <- function(
     dropout = 0.5,
     physics_weight = 0
 ) {
+
+  # We want to use the function
+  # file.path("model", "seir", "train_bilstm.py", package="epiworldRcalibrate")
+  # You don't want to include inst explicitly, since all files under
+  # inst are automatically copied into the package folder.
+  #
+  # If a user wants to save a new model, they CANNOT use the same system.
+  # they have to save files directly to other place in their computers.
+  #
+  # Finally, when writing the testing functions (including examples and 
+  # vignettes), you want to avoid having examples that write directly to
+  # non-temp folders (for instance, the home directory or the desktop).
+  # For this we use `tempdir()`.
+  # 
+
   package_dir <- normalizePath(package_dir, mustWork = TRUE)
   script <- package_file("inst", "python", "train_bilstm.py", package_dir = package_dir)
   python <- reticulate::py_config()$python

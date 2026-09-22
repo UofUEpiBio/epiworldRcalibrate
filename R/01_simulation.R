@@ -531,9 +531,9 @@ generate_sir_training_data <- function(
     ndays = 60,
     seed = 122,
     priors = NULL,
-    save = TRUE,
+    save = FALSE,
     name = "sir",
-    package_dir = "."
+    package_dir = tempdir()
 ) {
   bank <- simulate_training_data(
     simulator = sir_simulator(ndays = ndays, priors = priors),
@@ -542,6 +542,7 @@ generate_sir_training_data <- function(
   )
 
   if (isTRUE(save)) {
+    message("Saving training bank to ", file.path(package_dir, "data"))
     save_training_data(bank, name = name, package_dir = package_dir)
   }
 
@@ -563,9 +564,9 @@ generate_seir_training_data <- function(
     ndays = 365,
     seed = 122,
     priors = NULL,
-    save = TRUE,
+    save = FALSE,
     name = "seir",
-    package_dir = "."
+    package_dir = tempdir()
 ) {
   bank <- simulate_training_data(
     simulator = seir_simulator(ndays = ndays, priors = priors),
@@ -574,6 +575,7 @@ generate_seir_training_data <- function(
   )
 
   if (isTRUE(save)) {
+    message("Saving training bank to ", file.path(package_dir, "data"))
     save_training_data(bank, name = name, package_dir = package_dir)
   }
 
