@@ -1,0 +1,24 @@
+{
+  "model_type": "SEIR",
+  "calibrator": "BiLSTM",
+  "known_names": [
+    "n",
+    "recov",
+    "incub"
+  ],
+  "target_names": [
+    "ptran",
+    "crate",
+    "R0"
+  ],
+  "sequence_length": 365,
+  "hidden_size": 160,
+  "num_layers": 3,
+  "dropout": 0.5,
+  "epochs": 10,
+  "best_epoch": 7,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "seed": 122,
+  "physics_weight": 0.03
+}

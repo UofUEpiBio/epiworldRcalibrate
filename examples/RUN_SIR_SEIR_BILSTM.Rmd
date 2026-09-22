@@ -1,0 +1,946 @@
+---
+title: "Run SIR and SEIR BiLSTM Calibration"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+
+# ---------------------------------------------------------------------------
+# Find the package root whether this file is run from the project root,
+# examples/, or vignettes/.
+# ---------------------------------------------------------------------------
+find_root <- function() {
+  candidates <- c(".", "..", "../..", "../../..")
+
+  for (x in candidates) {
+    if (
+      file.exists(file.path(x, "DESCRIPTION")) &&
+      dir.exists(file.path(x, "R")) &&
+      dir.exists(file.path(x, "inst"))
+    ) {
+      return(normalizePath(x, mustWork = TRUE))
+    }
+  }
+
+  stop(
+    "Could not find the epiworldRcalibrate project root. ",
+    "Open the R project and run this file from inside the package."
+  )
+}
+
+PROJECT_ROOT <- find_root()
+
+# Make relative paths in all later chunks resolve from the package root.
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+
+# Source the three user-facing R files.
+source(file.path(PROJECT_ROOT, "R", "01_simulation.R"))
+source(file.path(PROJECT_ROOT, "R", "02_training.R"))
+source(file.path(PROJECT_ROOT, "R", "03_test_compare.R"))
+
+# ---------------------------------------------------------------------------
+# RUN SETTINGS
+#
+# FALSE = pipeline test: smaller banks and fewer epochs
+# TRUE  = full current research settings
+# ---------------------------------------------------------------------------
+FULL_RUN <- FALSE
+RETRAIN <- TRUE
+
+if (FULL_RUN) {
+
+  SIR_N_SIMS  <- 50L
+  SEIR_N_SIMS <- 20L
+  EPOCHS      <- 10L
+
+} else {
+
+  # Quick mode is for checking that the full workflow runs successfully.
+  # Do NOT use its accuracy values as final scientific results.
+  SIR_N_SIMS  <- 10L
+  SEIR_N_SIMS <- 10L
+  EPOCHS      <- 10L
+}
+
+BATCH_SIZE <- 64L
+SEED <- 122L
+
+if (!FULL_RUN) {
+  message(
+    "QUICK MODE: pipeline test only. Accuracy is not expected to be good ",
+    "with 100 simulations and 10 epochs."
+  )
+}
+
+RESULTS_DIR <- file.path(PROJECT_ROOT, "results")
+dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Purpose
+
+This notebook **actually runs** the SIR and SEIR workflows.
+
+For each model it:
+
+```text
+1. generates training data with epiworldR
+2. saves the training bank
+3. trains the generic Python BiLSTM
+4. reads validation metrics
+5. creates a new test epidemic curve
+6. loads the trained model as a calibrator
+7. estimates the unknown parameters
+8. compares prediction with truth
+9. saves the results
+```
+
+The reusable Python model used for **both** SIR and SEIR is:
+
+```text
+inst/python/bilstm.py
+```
+
+The small command-line training wrapper is:
+
+```text
+inst/python/train_bilstm.py
+```
+
+The R/Python separation is:
+
+```text
+R/01_simulation.R
+    |
+    | epiworldR generates training curves
+    v
+data/*_theta.csv
+data/*_observations.csv
+    |
+    v
+R/02_training.R
+    |
+    | calls
+    v
+inst/python/bilstm.py
+    |
+    v
+inst/models/<model>/trained/
+    |
+    v
+R/03_test_compare.R
+    |
+    v
+calibrate()
+```
+
+# 0. Check the environment
+
+```{r environment}
+cat("Project root:", PROJECT_ROOT, "\n")
+cat("Full run:", FULL_RUN, "\n")
+cat("Retrain:", RETRAIN, "\n")
+cat("SIR simulations:", SIR_N_SIMS, "\n")
+cat("SEIR simulations:", SEIR_N_SIMS, "\n")
+cat("Epochs:", EPOCHS, "\n\n")
+
+if (!requireNamespace("epiworldR", quietly = TRUE)) {
+  stop("The R package 'epiworldR' is required for SIR/SEIR simulation.")
+}
+
+if (!requireNamespace("reticulate", quietly = TRUE)) {
+  stop("The R package 'reticulate' is required for Python training.")
+}
+
+setup_python_deps()
+
+cat("\nPython configuration:\n")
+print(reticulate::py_config())
+```
+
+# Part I — SIR
+
+## 1. Generate SIR training data with epiworldR
+
+Current SIR parameter ranges are:
+
+```text
+n       = 5000 to 10000
+recov   ~ Uniform(0.071, 0.25)
+preval  ~ Uniform(0.007, 0.02)
+crate   ~ Uniform(1, 5)
+R0      ~ Uniform(1.1, 5)
+
+ptran = R0 * recov / crate
+```
+
+The simulator is `epiworldR::ModelSIRCONN()`.
+
+```{r sir-generate}
+set.seed(SEED)
+
+sir_data <- generate_sir_training_data(
+  n_sims = SIR_N_SIMS,
+  ndays = 60,
+  seed = SEED,
+  save = TRUE,
+  name = "sir",
+  package_dir = PROJECT_ROOT
+)
+
+cat("SIR parameter rows:", nrow(sir_data$theta), "\n")
+cat("SIR curve length:", ncol(sir_data$observations), "\n\n")
+
+head(sir_data$theta)
+```
+
+The training files are:
+
+```{r sir-data-files}
+sir_theta_file <- file.path(
+  PROJECT_ROOT,
+  "data",
+  "sir_theta.csv"
+)
+
+sir_curve_file <- file.path(
+  PROJECT_ROOT,
+  "data",
+  "sir_observations.csv"
+)
+
+cat("theta exists:", file.exists(sir_theta_file), "\n")
+cat("observations exist:", file.exists(sir_curve_file), "\n")
+cat("theta:", sir_theta_file, "\n")
+cat("observations:", sir_curve_file, "\n")
+```
+
+## 2. Train the SIR BiLSTM
+
+Known inputs:
+
+```text
+n
+recov
+```
+
+Targets:
+
+```text
+ptran
+crate
+R0
+```
+
+The mechanistic relationship used by the optional physics loss is:
+
+```text
+R0 * recov = ptran * crate
+```
+
+```{r sir-train}
+sir_model_dir <- file.path(
+  PROJECT_ROOT,
+  "inst",
+  "models",
+  "sir",
+  "trained"
+)
+
+if (RETRAIN || !file.exists(file.path(sir_model_dir, "model.pt"))) {
+
+  train_bilstm_calibrator(
+    name = "sir",
+    known_names = c(
+      "n",
+      "recov"
+    ),
+    target_names = c(
+      "ptran",
+      "crate",
+      "R0"
+    ),
+    type = "SIR",
+    package_dir = PROJECT_ROOT,
+    epochs = EPOCHS,
+    batch_size = BATCH_SIZE,
+    learning_rate = 0.001,
+    seed = SEED,
+    hidden_size = 160,
+    num_layers = 3,
+    dropout = 0.5,
+    physics_weight = 0.03
+  )
+
+} else {
+
+  cat("Using existing SIR model:", sir_model_dir, "\n")
+}
+```
+
+## 3. SIR validation results
+
+```{r sir-validation}
+sir_validation <- read.csv(
+  file.path(
+    sir_model_dir,
+    "validation_metrics.csv"
+  )
+)
+
+sir_validation$model <- "SIR"
+
+knitr::kable(
+  sir_validation,
+  digits = 4,
+  caption = "SIR BiLSTM validation metrics"
+)
+```
+
+### SIR training history
+
+```{r sir-training-history, fig.width=7, fig.height=5}
+sir_history <- read.csv(
+  file.path(
+    sir_model_dir,
+    "training_history.csv"
+  )
+)
+
+matplot(
+  sir_history$epoch,
+  cbind(
+    sir_history$train_loss,
+    sir_history$validation_loss
+  ),
+  type = "l",
+  lty = 1,
+  xlab = "Epoch",
+  ylab = "Loss",
+  main = "SIR BiLSTM training history"
+)
+
+legend(
+  "topright",
+  legend = c(
+    "Training loss",
+    "Validation loss"
+  ),
+  lty = 1,
+  bty = "n"
+)
+```
+
+### SIR true versus predicted validation parameters
+
+```{r sir-validation-scatter, fig.width=6, fig.height=5}
+sir_predictions <- read.csv(
+  file.path(
+    sir_model_dir,
+    "validation_predictions.csv"
+  )
+)
+
+for (parameter in c("ptran", "crate", "R0")) {
+
+  truth <- sir_predictions[[paste0("true_", parameter)]]
+  pred  <- sir_predictions[[paste0("pred_", parameter)]]
+
+  plot(
+    truth,
+    pred,
+    pch = 16,
+    xlab = paste("True", parameter),
+    ylab = paste("Predicted", parameter),
+    main = paste("SIR:", parameter)
+  )
+
+  abline(
+    0,
+    1,
+    lty = 2
+  )
+}
+```
+
+## 4. Create a new SIR test curve
+
+This test epidemic is **not** one of the training curves.
+
+```{r sir-test-data}
+sir_sim <- sir_simulator(
+  ndays = 60
+)
+
+true_sir <- list(
+  n = 8000,
+  preval = 0.01,
+  recov = 0.10,
+  crate = 3,
+  R0 = 2.5,
+  ptran = 2.5 * 0.10 / 3
+)
+
+sir_curve <- simulate_from_parameters(
+  simulator = sir_sim,
+  parameters = true_sir,
+  seed = 3123
+)
+
+cat("Test SIR curve length:", length(sir_curve), "\n")
+cat("Total SIR incidence:", sum(sir_curve), "\n")
+```
+
+```{r sir-test-curve, fig.width=8, fig.height=4}
+plot(
+  0:60,
+  sir_curve,
+  type = "l",
+  xlab = "Day",
+  ylab = "Incidence",
+  main = "SIR test epidemic"
+)
+```
+
+## 5. Calibrate the SIR test curve
+
+```{r sir-load-calibrator}
+sir_bilstm <- bilstm_calibrator(
+  model_dir = sir_model_dir,
+  known_names = c(
+    "n",
+    "recov"
+  ),
+  type = "SIR",
+  package_dir = PROJECT_ROOT
+)
+
+sir_bilstm
+```
+
+```{r sir-calibrate}
+sir_fit <- calibrate(
+  daily_cases = sir_curve,
+  calibrator = sir_bilstm,
+  n = true_sir$n,
+  recov = true_sir$recov
+)
+
+sir_fit
+```
+
+## 6. SIR truth versus prediction
+
+```{r sir-final-results}
+sir_truth <- c(
+  ptran = true_sir$ptran,
+  crate = true_sir$crate,
+  R0 = true_sir$R0
+)
+
+sir_result <- data.frame(
+  model = "SIR",
+  parameter = names(sir_truth),
+  truth = as.numeric(sir_truth),
+  prediction = as.numeric(
+    sir_fit[names(sir_truth)]
+  )
+)
+
+sir_result$absolute_error <-
+  abs(
+    sir_result$prediction -
+    sir_result$truth
+  )
+
+knitr::kable(
+  sir_result,
+  digits = 5,
+  caption = "SIR held-out test result"
+)
+
+write.csv(
+  sir_result,
+  file.path(
+    RESULTS_DIR,
+    "sir_bilstm_test_result.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Part II — SEIR
+
+## 7. Generate SEIR training data with epiworldR
+
+Current SEIR parameter ranges are:
+
+```text
+n                 = 5000 to 10000
+recov             ~ Uniform(0.071, 0.25)
+crate             ~ Uniform(5, 15)
+incub             ~ Uniform(3, 21)
+R0                ~ Uniform(1, 5)
+initial_infected  = 100 to 2000
+
+preval = initial_infected / n
+ptran  = R0 * recov / crate
+```
+
+The simulator is `epiworldR::ModelSEIRCONN()`.
+
+```{r seir-generate}
+set.seed(SEED)
+
+seir_data <- generate_seir_training_data(
+  n_sims = SEIR_N_SIMS,
+  ndays = 365,
+  seed = SEED,
+  save = TRUE,
+  name = "seir",
+  package_dir = PROJECT_ROOT
+)
+
+cat("SEIR parameter rows:", nrow(seir_data$theta), "\n")
+cat("SEIR curve length:", ncol(seir_data$observations), "\n\n")
+
+head(seir_data$theta)
+```
+
+The training files are:
+
+```{r seir-data-files}
+seir_theta_file <- file.path(
+  PROJECT_ROOT,
+  "data",
+  "seir_theta.csv"
+)
+
+seir_curve_file <- file.path(
+  PROJECT_ROOT,
+  "data",
+  "seir_observations.csv"
+)
+
+cat("theta exists:", file.exists(seir_theta_file), "\n")
+cat("observations exist:", file.exists(seir_curve_file), "\n")
+cat("theta:", seir_theta_file, "\n")
+cat("observations:", seir_curve_file, "\n")
+```
+
+## 8. Train the SEIR BiLSTM
+
+Known inputs:
+
+```text
+n
+recov
+incub
+```
+
+Targets:
+
+```text
+ptran
+crate
+R0
+```
+
+```{r seir-train}
+seir_model_dir <- file.path(
+  PROJECT_ROOT,
+  "inst",
+  "models",
+  "seir",
+  "trained"
+)
+
+if (RETRAIN || !file.exists(file.path(seir_model_dir, "model.pt"))) {
+
+  train_bilstm_calibrator(
+    name = "seir",
+    known_names = c(
+      "n",
+      "recov",
+      "incub"
+    ),
+    target_names = c(
+      "ptran",
+      "crate",
+      "R0"
+    ),
+    type = "SEIR",
+    package_dir = PROJECT_ROOT,
+    epochs = EPOCHS,
+    batch_size = BATCH_SIZE,
+    learning_rate = 0.001,
+    seed = SEED,
+    hidden_size = 160,
+    num_layers = 3,
+    dropout = 0.5,
+    physics_weight = 0.03
+  )
+
+} else {
+
+  cat("Using existing SEIR model:", seir_model_dir, "\n")
+}
+```
+
+## 9. SEIR validation results
+
+```{r seir-validation}
+seir_validation <- read.csv(
+  file.path(
+    seir_model_dir,
+    "validation_metrics.csv"
+  )
+)
+
+seir_validation$model <- "SEIR"
+
+knitr::kable(
+  seir_validation,
+  digits = 4,
+  caption = "SEIR BiLSTM validation metrics"
+)
+```
+
+### SEIR training history
+
+```{r seir-training-history, fig.width=7, fig.height=5}
+seir_history <- read.csv(
+  file.path(
+    seir_model_dir,
+    "training_history.csv"
+  )
+)
+
+matplot(
+  seir_history$epoch,
+  cbind(
+    seir_history$train_loss,
+    seir_history$validation_loss
+  ),
+  type = "l",
+  lty = 1,
+  xlab = "Epoch",
+  ylab = "Loss",
+  main = "SEIR BiLSTM training history"
+)
+
+legend(
+  "topright",
+  legend = c(
+    "Training loss",
+    "Validation loss"
+  ),
+  lty = 1,
+  bty = "n"
+)
+```
+
+### SEIR true versus predicted validation parameters
+
+```{r seir-validation-scatter, fig.width=6, fig.height=5}
+seir_predictions <- read.csv(
+  file.path(
+    seir_model_dir,
+    "validation_predictions.csv"
+  )
+)
+
+for (parameter in c("ptran", "crate", "R0")) {
+
+  truth <- seir_predictions[[paste0("true_", parameter)]]
+  pred  <- seir_predictions[[paste0("pred_", parameter)]]
+
+  plot(
+    truth,
+    pred,
+    pch = 16,
+    xlab = paste("True", parameter),
+    ylab = paste("Predicted", parameter),
+    main = paste("SEIR:", parameter)
+  )
+
+  abline(
+    0,
+    1,
+    lty = 2
+  )
+}
+```
+
+## 10. Create a new SEIR test curve
+
+```{r seir-test-data}
+seir_sim <- seir_simulator(
+  ndays = 365
+)
+
+true_seir <- list(
+  n = 8000,
+  recov = 0.10,
+  crate = 8,
+  incub = 7,
+  R0 = 2.5,
+  initial_infected = 100
+)
+
+true_seir$preval <-
+  true_seir$initial_infected /
+  true_seir$n
+
+true_seir$ptran <-
+  true_seir$R0 *
+  true_seir$recov /
+  true_seir$crate
+
+seir_curve <- simulate_from_parameters(
+  simulator = seir_sim,
+  parameters = true_seir,
+  seed = 4123
+)
+
+cat("Test SEIR curve length:", length(seir_curve), "\n")
+cat("Total SEIR incidence:", sum(seir_curve), "\n")
+```
+
+```{r seir-test-curve, fig.width=8, fig.height=4}
+plot(
+  seq_len(365),
+  seir_curve,
+  type = "l",
+  xlab = "Day",
+  ylab = "Incidence",
+  main = "SEIR test epidemic"
+)
+```
+
+## 11. Calibrate the SEIR test curve
+
+```{r seir-load-calibrator}
+seir_bilstm <- bilstm_calibrator(
+  model_dir = seir_model_dir,
+  known_names = c(
+    "n",
+    "recov",
+    "incub"
+  ),
+  type = "SEIR",
+  package_dir = PROJECT_ROOT
+)
+
+seir_bilstm
+```
+
+```{r seir-calibrate}
+seir_fit <- calibrate(
+  daily_cases = seir_curve,
+  calibrator = seir_bilstm,
+  n = true_seir$n,
+  recov = true_seir$recov,
+  incub = true_seir$incub
+)
+
+seir_fit
+```
+
+## 12. SEIR truth versus prediction
+
+```{r seir-final-results}
+seir_truth <- c(
+  ptran = true_seir$ptran,
+  crate = true_seir$crate,
+  R0 = true_seir$R0
+)
+
+seir_result <- data.frame(
+  model = "SEIR",
+  parameter = names(seir_truth),
+  truth = as.numeric(seir_truth),
+  prediction = as.numeric(
+    seir_fit[names(seir_truth)]
+  )
+)
+
+seir_result$absolute_error <-
+  abs(
+    seir_result$prediction -
+    seir_result$truth
+  )
+
+knitr::kable(
+  seir_result,
+  digits = 5,
+  caption = "SEIR held-out test result"
+)
+
+write.csv(
+  seir_result,
+  file.path(
+    RESULTS_DIR,
+    "seir_bilstm_test_result.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Part III — Combined results
+
+## 13. Validation metrics for both models
+
+```{r combined-validation}
+validation_results <- rbind(
+  sir_validation,
+  seir_validation
+)
+
+validation_results <- validation_results[
+  ,
+  c(
+    "model",
+    "parameter",
+    "MAE",
+    "RMSE",
+    "R2"
+  )
+]
+
+knitr::kable(
+  validation_results,
+  digits = 4,
+  caption = "BiLSTM validation results: SIR and SEIR"
+)
+
+write.csv(
+  validation_results,
+  file.path(
+    RESULTS_DIR,
+    "bilstm_validation_metrics.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+## 14. Held-out test predictions for both models
+
+```{r combined-test-results}
+test_results <- rbind(
+  sir_result,
+  seir_result
+)
+
+knitr::kable(
+  test_results,
+  digits = 5,
+  caption = "Held-out calibration results: SIR and SEIR"
+)
+
+write.csv(
+  test_results,
+  file.path(
+    RESULTS_DIR,
+    "bilstm_sir_seir_test_results.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# 15. Files produced by this run
+
+```{r output-files}
+cat(
+  "
+Training data:
+  data/sir_theta.csv
+  data/sir_observations.csv
+  data/seir_theta.csv
+  data/seir_observations.csv
+
+SIR trained model:
+  inst/models/sir/trained/model.pt
+  inst/models/sir/trained/model_config.json
+  inst/models/sir/trained/validation_metrics.csv
+  inst/models/sir/trained/validation_predictions.csv
+  inst/models/sir/trained/training_history.csv
+
+SEIR trained model:
+  inst/models/seir/trained/model.pt
+  inst/models/seir/trained/model_config.json
+  inst/models/seir/trained/validation_metrics.csv
+  inst/models/seir/trained/validation_predictions.csv
+  inst/models/seir/trained/training_history.csv
+
+Combined results:
+  results/bilstm_validation_metrics.csv
+  results/sir_bilstm_test_result.csv
+  results/seir_bilstm_test_result.csv
+  results/bilstm_sir_seir_test_results.csv
+"
+)
+```
+
+# 16. Full research run
+
+The default at the top of this notebook is:
+
+```r
+FULL_RUN <- FALSE
+```
+
+That is only to verify the pipeline.
+
+For the current full SIR/SEIR experiment, change it to:
+
+```r
+FULL_RUN <- TRUE
+```
+
+Then the notebook uses:
+
+```text
+SIR:
+    5,000 simulations
+    60 days + day zero = 61 observations
+    100 epochs
+
+SEIR:
+    20,000 simulations
+    365 observations
+    100 epochs
+```
+
+Those are the settings whose validation metrics should be used for the actual
+scientific comparison, not the small quick-run settings.
+
+# 17. Standard baseline comparison
+
+ABC-MCMC, ABC-SMC, Nelder-Mead, and Differential Evolution are intentionally
+not run automatically in this notebook because they can require many thousands
+of additional simulator evaluations.
+
+After confirming the BiLSTM SIR/SEIR pipeline, they can be run through:
+
+```r
+baseline_calibrators()
+compare_calibrators()
+```
+
+using the same held-out test curves.
+
+The detailed SEIR/HPC versions of those methods remain in:
+
+```text
+examples/seir_reference_comparison/
+```

@@ -1,0 +1,409 @@
+---
+title: "Getting started with epiworldRcalibrate"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with epiworldRcalibrate}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+# Overview
+
+`epiworldRcalibrate` separates the epidemic model from the calibration method.
+
+The package uses the same three-step workflow for every model and method:
+
+```text
+1. simulation/data -> 2. training/calibrator -> 3. calibrate/test/compare
+```
+
+The three main R files follow the same organization:
+
+```text
+R/01_simulation.R
+R/02_training.R
+R/03_test_compare.R
+```
+
+# The calibrator interface
+
+A calibration method is represented by a simple R object with three functions:
+
+```{r}
+calibrator_example <- list(
+
+  pre_process = function(x, ...) {
+    x
+  },
+
+  run = function(x, ...) {
+    x
+  },
+
+  post_process = function(x, ...) {
+    x
+  },
+
+  type = "SIR"
+
+) |>
+  structure(class = "calibrator")
+
+calibrator_example
+```
+
+All calibration methods are called through the same function. For this
+identity example, use a small numeric curve:
+
+```{r}
+example_observed_data <- c(1, 2, 3, 4, 5)
+
+calibrate(
+  daily_cases = example_observed_data,
+  calibrator = calibrator_example
+)
+```
+
+Real calibrators can receive named known parameters such as `n = 8000` and
+`recov = 0.1`.
+
+Internally, `calibrate()` simply runs:
+
+```text
+pre_process -> run -> post_process
+```
+
+A new deep-learning model, Bayesian method, optimizer, or other method only
+needs to follow this `calibrator` interface.
+
+# Step 1: create or import training data
+
+## Built-in SIR
+
+The package can generate SIR training data with `epiworldR`:
+
+```{r}
+sir_data <- generate_sir_training_data(
+  n_sims = 50,
+  ndays = 60,
+  seed = 122,
+  save = TRUE
+)
+
+head(sir_data$theta)
+dim(sir_data$observations)
+```
+
+For a real training run, increase `n_sims` substantially. The small value above
+is only for demonstrating the workflow.
+
+## Built-in SEIR
+
+The package can also generate SEIR training data:
+
+```{r}
+seir_data <- generate_seir_training_data(
+  n_sims = 20,
+  ndays = 365,
+  seed = 122,
+  save = TRUE
+)
+
+head(seir_data$theta)
+dim(seir_data$observations)
+```
+
+Again, the small number of simulations is only for a quick example.
+
+## A model not available in epiworldR
+
+For a model such as SIRH or SEIRD, the user can supply their own training bank.
+
+The parameter table must contain one row per simulation:
+
+```{r}
+my_parameter_table <- data.frame(
+  n = c(5000, 6000, 7000),
+  gamma = c(0.10, 0.12, 0.09),
+  hosp_rate = c(0.05, 0.08, 0.06),
+  beta = c(0.25, 0.30, 0.20)
+)
+```
+
+The observation matrix must contain one observed time series per row:
+
+```{r}
+my_observation_matrix <- rbind(
+  c(1, 3, 5, 7, 6),
+  c(2, 4, 8, 9, 5),
+  c(1, 2, 4, 6, 3)
+)
+```
+
+The observations do not have to be case incidence. They can represent
+hospitalizations, deaths, prevalence, or another numeric time series.
+
+```{r}
+custom_data <- new_training_data(
+  parameters = my_parameter_table,
+  observations = my_observation_matrix,
+  type = "SIRH"
+)
+
+custom_data
+```
+
+This example only demonstrates the required data shape. In a real application,
+the user would normally provide many simulated parameter/observation pairs.
+
+If the user has their own simulator rather than an existing training bank,
+they can connect it through `new_simulator()` and then call
+`simulate_training_data()`.
+
+# Step 2: train or define a calibrator
+
+## Train the generic BiLSTM
+
+For SIR:
+
+```{r}
+train_bilstm_calibrator(
+  name = "sir",
+  known_names = c("n", "recov"),
+  target_names = c("ptran", "crate", "R0"),
+  type = "SIR",
+  package_dir = find_project_root(),
+  epochs = 100,
+  physics_weight = 0.03
+)
+```
+
+The fitted model and preprocessing objects are saved under:
+
+```text
+inst/models/sir/trained/
+```
+
+Create the SIR BiLSTM calibrator:
+
+```{r}
+sir_bilstm <- bilstm_calibrator(
+  model_dir = "inst/models/sir/trained",
+  known_names = c("n", "recov"),
+  type = "SIR"
+)
+
+sir_bilstm
+```
+
+The returned object is still just a standard `calibrator`:
+
+```text
+pre_process
+run
+post_process
+type
+```
+
+## Use the original pretrained SIR model
+
+The original SIR model can be used without retraining:
+
+```{r}
+sir_pretrained <- pretrained_sir_calibrator()
+
+sir_pretrained
+```
+
+## Define a completely new calibration method
+
+A user can add another method without changing `calibrate()`:
+
+```{r}
+calibrator_custom <- list(
+
+  pre_process = function(x, population_size, ...) {
+    list(
+      observed = as.numeric(x),
+      n = population_size
+    )
+  },
+
+  run = function(x, ...) {
+    # Replace this with the user's calibration algorithm.
+    list(
+      beta = 0.25,
+      n = x$n
+    )
+  },
+
+  post_process = function(x, ...) {
+    unlist(x)
+  },
+
+  type = "SIRH"
+
+) |>
+  structure(class = "calibrator")
+```
+
+# Step 3: calibrate and compare
+
+## Create one SIR curve for testing
+
+First create a simulator:
+
+```{r}
+sir_sim <- sir_simulator(ndays = 60)
+```
+
+Choose known true parameters:
+
+```{r}
+true_parameters <- list(
+  n = 8000,
+  preval = 0.01,
+  recov = 0.10,
+  crate = 3,
+  R0 = 2.5,
+  ptran = 2.5 * 0.10 / 3
+)
+```
+
+Generate one observed curve:
+
+```{r}
+curve <- simulate_from_parameters(
+  simulator = sir_sim,
+  parameters = true_parameters,
+  seed = 3123
+)
+
+length(curve)
+```
+
+## Calibrate with BiLSTM
+
+```{r}
+fit <- calibrate(
+  daily_cases = curve,
+  calibrator = sir_bilstm,
+  n = true_parameters$n,
+  recov = true_parameters$recov
+)
+
+fit
+```
+
+The same `calibrate()` function is used for every calibration method.
+
+# Compare against standard baseline methods
+
+The package includes the four methods used as standard comparisons in this
+project:
+
+```text
+ABC-MCMC
+ABC-SMC
+Nelder-Mead
+Differential Evolution
+```
+
+For example, suppose SIR calibration estimates `crate` and `ptran`:
+
+```{r}
+bounds <- list(
+  crate = c(1, 5),
+  ptran = c(0.001, 1)
+)
+```
+
+Known parameters are supplied separately:
+
+```{r}
+known_names <- c(
+  "n",
+  "preval",
+  "recov"
+)
+```
+
+Create the four baseline calibrators:
+
+```{r}
+baselines <- baseline_calibrators(
+  simulator = sir_sim,
+  bounds = bounds,
+  known_names = known_names,
+  type = "SIR"
+)
+```
+
+A primary calibration method can then be added to the same list:
+
+```{r}
+methods <- c(
+  list(BiLSTM = sir_bilstm),
+  baselines
+)
+```
+
+The generic comparison function runs all supplied calibrators on the same
+observation:
+
+```{r}
+comparison <- compare_calibrators(
+  observed = curve,
+  calibrators = methods,
+  known = list(
+    n = true_parameters$n,
+    preval = true_parameters$preval,
+    recov = true_parameters$recov
+  ),
+  truth = c(
+    ptran = true_parameters$ptran,
+    crate = true_parameters$crate,
+    R0 = true_parameters$R0
+  ),
+  simulator = sir_sim
+)
+
+comparison$summary
+comparison$estimates
+```
+
+# Summary
+
+The package supports two data-generation situations:
+
+```text
+SIR / SEIR
+    -> training data can be generated by the package
+
+SIRH / SEIRD / another model
+    -> user supplies a training bank
+       OR
+       user connects their own simulator
+```
+
+The calibration interface is the same in every case:
+
+```r
+calibrator_x <- list(
+  pre_process = function(x, ...) { ... },
+  run = function(x, ...) { ... },
+  post_process = function(x, ...) { ... },
+  type = "MODEL"
+) |>
+  structure(class = "calibrator")
+```
+
+and every method is used through:
+
+```r
+calibrate(observed_data, calibrator_x, ...)
+```

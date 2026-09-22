@@ -1,0 +1,463 @@
+---
+title: "epiworldRcalibrate: comparing calibration methods"
+author: "Sima Najafzadeh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. What this demo shows
+
+`epiworldRcalibrate` separates the epidemic model from the calibration method, so the same
+calibration methods can be reused on any simulator. This demo runs **five calibration methods**
+on the **same SIR model** and the **same observed epidemic curve**, and compares them side by
+side:
+
+- `BiLSTM` — the pretrained neural-network calibrator
+- `ABC-MCMC` — approximate Bayesian computation (MCMC)
+- `ABC-SMC` — approximate Bayesian computation (sequential Monte Carlo)
+- `NelderMead` — derivative-free optimization
+- `DE` — differential evolution
+
+Every method receives the same *known* inputs (population size, initial prevalence, recovery
+rate) and must estimate the same *unknown* parameters (contact rate, transmission probability,
+and the derived R0) from the daily-case curve alone.
+
+Under the hood, the package always follows the same three steps, and this demo shows each one:
+
+1. **get training data** — simulate it yourself, or bring your own.
+2. **get a calibrator** — train a new one, or reuse an already-trained one.
+3. **evaluate/compare** — run one or more calibrators on an observed curve and compare them.
+
+Only two small functions are written in this whole document (Section 5): one that builds a
+single calibrator by name, and one that uses it to run and compare several methods at once. Both
+are reused, unchanged, for SIR and for SEIR.
+
+- **Part A** uses a simulated curve with a *known* true answer, so we can check that every
+  method actually recovers the truth.
+- **Part B** applies the same five methods to *real* Utah COVID-19 case data, where the true
+  parameters are unknown — this is the pretrained model plus every other method, side by side, on
+  real data.
+- **Part C** repeats Part A on a second epidemic model, SEIR.
+
+## 2. Load the package
+
+```{r}
+candidates <- c(".", "..", "../..")
+ok <- file.exists(file.path(candidates, "DESCRIPTION")) &
+  dir.exists(file.path(candidates, "R"))
+project_root <- normalizePath(candidates[which(ok)[1]])
+
+source(file.path(project_root, "R", "01_simulation.R"))
+source(file.path(project_root, "R", "02_training.R"))
+source(file.path(project_root, "R", "03_test_compare.R"))
+```
+
+## 3. Step 1 — get training data
+
+You can simulate training data yourself, for either SIR or SEIR:
+
+```{r}
+sir_bank  <- generate_sir_training_data(n_sims = 30, ndays = 60, save = FALSE)
+seir_bank <- generate_seir_training_data(n_sims = 5, ndays = 30, save = FALSE)
+
+sir_bank
+seir_bank
+```
+
+Or, if you already have your own parameter/observation data, `read_training_data()` turns a pair
+of CSV files into the exact same kind of object — here we read the small example files already
+shipped in `examples/data/`:
+
+```{r}
+own_data <- read_training_data(
+  parameter_file   = file.path(project_root, "examples", "data", "sir_theta.csv"),
+  observation_file = file.path(project_root, "examples", "data", "sir_observations.csv")
+)
+own_data
+```
+
+## 4. Step 2 — get a calibrator
+
+You can train your own calibrator on a training bank like `sir_bank` above. This is a real
+training run — `epochs = 10` just keeps this demo step quick, on a small bank of 30 simulations:
+
+```{r}
+demo_name <- "demo_sir_tmp"
+
+model_dir <- train_bilstm_calibrator(
+  name         = demo_name,
+  known_names  = c("n", "recov"),
+  target_names = c("ptran", "crate", "R0"),
+  package_dir  = project_root,
+  data         = sir_bank,
+  epochs       = 10,
+  hidden_size  = 32,
+  num_layers   = 1
+)
+model_dir
+
+demo_cal <- bilstm_calibrator(
+  model_dir   = model_dir,
+  known_names = c("n", "recov"),
+  package_dir = project_root
+)
+demo_cal
+
+one_curve <- as.numeric(sir_bank$observations[1, ])
+calibrate(one_curve, demo_cal, n = sir_bank$theta$n[1], recov = sir_bank$theta$recov[1])
+```
+
+```{r, include=FALSE}
+# This was just a demo of the training call, on a throwaway name and a tiny
+# bank, so clean up the few files it wrote before moving on.
+unlink(file.path(project_root, "data", paste0(demo_name, "_theta.csv")))
+unlink(file.path(project_root, "data", paste0(demo_name, "_observations.csv")))
+unlink(file.path(project_root, "inst", "models", demo_name), recursive = TRUE)
+```
+
+Or, just reuse an already-trained calibrator — this is what the rest of this demo uses, since it
+was trained on a much bigger bank of simulations than our 30-run toy example above:
+
+```{r}
+pretrained_cal <- pretrained_sir_calibrator(package_dir = project_root)
+pretrained_cal
+```
+
+## 5. One function from the package, one function we write
+
+The package itself now has a single function for every search-based method: `make_calibrator(
+method, simulator, bounds, known_names, ...)`. Say the name (`"ABC-MCMC"`, `"ABC-SMC"`,
+`"NelderMead"`, or `"DE"`) and it builds that calibrator — `bounds` (the search range for each
+unknown parameter) and `known_names` (which values are already known) are arguments, not fixed
+numbers inside the function, so the same call works for SIR *and* SEIR later on. A pretrained
+BiLSTM is not a search method, so it is still built separately, with `pretrained_sir_calibrator()`.
+
+```{r}
+derive_R0 <- function(estimate, known) {
+  c(R0 = unname(estimate["ptran"] * estimate["crate"] / known$recov))
+}
+```
+
+Say the name, get that calibrator, then calibrate with the package's own `calibrate()` — that is
+the whole idea. We try it here on the first row of `sir_bank` from Step 1:
+
+```{r}
+sim <- sir_simulator(ndays = 60)
+sim
+sir_bounds      <- list(crate = c(1, 5), ptran = c(0.01, 0.9))
+sir_known_names <- c("n", "preval", "recov")
+
+one_curve <- as.numeric(sir_bank$observations[1, ])
+one_known <- as.list(sir_bank$theta[1, c("n", "preval", "recov")])
+
+cal <- make_calibrator("NelderMead", sim, sir_bounds, sir_known_names, derive_R0)
+cal
+calibrate(one_curve, cal, n = one_known$n, preval = one_known$preval, recov = one_known$recov)
+```
+
+We write exactly two functions ourselves. **`get_estimate()`** does the three steps above (build
+a calibrator, calibrate, read out a plain estimate) for **one** method on **one** curve.
+**`run_and_collect()`** just calls `get_estimate()` once per method name, and gathers every
+method's estimate and fitted curve into two simple tables (`results`, `curves`). If `truth` is
+given, it adds one extra row showing the true parameter values, so they can be compared by eye.
+This pair is used by every "Part" below.
+
+`quick_settings` just keeps each search-based method's speed/quality tradeoff in one small list,
+for this demo, so every "Part" below runs in a minute or two instead of the package's slower
+research-grade defaults:
+
+```{r}
+quick_settings <- list(
+  "ABC-MCMC"   = list(n_samples = 400, burnin = 200),
+  "ABC-SMC"    = list(n_particles = 80, n_generations = 4, sim_budget = 3500),
+  "NelderMead" = list(maxit = 300, restarts = 1),
+  "DE"         = list(maxiter = 20)
+)
+quick_settings
+
+get_estimate <- function(daily_cases, method, simulator, bounds, known_names, derive, known) {
+  # build: BiLSTM is already trained, so it is loaded rather than built by name
+  cal <- if (method == "BiLSTM") {
+    pretrained_sir_calibrator(package_dir = project_root)
+  } else {
+    do.call(
+      make_calibrator,
+      c(list(method, simulator, bounds, known_names, derive), quick_settings[[method]])
+    )
+  }
+
+  # run: do.call just means "call calibrate() using the pieces inside `known`
+  # as its extra arguments (n = ..., preval = ..., recov = ..., ...)"
+  result <- do.call(calibrate, c(list(daily_cases, cal), known))
+
+  # read out a plain estimate, the same way for every method
+  calibration_estimate(result)
+}
+
+run_and_collect <- function(
+    daily_cases, method_names, simulator, bounds, known_names, derive, known,
+    truth = NULL, seed = 1
+) {
+  results <- data.frame()
+  curves  <- data.frame(time = seq_along(daily_cases), observed = daily_cases)
+
+  set.seed(seed)
+  for (m in method_names) {
+    t0       <- Sys.time()
+    estimate <- get_estimate(daily_cases, m, simulator, bounds, known_names, derive, known)
+
+    curves[[m]] <- simulator$run(parameters = c(known, as.list(estimate)), seed = 123)
+
+    results <- rbind(results, data.frame(
+      method     = m,
+      wall_sec   = as.numeric(Sys.time() - t0),
+      curve_rmse = sqrt(mean((curves[[m]] - daily_cases)^2)),
+      crate      = unname(estimate["crate"]),
+      ptran      = unname(estimate["ptran"]),
+      R0         = unname(estimate["R0"])
+    ))
+  }
+
+  if (!is.null(truth)) {
+    results <- rbind(results, data.frame(
+      method = "TRUE VALUE", wall_sec = NA, curve_rmse = NA,
+      crate = unname(truth["crate"]), ptran = unname(truth["ptran"]), R0 = unname(truth["R0"])
+    ))
+  }
+
+  list(results = results, curves = curves)
+}
+```
+
+## 6. Step 3, Part A — synthetic SIR data, known truth
+
+We simulate one SIR epidemic curve from parameters we choose ourselves, so we know the right
+answer: `crate = 3`, `ptran = 0.15`, which gives `R0 = ptran * crate / recov = 3`.
+
+```{r}
+known      <- list(n = 5000, preval = 0.01, recov = 0.15)
+true_theta <- list(crate = 3, ptran = 0.15)
+
+observed_A <- simulate_from_parameters(sim, c(known, true_theta), seed = 2024)
+observed_A
+
+method_names <- c("BiLSTM", "ABC-MCMC", "ABC-SMC", "NelderMead", "DE")
+
+out_A <- run_and_collect(
+  observed_A, method_names, sim, sir_bounds, sir_known_names, derive_R0, known,
+  truth = c(crate = 3, ptran = 0.15, R0 = 3)
+)
+```
+
+`wall_sec` is how long each method took, `curve_rmse` is how well its fitted curve matches the
+observed curve, and `crate`/`ptran`/`R0` are its parameter estimates — compare them directly
+against the `TRUE VALUE` row at the bottom.
+
+```{r}
+knitr::kable(
+  out_A$results, digits = 3, row.names = FALSE,
+  caption = "Part A: all five methods vs. the true answer"
+)
+```
+
+```{r, fig.width=7, fig.height=5}
+matplot(
+  out_A$curves$time, out_A$curves[, method_names], type = "l", lty = 1, lwd = 2,
+  col = seq_along(method_names) + 1,
+  ylim = range(out_A$curves[, c("observed", method_names)]),
+  xlab = "day", ylab = "daily cases", main = "Part A: synthetic SIR curve - observed vs. fitted"
+)
+lines(out_A$curves$time, out_A$curves$observed, lwd = 3, col = "black")
+legend(
+  "topright", bty = "n", lwd = 2, lty = 1,
+  legend = c("observed", method_names), col = c("black", seq_along(method_names) + 1)
+)
+```
+
+## 7. Step 3, Part B — real data (Utah COVID-19)
+
+Same five methods, same SIR model, but now the observed curve is 61 days of real Utah COVID-19
+case counts, and the true parameters are unknown. This is the finale: the pretrained model,
+loaded and run right alongside every other method, on real data.
+
+```{r}
+fetch_utah_covid_data <- function(n_days = 61) {
+  zip_url <- "https://coronavirus-dashboard.utah.gov/Utah_COVID19_data.zip"
+  tmp <- tempfile(fileext = ".zip")
+  download.file(zip_url, tmp, mode = "wb", quiet = TRUE)
+  target <- grep(
+    "Trends_Epidemic", unzip(tmp, list = TRUE)$Name,
+    ignore.case = TRUE, value = TRUE
+  )[1]
+  daily <- read.csv(unz(tmp, target))
+  unlink(tmp)
+  daily$Date <- as.Date(daily$Date)
+  daily <- daily[order(daily$Date), ]
+  tail(daily, n_days)
+}
+
+utah <- fetch_utah_covid_data(61)
+observed_B <- utah$Daily.Cases
+utah[, c("Date", "Daily.Cases")]
+```
+
+```{r}
+# n and recov match the assumptions used for the pretrained model; preval is
+# seeded from the first observed day, since the true initial prevalence is
+# not known for real data.
+known_B <- list(n = 5000, recov = 1 / 7, preval = observed_B[1] / 5000)
+
+out_B <- run_and_collect(observed_B, method_names, sim, sir_bounds, sir_known_names, derive_R0, known_B)
+```
+
+There is no `TRUE VALUE` row here — the true parameters for real data are unknown, so
+`curve_rmse` is the only accuracy check we have.
+
+```{r}
+knitr::kable(
+  out_B$results, digits = 3, row.names = FALSE,
+  caption = "Part B: all five methods on real Utah COVID-19 data"
+)
+```
+
+```{r, fig.width=7, fig.height=5}
+matplot(
+  out_B$curves$time, out_B$curves[, method_names], type = "l", lty = 1, lwd = 2,
+  col = seq_along(method_names) + 1,
+  ylim = range(out_B$curves[, c("observed", method_names)]),
+  xlab = "day", ylab = "daily cases",
+  main = "Part B: real Utah COVID-19 data - observed vs. fitted"
+)
+lines(out_B$curves$time, out_B$curves$observed, lwd = 3, col = "black")
+legend(
+  "topright", bty = "n", lwd = 2, lty = 1,
+  legend = c("observed", method_names), col = c("black", seq_along(method_names) + 1)
+)
+```
+
+### Uncertainty from the pretrained model
+
+`BiLSTM` only gives one number per parameter. To see the day-to-day spread that single estimate
+implies, we simulate the calibrated SIR model many times — same `crate`/`ptran`, 300 different
+random seeds — and look at the range across simulations, the same idea used in the earlier
+LSTM-calibrated SIR report.
+
+```{r}
+bilstm_row <- out_B$results[out_B$results$method == "BiLSTM", ]
+bilstm_est <- c(crate = bilstm_row$crate, ptran = bilstm_row$ptran)
+bilstm_est
+
+n_reps  <- 300
+n_days  <- length(observed_B)
+sim_curves <- matrix(NA_real_, nrow = n_reps, ncol = n_days)
+for (i in seq_len(n_reps)) {
+  sim_curves[i, ] <- sim$run(parameters = c(known_B, as.list(bilstm_est)), seed = i)
+}
+# sim_curves is 300 rows x 61 days - too big to print in full, so just its
+# shape and a 3-row preview
+dim(sim_curves)
+sim_curves[1:3, ]
+
+lower_ci     <- apply(sim_curves, 2, quantile, probs = 0.025)
+upper_ci     <- apply(sim_curves, 2, quantile, probs = 0.975)
+median_curve <- apply(sim_curves, 2, median)
+lower_ci
+upper_ci
+median_curve
+```
+
+```{r, fig.width=7, fig.height=5}
+day <- seq_len(n_days)
+plot(
+  day, median_curve, type = "n", ylim = range(c(observed_B, lower_ci, upper_ci)),
+  xlab = "day", ylab = "daily cases",
+  main = "Part B: pretrained model - observed vs. median with 95% interval"
+)
+polygon(
+  c(day, rev(day)), c(upper_ci, rev(lower_ci)),
+  col = adjustcolor("red", alpha.f = 0.3), border = NA
+)
+lines(day, median_curve, col = "red", lwd = 2)
+lines(day, observed_B, col = "blue", lwd = 2)
+points(day, observed_B, col = "blue", pch = 16)
+legend(
+  "topright", bty = "n", lwd = 2,
+  legend = c("model median", "observed"), col = c("red", "blue")
+)
+```
+
+Coverage checks whether the 95% interval is a reasonable width — it should contain roughly 95%
+of the observed days. RMSE and MAE measure how close the median curve is to what was observed.
+
+```{r}
+in_ci    <- observed_B >= lower_ci & observed_B <= upper_ci
+coverage <- mean(in_ci) * 100
+rmse     <- sqrt(mean((median_curve - observed_B)^2))
+mae      <- mean(abs(median_curve - observed_B))
+
+knitr::kable(
+  data.frame(
+    metric = c("95% CI coverage (%)", "RMSE (cases/day)", "MAE (cases/day)"),
+    value  = round(c(coverage, rmse, mae), 2)
+  ),
+  row.names = FALSE,
+  caption = paste0(sum(in_ci), " of ", n_days, " observed days fall within the 95% interval")
+)
+```
+
+## 8. Step 3, Part C — the same thing again, for SEIR
+
+The four search-based methods (`ABC-MCMC`, `ABC-SMC`, `NelderMead`, `DE`) are not tied to SIR —
+the exact same `make_calibrator()` and `run_and_collect()` from Part A work on the SEIR simulator
+too, just by passing SEIR's own `simulator`/`bounds`/`known_names` instead of SIR's. There is no
+pretrained BiLSTM for SEIR yet, so this part only uses the four search-based methods. Just like
+Part A, we simulate one curve from a known answer (`crate = 8`, `R0 = 3`) and check that every
+method recovers it.
+
+```{r}
+seir_sim <- seir_simulator(ndays = 60)
+seir_sim
+
+known_C      <- list(n = 5000, preval = 0.01, recov = 0.15, incub = 7)
+true_theta_C <- list(crate = 8, ptran = 3 * 0.15 / 8)   # true R0 = 3
+
+observed_C <- simulate_from_parameters(seir_sim, c(known_C, true_theta_C), seed = 2024)
+observed_C
+
+seir_bounds      <- list(crate = c(5, 15), ptran = c(0.01, 0.9))
+seir_known_names <- c("n", "preval", "recov", "incub")
+method_names_C   <- c("ABC-MCMC", "ABC-SMC", "NelderMead", "DE")
+
+out_C <- run_and_collect(
+  observed_C, method_names_C, seir_sim, seir_bounds, seir_known_names, derive_R0, known_C,
+  truth = c(crate = 8, ptran = 3 * 0.15 / 8, R0 = 3)
+)
+```
+
+```{r}
+knitr::kable(
+  out_C$results, digits = 3, row.names = FALSE,
+  caption = "Part C: all four methods vs. the true answer (synthetic SEIR data)"
+)
+```
+
+```{r, fig.width=7, fig.height=5}
+matplot(
+  out_C$curves$time, out_C$curves[, method_names_C], type = "l", lty = 1, lwd = 2,
+  col = seq_along(method_names_C) + 1,
+  ylim = range(out_C$curves[, c("observed", method_names_C)]),
+  xlab = "day", ylab = "daily cases",
+  main = "Part C: synthetic SEIR curve - observed vs. fitted"
+)
+lines(out_C$curves$time, out_C$curves$observed, lwd = 3, col = "black")
+legend(
+  "topright", bty = "n", lwd = 2, lty = 1,
+  legend = c("observed", method_names_C), col = c("black", seq_along(method_names_C) + 1)
+)
+```

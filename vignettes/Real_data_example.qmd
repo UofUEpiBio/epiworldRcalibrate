@@ -1,0 +1,47 @@
+---
+title: "Real data example: Utah COVID-19"
+format: html
+---
+
+This example uses the original pretrained SIR BiLSTM.  It does **not** retrain
+the network.
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(epiworldR)
+  library(reticulate)
+})
+
+candidates <- c(".", "..", "../..")
+ok <- file.exists(file.path(candidates, "DESCRIPTION")) &
+  dir.exists(file.path(candidates, "R"))
+project_root <- normalizePath(candidates[which(ok)[1]])
+
+source(file.path(project_root, "R", "01_simulation.R"))
+source(file.path(project_root, "R", "02_training.R"))
+source(file.path(project_root, "R", "03_test_compare.R"))
+```
+
+```{r}
+source(file.path(project_root, "data-raw", "utah-covid-data.R"))
+last_date <- max(utah_covid_data$Date, na.rm = TRUE)
+covid_data <- utah_covid_data |>
+  filter(Date > last_date - 61) |>
+  arrange(Date)
+incidence_vec <- covid_data$Daily.Cases
+stopifnot(length(incidence_vec) == 61)
+```
+
+```{r}
+cal <- pretrained_sir_calibrator(package_dir = project_root)
+
+prediction <- calibrate(
+  daily_cases = incidence_vec,
+  calibrator = cal,
+  n = 5000,
+  recov = 1 / 7
+)
+
+prediction
+```

@@ -1,0 +1,96 @@
+---
+title: epiworldRcalibrate
+format: gfm
+---
+
+A generic framework for calibrating epidemic and agent-based models.
+
+## Core idea
+
+Every calibration method is represented by the same simple S3 object:
+
+```r
+calibrator_example <- list(
+  pre_process = function(x, ...) { ... },
+  run = function(x, ...) { ... },
+  post_process = function(x, ...) { ... },
+  type = "SIR"
+) |>
+  structure(class = "calibrator")
+```
+
+All methods are called through:
+
+```r
+calibrate(daily_cases, calibrator, ...)
+```
+
+This keeps the **epidemic model** independent of the **calibration method**.
+
+## Three-step organization
+
+```text
+R/01_simulation.R     data generation/import
+R/02_training.R       training + calibrator definitions
+R/03_test_compare.R   calibration + testing + benchmark comparisons
+```
+
+## Built-in training-data support
+
+The package currently generates training banks for:
+
+- SIR
+- SEIR
+
+For other models such as SIRH/SEIRD, users may provide their own training
+data or plug in their own simulator.
+
+## Calibration methods
+
+The package currently demonstrates:
+
+- BiLSTM
+- ABC-MCMC
+- ABC-SMC
+- Nelder-Mead
+- Differential Evolution
+
+A user can add any new method by creating another four-field `calibrator`
+object; `calibrate()` itself does not change.
+
+See [USER_GUIDE.md](USER_GUIDE.md) for complete examples.
+
+
+## Step-by-step documentation
+
+For the complete copy/paste workflow, see [STEP_BY_STEP_GUIDE.md](STEP_BY_STEP_GUIDE.md).
+
+
+## Run SIR and SEIR end-to-end
+
+To actually generate SIR/SEIR training banks, train both BiLSTM models, and
+produce validation/test results, open:
+
+```text
+examples/RUN_SIR_SEIR_BILSTM.Rmd
+```
+
+and Knit it.
+
+At the top of the file:
+
+```r
+FULL_RUN <- FALSE
+```
+
+runs a small pipeline test. Change to:
+
+```r
+FULL_RUN <- TRUE
+```
+
+for the current full settings (5,000 SIR simulations, 20,000 SEIR simulations,
+100 epochs for each model).
+
+The official Getting Started vignette remains lightweight documentation and
+does not run the expensive full training workflow during package checks.

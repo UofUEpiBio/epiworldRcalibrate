@@ -1,0 +1,7 @@
+.Rproj.user
+STEP_BY_STEP_GUIDE.md
+results/
+__pycache__/
+*.csv
+*.html
+

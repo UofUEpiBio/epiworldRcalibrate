@@ -1,0 +1,19 @@
+Package: epiworldRcalibrate
+Type: Package
+Title: Generic Calibration Interface for Agent-Based Epidemic Models
+Version: 0.5.0
+Authors@R: person("Sima", "Najafzadeh", role = c("aut", "cre"), email = "sima@example.com")
+Description: Provides a three-step generic workflow for epidemic-model calibration: simulation or data import, calibrator training, and evaluation/comparison. Includes epiworldR SIR/SEIR adapters, user-supplied data and simulator interfaces, a generic BiLSTM calibrator, and ABC/optimization benchmark methods.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Imports:
+    epiworldR,
+    reticulate
+Suggests:
+    DEoptimR,
+    dplyr,
+    jsonlite,
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
