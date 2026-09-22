@@ -1,0 +1,159 @@
+url: https://uofuepibio.github.io/epiworldRcalibrate
+template:
+  bootstrap: 5
+
+# authors:
+#   "George Vega Yon":
+#     href: "https://ggvy.cl"
+#   "Derek Meyer":
+#     href: "https://orcid.org/0009-0005-1350-6988"
+#   "Andrew Pulsipher":
+#     href: "https://orcid.org/0000-0002-0773-3210"
+
+# reference:
+#   - title: "General Models"
+#     desc: >
+#       Standard epidemiological models including SIR, SEIR, SIS, and their variants.
+#     contents:
+#       - has_concept("general-models")
+
+#   - title: "Model Methods"
+#     desc: >
+#       Core functions for manipulating models, running simulations, and extracting results.
+#     contents:
+#       - epiworld-methods
+#       - run_multiple
+
+#   - title: "Model Diagrams"
+#     desc: >
+#       Functions for creating and visualizing model state transition diagrams.
+#     contents:
+#       - has_concept("epiworld-model-diagrams")
+
+#   - title: "Agents"
+#     desc: >
+#       Functions for creating, inspecting, and manipulating agents in models.
+#     contents:
+#       - agents
+#       - agents_smallworld
+
+#   - title: "Likelihood-Free MCMC"
+#     desc: >
+#       Functions for performing Likelihood-Free Markov Chain Monte Carlo simulations.
+#     contents:
+#       - has_concept("fmcmc")
+
+#   - title: "Model History"
+#     desc: >
+#       Functions to extract simulation history at total, variant, and tool levels.
+#     contents:
+#       - epiworld-history
+#       - get_hist_total
+#       - get_hist_virus
+#       - get_hist_tool
+#       - get_today_total
+
+#   - title: "Transition Dynamics & Incidence"
+#     desc: >
+#       Transition counts by day, incidence plots, and array conversion.
+#     contents:
+#       - epiworld-transition
+#       - get_hist_transition_matrix
+#       - plot_incidence
+
+#   - title: "Reproductive Number (Rt)"
+#     desc: >
+#       Extraction and plotting of Rt by virus over time.
+#     contents:
+#       - epiworld-repnum
+#       - get_reproductive_number
+#       - plot_reproductive_number
+#       - compute_reproduction_number
+
+#   - title: "Generation Time"
+#     desc: >
+#       Extraction and plotting of generation time by virus over time.
+#     contents:
+#       - epiworld-gentime
+#       - get_generation_time
+#       - plot_generation_time
+#       - has_concept("plot-epidemic-curves")
+
+#   - title: "Network functions"
+#     desc: >
+#       Random graphs, transmission edges, including seeded infections.
+#     contents:
+#       - epiworld-transmissions
+#       - get_transmissions
+#       - network-models
+
+#   - title: "Summaries"
+#     desc: >
+#       Active cases, outbreak size, and transition probability snapshots.
+#     contents:
+#       - epiworld-summaries
+#       - get_active_cases
+#       - get_outbreak_size
+#       - get_transition_probability
+
+#   - title: "Hospitalizations"
+#     desc: >
+#       Weighted hospitalization tracking when agents have multiple tools.
+#     contents:
+#       - epiworld-hospitalizations
+#       - get_hospitalizations
+
+#   - title: "Virus Functions"
+#     desc: >
+#       Functions for creating and manipulating virus objects in models.
+#     contents:
+#       - has_concept("virus-functions")
+
+#   - title: "Virus Distribution"
+#     desc: >
+#       Functions for assigning viruses across agents at initialization.
+#     contents:
+#       - has_concept("virus-distribution")
+
+#   - title: "Tool Functions"
+#     desc: >
+#       Functions for creating and managing tools (e.g., vaccines, interventions).
+#     contents:
+#       - has_concept("tool-functions")
+
+#   - title: "Tool Distribution"
+#     desc: >
+#       Functions for assigning tools across agents at initialization.
+#     contents:
+#       - has_concept("tool-distribution")
+
+#   - title: "Entity Functions and Mixing Models"
+#     desc: >
+#       Functions for working with entities in mixing models.
+#     contents:
+#       - has_concept("entity-functions")
+#       - has_concept("mixing-models")
+
+#   - title: "Global Events"
+#     desc: >
+#       Functions for defining and managing global events in simulations.
+#     contents:
+#       - has_concept("global-events")
+
+#   - title: "Model building"
+#     desc: >
+#       Functions for constructing models from components and running simulations.
+#     contents:
+#       - has_concept("model-building-functions")
+
+#   - title: "Miscellaneous Functions"
+#     desc: >
+#       Various utility functions for model manipulation and analysis.
+#     contents:
+#       - has_concept("misc-functions")
+
+#   - title: "Deprecated Functions"
+#     desc: >
+#       Functions that have been renamed or deprecated in recent versions.
+#     contents:
+#       - has_concept("deprecated-functions")
