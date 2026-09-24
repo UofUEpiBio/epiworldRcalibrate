@@ -69,8 +69,8 @@ shipped in `examples/data/`:
 
 ```{r, eval=FALSE}
 own_data <- read_training_data(
-  parameter_file   = file.path(project_root, "examples", "data", "sir_theta.csv"),
-  observation_file = file.path(project_root, "examples", "data", "sir_observations.csv")
+  parameter_file   = file.path("data", "sir_theta.csv"),
+  observation_file = file.path("data", "sir_observations.csv")
 )
 own_data
 ```
@@ -87,7 +87,6 @@ model_dir <- train_bilstm_calibrator(
   name         = demo_name,
   known_names  = c("n", "recov"),
   target_names = c("ptran", "crate", "R0"),
-  package_dir  = project_root,
   data         = sir_bank,
   epochs       = 10,
   hidden_size  = 32,
@@ -97,8 +96,7 @@ model_dir
 
 demo_cal <- bilstm_calibrator(
   model_dir   = model_dir,
-  known_names = c("n", "recov"),
-  package_dir = project_root
+  known_names = c("n", "recov")
 )
 demo_cal
 
@@ -109,16 +107,14 @@ calibrate(one_curve, demo_cal, n = sir_bank$theta$n[1], recov = sir_bank$theta$r
 ```{r, include=FALSE}
 # This was just a demo of the training call, on a throwaway name and a tiny
 # bank, so clean up the few files it wrote before moving on.
-unlink(file.path(project_root, "data", paste0(demo_name, "_theta.csv")))
-unlink(file.path(project_root, "data", paste0(demo_name, "_observations.csv")))
-unlink(file.path(project_root, "inst", "models", demo_name), recursive = TRUE)
+unlink(model_dir, recursive = TRUE)
 ```
 
 Or, just reuse an already-trained calibrator — this is what the rest of this demo uses, since it
 was trained on a much bigger bank of simulations than our 30-run toy example above:
 
 ```{r}
-pretrained_cal <- pretrained_sir_calibrator(package_dir = project_root)
+pretrained_cal <- pretrained_sir_calibrator()
 pretrained_cal
 ```
 
@@ -177,7 +173,7 @@ quick_settings
 get_estimate <- function(daily_cases, method, simulator, bounds, known_names, derive, known) {
   # build: BiLSTM is already trained, so it is loaded rather than built by name
   cal <- if (method == "BiLSTM") {
-    pretrained_sir_calibrator(package_dir = project_root)
+    pretrained_sir_calibrator()
   } else {
     do.call(
       make_calibrator,

@@ -48,7 +48,6 @@ print.calibrator <- function(x, ...) {
 #' @param type Epidemiological model label.
 #' @param name Calibrator label.
 #' @param post_process Optional result transformation.
-#' @param package_dir Optional source-package root.
 #' @return A `calibrator` object.
 #' @export
 bilstm_calibrator <- function(
@@ -56,8 +55,7 @@ bilstm_calibrator <- function(
     known_names,
     type = "generic",
     name = "BiLSTM",
-    post_process = function(x, ...) x,
-    package_dir = NULL
+    post_process = function(x, ...) x
 ) {
   model_dir <- normalizePath(model_dir, mustWork = TRUE)
 
@@ -75,7 +73,7 @@ bilstm_calibrator <- function(
   }
 
   run <- function(x, ...) {
-    py <- load_python_script("bilstm.py", package_dir = package_dir)
+    py <- load_python_script("bilstm.py")
     ans <- py$predict_saved_model(
       x$epicurve,
       matrix(x$known, nrow = 1),
@@ -100,12 +98,9 @@ bilstm_calibrator <- function(
 #' used its own architecture and saved scalers.
 #'
 #' @export
-pretrained_sir_calibrator <- function(package_dir = NULL, model_dir = NULL) {
+pretrained_sir_calibrator <- function(model_dir = NULL) {
   if (is.null(model_dir)) {
-    model_dir <- package_file(
-      "inst", "models", "sir", "pretrained",
-      package_dir = package_dir
-    )
+    model_dir <- package_file("models", "sir", "pretrained")
   }
   model_dir <- normalizePath(model_dir, mustWork = TRUE)
 
@@ -118,7 +113,7 @@ pretrained_sir_calibrator <- function(package_dir = NULL, model_dir = NULL) {
   }
 
   run <- function(x, ...) {
-    py <- load_python_script("legacy_sir.py", package_dir = package_dir)
+    py <- load_python_script("legacy_sir.py")
     unlist(py$predict_pretrained_sir(
       x$epicurve,
       x$n,
@@ -150,7 +145,7 @@ pretrained_sir_calibrator <- function(package_dir = NULL, model_dir = NULL) {
 #' The Python trainer only needs a parameter table and an observed-curve matrix.
 #' `name` can be "sir", "seir", "sirh", or any future model label.
 #' @export
-save_training_data <- function(x, name, package_dir = ".") {
+save_training_data <- function(x, name, output_dir = tempdir()) {
   if (is.null(x$theta) || !is.data.frame(x$theta)) {
     stop("x$theta must be a data.frame.")
   }
@@ -166,11 +161,10 @@ save_training_data <- function(x, name, package_dir = ".") {
     stop("theta and observations must have the same number of rows.")
   }
 
-  d <- file.path(package_dir, "data")
-  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-  theta_path <- file.path(d, paste0(name, "_theta.csv"))
-  observations_path <- file.path(d, paste0(name, "_observations.csv"))
+  theta_path <- file.path(output_dir, paste0(name, "_theta.csv"))
+  observations_path <- file.path(output_dir, paste0(name, "_observations.csv"))
 
   write.csv(x$theta, theta_path, row.names = FALSE)
   write.csv(observations, observations_path, row.names = FALSE)
@@ -184,11 +178,13 @@ save_training_data <- function(x, name, package_dir = ".") {
 #' @param known_names Columns in the parameter table treated as known inputs.
 #' @param target_names Columns the neural network should estimate.
 #' @param type Epidemiological model label written to model_config.json.
-#' @param package_dir Project root.
-#' @param data Optional `training_data` object. If supplied, it is saved and
-#'   used directly; no package simulator is required.
+#' @param data Optional `training_data` object. If supplied, it is saved to a
+#'   temporary folder and used directly; no package simulator is required.
 #' @param parameter_file Optional external CSV containing parameter rows.
 #' @param observation_file Optional external CSV containing observation rows.
+#' @param output_dir Directory the trained model is written to. Defaults to a
+#'   temporary folder; pass your own folder to keep the model after the R
+#'   session ends.
 #' @param epochs Number of epochs.
 #' @param batch_size Batch size.
 #' @param learning_rate Adam learning rate.
@@ -205,10 +201,10 @@ train_bilstm_calibrator <- function(
     known_names,
     target_names,
     type = name,
-    package_dir = ".",
     data = NULL,
     parameter_file = NULL,
     observation_file = NULL,
+    output_dir = file.path(tempdir(), name),
     epochs = 100,
     batch_size = 64,
     learning_rate = 0.001,
@@ -218,61 +214,32 @@ train_bilstm_calibrator <- function(
     dropout = 0.5,
     physics_weight = 0
 ) {
-
-  # We want to use the function
-  # file.path("model", "seir", "train_bilstm.py", package="epiworldRcalibrate")
-  # You don't want to include inst explicitly, since all files under
-  # inst are automatically copied into the package folder.
-  #
-  # If a user wants to save a new model, they CANNOT use the same system.
-  # they have to save files directly to other place in their computers.
-  #
-  # Finally, when writing the testing functions (including examples and 
-  # vignettes), you want to avoid having examples that write directly to
-  # non-temp folders (for instance, the home directory or the desktop).
-  # For this we use `tempdir()`.
-  # 
-
-  package_dir <- normalizePath(package_dir, mustWork = TRUE)
-  script <- package_file("inst", "python", "train_bilstm.py", package_dir = package_dir)
+  script <- package_file("python", "train_bilstm.py")
   python <- reticulate::py_config()$python
 
-  # Three supported input modes:
+  # Two supported input modes:
   #   1. `data=`: pass a training_data object directly;
-  #   2. `parameter_file=` + `observation_file=`: use external CSV files;
-  #   3. neither: use data/<name>_theta.csv and data/<name>_observations.csv.
+  #   2. `parameter_file=` + `observation_file=`: use external CSV files.
   if (!is.null(data)) {
     if (is.null(data$theta) || is.null(data$observations)) {
       stop("data must contain `theta` and `observations`.")
     }
-    save_training_data(data, name = name, package_dir = package_dir)
-    theta <- file.path(package_dir, "data", paste0(name, "_theta.csv"))
-    observations <- file.path(
-      package_dir, "data", paste0(name, "_observations.csv")
+    paths <- save_training_data(
+      data, name = name, output_dir = tempfile("training_data_")
     )
-  } else if (!is.null(parameter_file) || !is.null(observation_file)) {
-    if (is.null(parameter_file) || is.null(observation_file)) {
-      stop(
-        "Supply both `parameter_file` and `observation_file`, or neither."
-      )
-    }
+    theta <- paths[["theta"]]
+    observations <- paths[["observations"]]
+  } else if (!is.null(parameter_file) && !is.null(observation_file)) {
     theta <- normalizePath(parameter_file, mustWork = TRUE)
     observations <- normalizePath(observation_file, mustWork = TRUE)
   } else {
-    theta <- file.path(package_dir, "data", paste0(name, "_theta.csv"))
-    observations <- file.path(
-      package_dir, "data", paste0(name, "_observations.csv")
+    stop(
+      "Supply either `data`, or both `parameter_file` and `observation_file`."
     )
-    legacy_incidence <- file.path(
-      package_dir, "data", paste0(name, "_incidence.csv")
-    )
-    if (!file.exists(observations) && file.exists(legacy_incidence)) {
-      observations <- legacy_incidence
-    }
   }
 
-  output_dir <- file.path(package_dir, "inst", "models", name, "trained")
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  output_dir <- normalizePath(output_dir, mustWork = TRUE)
 
   if (!file.exists(theta)) stop("Missing training file: ", theta)
   if (!file.exists(observations)) {

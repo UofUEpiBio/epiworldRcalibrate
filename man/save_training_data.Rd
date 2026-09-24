@@ -4,7 +4,7 @@
 \alias{save_training_data}
 \title{Save a training bank}
 \usage{
-save_training_data(x, name, package_dir = ".")
+save_training_data(x, name, output_dir = tempdir())
 }
 \description{
 The Python trainer only needs a parameter table and an observed-curve matrix.

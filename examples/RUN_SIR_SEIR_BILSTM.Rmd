@@ -194,7 +194,7 @@ sir_data <- generate_sir_training_data(
   seed = SEED,
   save = TRUE,
   name = "sir",
-  package_dir = PROJECT_ROOT
+  output_dir = file.path(PROJECT_ROOT, "data")
 )
 
 cat("SIR parameter rows:", nrow(sir_data$theta), "\n")
@@ -270,7 +270,9 @@ if (RETRAIN || !file.exists(file.path(sir_model_dir, "model.pt"))) {
       "R0"
     ),
     type = "SIR",
-    package_dir = PROJECT_ROOT,
+    parameter_file = sir_theta_file,
+    observation_file = sir_curve_file,
+    output_dir = sir_model_dir,
     epochs = EPOCHS,
     batch_size = BATCH_SIZE,
     learning_rate = 0.001,
@@ -420,8 +422,7 @@ sir_bilstm <- bilstm_calibrator(
     "n",
     "recov"
   ),
-  type = "SIR",
-  package_dir = PROJECT_ROOT
+  type = "SIR"
 )
 
 sir_bilstm
@@ -507,7 +508,7 @@ seir_data <- generate_seir_training_data(
   seed = SEED,
   save = TRUE,
   name = "seir",
-  package_dir = PROJECT_ROOT
+  output_dir = file.path(PROJECT_ROOT, "data")
 )
 
 cat("SEIR parameter rows:", nrow(seir_data$theta), "\n")
@@ -579,7 +580,9 @@ if (RETRAIN || !file.exists(file.path(seir_model_dir, "model.pt"))) {
       "R0"
     ),
     type = "SEIR",
-    package_dir = PROJECT_ROOT,
+    parameter_file = seir_theta_file,
+    observation_file = seir_curve_file,
+    output_dir = seir_model_dir,
     epochs = EPOCHS,
     batch_size = BATCH_SIZE,
     learning_rate = 0.001,
@@ -737,8 +740,7 @@ seir_bilstm <- bilstm_calibrator(
     "recov",
     "incub"
   ),
-  type = "SEIR",
-  package_dir = PROJECT_ROOT
+  type = "SEIR"
 )
 
 seir_bilstm

@@ -16,31 +16,16 @@
 
 # Internal path helpers -------------------------------------------------------
 
-find_project_root <- function() {
-  candidates <- c(".", "..", "../..", "../../..")
-  ok <- file.exists(file.path(candidates, "DESCRIPTION")) &
-    dir.exists(file.path(candidates, "R")) &
-    dir.exists(file.path(candidates, "inst"))
-  if (!any(ok)) return(NULL)
-  normalizePath(candidates[which(ok)[1]], mustWork = TRUE)
+# Files under inst/ are installed at the top level of the package, so paths
+# here leave out "inst" (e.g. inst/python/bilstm.py -> python/bilstm.py).
+package_file <- function(...) {
+  path <- system.file(..., package = "epiworldRcalibrate")
+  if (!nzchar(path)) stop("Cannot find package file: ", file.path(...))
+  path
 }
 
-package_file <- function(..., package_dir = NULL) {
-  if (is.null(package_dir)) package_dir <- find_project_root()
-
-  if (!is.null(package_dir)) {
-    path <- file.path(package_dir, ...)
-    if (file.exists(path) || dir.exists(path)) return(normalizePath(path, mustWork = FALSE))
-  }
-
-  installed <- system.file(..., package = "epiworldRcalibrate")
-  if (nzchar(installed)) return(installed)
-
-  stop("Cannot find package file: ", file.path(...))
-}
-
-load_python_script <- function(filename, package_dir = NULL) {
-  path <- package_file("inst", "python", filename, package_dir = package_dir)
+load_python_script <- function(filename) {
+  path <- package_file("python", filename)
   env <- new.env(parent = globalenv())
   reticulate::source_python(path, envir = env, convert = TRUE)
   env
@@ -50,6 +35,12 @@ setup_python_deps <- function(force = FALSE) {
   packages <- c("numpy", "pandas", "torch", "scikit-learn==1.6.1", "joblib")
   reticulate::py_require(packages, action = if (force) "set" else "add")
   invisible(TRUE)
+}
+
+# Declare the Python packages when the package loads, so reticulate sets them
+# up the first time Python is used.
+.onLoad <- function(libname, pkgname) {
+  setup_python_deps()
 }
 
 
@@ -522,9 +513,9 @@ seir_simulator <- function(
 #'   `ndays + 1` values including day zero.
 #' @param seed Master random seed.
 #' @param priors Optional prior overrides passed to `sir_simulator()`.
-#' @param save If TRUE, save the bank under `data/`.
+#' @param save If TRUE, save the bank as CSV files in `output_dir`.
 #' @param name File/model label.
-#' @param package_dir Project root.
+#' @param output_dir Directory the CSV files are written to when `save = TRUE`.
 #' @export
 generate_sir_training_data <- function(
     n_sims = 5000,
@@ -533,7 +524,7 @@ generate_sir_training_data <- function(
     priors = NULL,
     save = FALSE,
     name = "sir",
-    package_dir = tempdir()
+    output_dir = tempdir()
 ) {
   bank <- simulate_training_data(
     simulator = sir_simulator(ndays = ndays, priors = priors),
@@ -542,8 +533,8 @@ generate_sir_training_data <- function(
   )
 
   if (isTRUE(save)) {
-    message("Saving training bank to ", file.path(package_dir, "data"))
-    save_training_data(bank, name = name, package_dir = package_dir)
+    message("Saving training bank to ", output_dir)
+    save_training_data(bank, name = name, output_dir = output_dir)
   }
 
   bank
@@ -555,9 +546,9 @@ generate_sir_training_data <- function(
 #' @param ndays Number of returned incidence days.
 #' @param seed Master random seed.
 #' @param priors Optional prior overrides passed to `seir_simulator()`.
-#' @param save If TRUE, save the bank under `data/`.
+#' @param save If TRUE, save the bank as CSV files in `output_dir`.
 #' @param name File/model label.
-#' @param package_dir Project root.
+#' @param output_dir Directory the CSV files are written to when `save = TRUE`.
 #' @export
 generate_seir_training_data <- function(
     n_sims = 20000,
@@ -566,7 +557,7 @@ generate_seir_training_data <- function(
     priors = NULL,
     save = FALSE,
     name = "seir",
-    package_dir = tempdir()
+    output_dir = tempdir()
 ) {
   bank <- simulate_training_data(
     simulator = seir_simulator(ndays = ndays, priors = priors),
@@ -575,8 +566,8 @@ generate_seir_training_data <- function(
   )
 
   if (isTRUE(save)) {
-    message("Saving training bank to ", file.path(package_dir, "data"))
-    save_training_data(bank, name = name, package_dir = package_dir)
+    message("Saving training bank to ", output_dir)
+    save_training_data(bank, name = name, output_dir = output_dir)
   }
 
   bank

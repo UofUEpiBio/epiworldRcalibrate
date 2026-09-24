@@ -1,5 +1,4 @@
-source("R/02_training.R")
-source("R/03_test_compare.R")
+library(epiworldRcalibrate)
 
 cal <- list(
   pre_process = function(x, ...) x,

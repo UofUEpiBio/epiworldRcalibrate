@@ -171,28 +171,26 @@ they can connect it through `new_simulator()` and then call
 For SIR:
 
 ```{r}
-train_bilstm_calibrator(
+sir_model_dir <- train_bilstm_calibrator(
   name = "sir",
   known_names = c("n", "recov"),
   target_names = c("ptran", "crate", "R0"),
   type = "SIR",
-  package_dir = find_project_root(),
+  data = sir_data,
+  output_dir = file.path(tempdir(), "sir"),
   epochs = 100,
   physics_weight = 0.03
 )
 ```
 
-The fitted model and preprocessing objects are saved under:
-
-```text
-inst/models/sir/trained/
-```
+The fitted model and preprocessing objects are saved in `output_dir`. A
+temporary folder is used here; pass your own folder to keep the model.
 
 Create the SIR BiLSTM calibrator:
 
 ```{r}
 sir_bilstm <- bilstm_calibrator(
-  model_dir = "inst/models/sir/trained",
+  model_dir = sir_model_dir,
   known_names = c("n", "recov"),
   type = "SIR"
 )

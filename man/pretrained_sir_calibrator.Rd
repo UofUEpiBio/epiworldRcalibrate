@@ -4,7 +4,7 @@
 \alias{pretrained_sir_calibrator}
 \title{Create the original pretrained SIR BiLSTM calibrator}
 \usage{
-pretrained_sir_calibrator(package_dir = NULL, model_dir = NULL)
+pretrained_sir_calibrator(model_dir = NULL)
 }
 \description{
 This is a compatibility adapter for the already-trained 61-day SIR model.

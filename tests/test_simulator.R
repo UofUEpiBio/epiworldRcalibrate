@@ -1,6 +1,6 @@
 # Small test of the generic simulator interface. No epiworldR model is needed.
 
-source(file.path("R", "01_simulation.R"))
+library(epiworldRcalibrate)
 
 sampler <- function(n_sims) {
   data.frame(

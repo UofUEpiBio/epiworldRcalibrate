@@ -1,5 +1,4 @@
-source("R/01_simulation.R")
-source("R/02_training.R")
+library(epiworldRcalibrate)
 
 parameters <- data.frame(
   n = c(1000, 1200, 1500),

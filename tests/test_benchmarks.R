@@ -1,6 +1,4 @@
-source("R/01_simulation.R")
-source("R/02_training.R")
-source("R/03_test_compare.R")
+library(epiworldRcalibrate)
 
 toy_sim <- new_simulator(
   sample_parameters = function(n_sims) {

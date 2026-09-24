@@ -1,25 +1,32 @@
-# Smoke test for any saved generic BiLSTM model.
+# Smoke test for a BiLSTM model shipped with the package.
 # Usage: Rscript tests/test_trained_model.R sir
+# Needs Python with torch, so it is skipped when no model name is given
+# (for example, during R CMD check).
 
 args <- commandArgs(trailingOnly = TRUE)
-if (!length(args)) stop("Usage: Rscript tests/test_trained_model.R <model-name>")
+if (!length(args)) {
+  cat("SKIP: run `Rscript tests/test_trained_model.R <model-name>` to test a trained model\n")
+  quit(save = "no")
+}
 name <- args[[1]]
 
-source(file.path("R", "01_simulation.R"))
-source(file.path("R", "02_training.R"))
-source(file.path("R", "03_test_compare.R"))
+library(epiworldRcalibrate)
 
-model_dir <- file.path("inst", "models", name, "trained")
+model_dir <- system.file("models", name, "trained", package = "epiworldRcalibrate")
 config_path <- file.path(model_dir, "model_config.json")
-if (!file.exists(config_path)) stop("No trained model found at: ", model_dir)
+if (!nzchar(model_dir) || !file.exists(config_path)) {
+  stop("No trained model named '", name, "' is installed with the package.")
+}
 
 config <- jsonlite::fromJSON(config_path)
-theta <- read.csv(file.path("data", paste0(name, "_theta.csv")))
-curve_path <- file.path("data", paste0(name, "_observations.csv"))
-if (!file.exists(curve_path)) {
-  curve_path <- file.path("data", paste0(name, "_incidence.csv"))
-}
-inc <- read.csv(curve_path, check.names = FALSE)
+
+# Simulate one test curve with the same length the model was trained on.
+bank <- switch(
+  name,
+  sir = generate_sir_training_data(n_sims = 1, ndays = config$sequence_length - 1),
+  seir = generate_seir_training_data(n_sims = 1, ndays = config$sequence_length),
+  stop("No built-in simulator for model '", name, "'.")
+)
 
 cal <- bilstm_calibrator(
   model_dir = model_dir,
@@ -27,10 +34,10 @@ cal <- bilstm_calibrator(
   type = config$model_type
 )
 
-dots <- as.list(theta[1, config$known_names, drop = FALSE])
+dots <- as.list(bank$theta[1, config$known_names, drop = FALSE])
 ans <- do.call(
   calibrate,
-  c(list(daily_cases = as.numeric(inc[1, ]), calibrator = cal), dots)
+  c(list(daily_cases = as.numeric(bank$observations[1, ]), calibrator = cal), dots)
 )
 
 print(ans)

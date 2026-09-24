@@ -9,10 +9,10 @@ train_bilstm_calibrator(
   known_names,
   target_names,
   type = name,
-  package_dir = ".",
   data = NULL,
   parameter_file = NULL,
   observation_file = NULL,
+  output_dir = file.path(tempdir(), name),
   epochs = 100,
   batch_size = 64,
   learning_rate = 0.001,
@@ -32,14 +32,16 @@ train_bilstm_calibrator(
 
 \item{type}{Epidemiological model label written to model_config.json.}
 
-\item{package_dir}{Project root.}
-
-\item{data}{Optional `training_data` object. If supplied, it is saved and
-used directly; no package simulator is required.}
+\item{data}{Optional `training_data` object. If supplied, it is saved to a
+temporary folder and used directly; no package simulator is required.}
 
 \item{parameter_file}{Optional external CSV containing parameter rows.}
 
 \item{observation_file}{Optional external CSV containing observation rows.}
+
+\item{output_dir}{Directory the trained model is written to. Defaults to a
+temporary folder; pass your own folder to keep the model after the R
+session ends.}
 
 \item{epochs}{Number of epochs.}
 

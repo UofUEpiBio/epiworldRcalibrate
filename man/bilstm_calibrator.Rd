@@ -9,8 +9,7 @@ bilstm_calibrator(
   known_names,
   type = "generic",
   name = "BiLSTM",
-  post_process = function(x, ...) x,
-  package_dir = NULL
+  post_process = function(x, ...) x
 )
 }
 \arguments{
@@ -23,8 +22,6 @@ bilstm_calibrator(
 \item{name}{Calibrator label.}
 
 \item{post_process}{Optional result transformation.}
-
-\item{package_dir}{Optional source-package root.}
 }
 \value{
 A `calibrator` object.

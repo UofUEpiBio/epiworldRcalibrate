@@ -9,9 +9,9 @@ generate_sir_training_data(
   ndays = 60,
   seed = 122,
   priors = NULL,
-  save = TRUE,
+  save = FALSE,
   name = "sir",
-  package_dir = "."
+  output_dir = tempdir()
 )
 }
 \arguments{
@@ -24,11 +24,11 @@ generate_sir_training_data(
 
 \item{priors}{Optional prior overrides passed to `sir_simulator()`.}
 
-\item{save}{If TRUE, save the bank under `data/`.}
+\item{save}{If TRUE, save the bank as CSV files in `output_dir`.}
 
 \item{name}{File/model label.}
 
-\item{package_dir}{Project root.}
+\item{output_dir}{Directory the CSV files are written to when `save = TRUE`.}
 }
 \description{
 Generate the built-in SIR training bank
