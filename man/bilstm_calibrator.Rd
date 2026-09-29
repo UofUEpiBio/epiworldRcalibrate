@@ -9,7 +9,7 @@ bilstm_calibrator(
   known_names,
   type = "generic",
   name = "BiLSTM",
-  post_process = function(x, ...) x
+  post_process = derive_crate
 )
 }
 \arguments{
@@ -21,7 +21,10 @@ bilstm_calibrator(
 
 \item{name}{Calibrator label.}
 
-\item{post_process}{Optional result transformation.}
+\item{post_process}{Result transformation. By default, the same as the
+pretrained SIR model: when the model predicts `ptran`, `crate` and `R0`
+and `recov` is known, `crate` is replaced by `R0 * recov / ptran`.
+Use `function(x, ...) x` to keep the raw network output.}
 }
 \value{
 A `calibrator` object.

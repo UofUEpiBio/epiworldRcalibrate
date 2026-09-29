@@ -37,6 +37,16 @@ print.calibrator <- function(x, ...) {
 
 # Generic BiLSTM calibrator ---------------------------------------------------
 
+# Post-processing used by the original pretrained SIR model: keep the predicted
+# ptran and R0, and recompute crate from R0 = ptran * crate / recov.
+# Models without ptran/crate/R0 targets or a known recov are left unchanged.
+derive_crate <- function(x, recov = NULL, ...) {
+  if (!is.null(recov) && all(c("ptran", "crate", "R0") %in% names(x))) {
+    x["crate"] <- x["R0"] * recov / x["ptran"]
+  }
+  x
+}
+
 #' Create a BiLSTM calibrator from a saved model directory
 #'
 #' The saved model determines the number of inputs and outputs.  `known_names`
@@ -47,7 +57,10 @@ print.calibrator <- function(x, ...) {
 #' @param known_names Names of known parameters expected by the model.
 #' @param type Epidemiological model label.
 #' @param name Calibrator label.
-#' @param post_process Optional result transformation.
+#' @param post_process Result transformation. By default, the same as the
+#'   pretrained SIR model: when the model predicts `ptran`, `crate` and `R0`
+#'   and `recov` is known, `crate` is replaced by `R0 * recov / ptran`.
+#'   Use `function(x, ...) x` to keep the raw network output.
 #' @return A `calibrator` object.
 #' @export
 bilstm_calibrator <- function(
@@ -55,7 +68,7 @@ bilstm_calibrator <- function(
     known_names,
     type = "generic",
     name = "BiLSTM",
-    post_process = function(x, ...) x
+    post_process = derive_crate
 ) {
   model_dir <- normalizePath(model_dir, mustWork = TRUE)
 
@@ -122,16 +135,10 @@ pretrained_sir_calibrator <- function(model_dir = NULL) {
     ))
   }
 
-  post_process <- function(x, recov, ...) {
-    # Preserve the behavior used with the original SIR deployment model.
-    x["crate"] <- x["R0"] * recov / x["ptran"]
-    x
-  }
-
   list(
     pre_process = pre_process,
     run = run,
-    post_process = post_process,
+    post_process = derive_crate,
     type = "SIR"
   ) |>
     structure(class = "calibrator")
