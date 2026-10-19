@@ -11,7 +11,8 @@ generate_sir_training_data(
   priors = NULL,
   save = FALSE,
   name = "sir",
-  output_dir = tempdir()
+  output_dir = tempdir(),
+  keep_day_zero = TRUE
 )
 }
 \arguments{
@@ -29,6 +30,8 @@ generate_sir_training_data(
 \item{name}{File/model label.}
 
 \item{output_dir}{Directory the CSV files are written to when `save = TRUE`.}
+
+\item{keep_day_zero}{Passed to `sir_simulator()`.}
 }
 \description{
 Generate the built-in SIR training bank

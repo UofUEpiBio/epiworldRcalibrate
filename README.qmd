@@ -61,6 +61,40 @@ object; `calibrate()` itself does not change.
 See [USER_GUIDE.md](USER_GUIDE.md) for complete examples.
 
 
+## Calibrating a window of daily infections (SEIR or SIR)
+
+The package ships trained BiLSTM calibrators for windows of daily new
+infections (30 to 365 days, from any part of an epidemic) of
+`epiworldR::ModelSEIRCONN` and `ModelSIRCONN`:
+
+``` r
+library(epiworldRcalibrate)
+
+fit  <- calibrate(cases, window_calibrator("SEIR"), n = 10000, recov = 1 / 7, incub = 5)
+fit                                    # R0 (95% range), ptran, crate, starting state
+band <- predict_cases(fit, ahead = 14) # or method = "renewal" (renewal equation)
+score_band(band)                       # coverage and interval score
+
+baselines <- window_baselines("SEIR")  # ABC-MCMC, ABC-SMC, DE, Nelder-Mead, set up the same way
+fit_smc <- calibrate(cases, baselines$`ABC-SMC`, n = 10000, recov = 1 / 7, incub = 5)
+window_baselines("SEIR", unknowns = "ptran_crate")   # search ptran and crate instead of R0
+
+windows <- real_data_windows("New York Omicron 2021-22")   # real data shipped with the package
+results <- compare_methods(windows, "SEIR", cores = 8)     # all methods on a list of windows
+plot_comparison(results)               # coverage, interval score, errors and time by method
+plot_bands(lapply(list(BiLSTM = fit, `ABC-SMC` = fit_smc), predict_cases, ahead = 14))
+```
+
+Data: `covid_us_states`, `covid_utah`, `admissions_utah`, `flu_baltimore_1918` and
+`real_data_waves` (the waves of the report).
+
+To make your own: `simulate_window_data()`, `tune_window_calibrator()`
+and `train_window_calibrator()`. See `vignette("Window_calibration")`.
+
+**Tutorial:** `TUTORIAL.Rmd` teaches the package step by step (installing, Python, calibrating,
+predicting, scoring, calibrating with the standard methods, ptran and crate, comparing methods
+with plots, the real data, training your own model, and rendering the documents); render it with `rmarkdown::render("TUTORIAL.Rmd")`.
+
 ## Step-by-step documentation
 
 For the complete copy/paste workflow, see [STEP_BY_STEP_GUIDE.md](STEP_BY_STEP_GUIDE.md).

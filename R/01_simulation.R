@@ -24,15 +24,22 @@ package_file <- function(...) {
   path
 }
 
+# Each script is sourced once per session; later calls reuse it (and the
+# models it has already loaded).
+python_scripts <- new.env(parent = emptyenv())
+
 load_python_script <- function(filename) {
-  path <- package_file("python", filename)
-  env <- new.env(parent = globalenv())
-  reticulate::source_python(path, envir = env, convert = TRUE)
-  env
+  if (is.null(python_scripts[[filename]])) {
+    path <- package_file("python", filename)
+    env <- new.env(parent = globalenv())
+    reticulate::source_python(path, envir = env, convert = TRUE)
+    python_scripts[[filename]] <- env
+  }
+  python_scripts[[filename]]
 }
 
 setup_python_deps <- function(force = FALSE) {
-  packages <- c("numpy", "pandas", "torch", "scikit-learn==1.6.1", "joblib")
+  packages <- c("numpy", "pandas", "torch", "scikit-learn==1.6.1", "joblib", "optuna>=4")
   reticulate::py_require(packages, action = if (force) "set" else "add")
   invisible(TRUE)
 }
@@ -348,6 +355,39 @@ get_incidence <- function(model, ndays, keep_day_zero = FALSE) {
   x[seq_len(expected)]
 }
 
+log_uniform <- function(n, range) {
+  exp(stats::runif(n, log(range[1]), log(range[2])))
+}
+
+# Evaluate `expr` with the random seed `seed`, then restore the caller's
+# random number state.
+with_seed <- function(seed, expr) {
+  had_seed <- exists(".Random.seed", envir = globalenv(), inherits = FALSE)
+  if (had_seed) old <- get(".Random.seed", envir = globalenv())
+  on.exit(
+    if (had_seed) assign(".Random.seed", old, envir = globalenv())
+    else rm(".Random.seed", envir = globalenv())
+  )
+  set.seed(seed)
+  expr
+}
+
+# Reported cases from true daily cases: each day's expected count is the
+# reported share times the true count times a weekday factor (7 random factors
+# with mean 1, so the weekly pattern starts on a random weekday), and the
+# reported count is negative binomial around it (Poisson when overdispersion
+# is 0): variance = mean + overdispersion * mean^2.
+observe_cases <- function(x, report_rate, overdispersion = 0, weekday_sd = 0) {
+  w <- exp(weekday_sd * stats::rnorm(7))
+  w <- w / mean(w)
+  mu <- report_rate * x * w[(seq_along(x) - 1L) %% 7L + 1L]
+  if (overdispersion > 0) {
+    stats::rnbinom(length(mu), size = 1 / overdispersion, mu = mu)
+  } else {
+    stats::rpois(length(mu), mu)
+  }
+}
+
 merge_priors <- function(defaults, priors) {
   if (is.null(priors)) return(defaults)
   unknown <- setdiff(names(priors), names(defaults))
@@ -381,18 +421,34 @@ sample_sir_theta <- function(n_sims, p) {
   out <- out[seq_len(n_sims), , drop = FALSE]
   rownames(out) <- NULL
   out$initial_infected <- pmax(1L, round(out$preval * out$n))
+  if (!is.null(p$report_rate)) out$report_rate <- log_uniform(n_sims, p$report_rate)
+  if (!is.null(p$overdispersion)) out$overdispersion <- log_uniform(n_sims, p$overdispersion)
+  if (!is.null(p$weekday_sd)) out$weekday_sd <- runif(n_sims, p$weekday_sd[1], p$weekday_sd[2])
   out
 }
 
 #' Create the current epiworldR SIR simulator
 #'
+#' `parameters$preval` is the share of the population initially infected. To
+#' start mid-epidemic, `parameters` may also hold `start_recovered`, the share
+#' initially recovered. With `parameters$report_rate`, the curve holds reported
+#' cases, as in [seir_simulator()].
+#'
 #' @param ndays Number of simulated days. The current SIR adapter preserves the
 #'   historical day-zero convention and returns `ndays + 1` values.
-#' @param priors Optional named list overriding the default prior ranges.
+#' @param priors Optional named list overriding the default prior ranges
+#'   (`c(min, max)` each): `n`, `recov`, `preval`, `crate`, `R0`. Optional
+#'   extras, as in [seir_simulator()]: `report_rate` and `overdispersion`,
+#'   drawn log-uniformly, and `weekday_sd`, drawn uniformly.
+#' @param keep_day_zero If TRUE (the historical convention), the curve starts
+#'   with day 0, the number initially infected, followed by new infections on
+#'   days 1 to `ndays` (`ndays + 1` values). If FALSE, the curve holds only new
+#'   infections on days 1 to `ndays`, like the SEIR adapter.
 #' @export
 sir_simulator <- function(
     ndays = 60,
-    priors = NULL
+    priors = NULL,
+    keep_day_zero = TRUE
 ) {
   p <- merge_priors(
     list(
@@ -400,7 +456,10 @@ sir_simulator <- function(
       recov = c(0.071, 0.25),
       preval = c(0.007, 0.02),
       crate = c(1, 5),
-      R0 = c(1.1, 5)
+      R0 = c(1.1, 5),
+      report_rate = NULL,
+      overdispersion = NULL,
+      weekday_sd = NULL
     ),
     priors
   )
@@ -418,11 +477,23 @@ sir_simulator <- function(
       transmission_rate = parameters$ptran,
       recovery_rate = parameters$recov
     )
+    if (!is.null(parameters$start_recovered)) {
+      # epiworldR sets the recovered share of everyone not infected.
+      epiworldR::initial_states(m, parameters$start_recovered / (1 - parameters$preval))
+    }
     epiworldR::verbose_off(m)
     epiworldR::run(m, ndays = ndays, seed = seed)
 
-    ans <- get_incidence(m, ndays, keep_day_zero = TRUE)
-    names(ans) <- paste0("day_", 0:ndays)
+    ans <- get_incidence(m, ndays, keep_day_zero = keep_day_zero)
+    if (!is.null(parameters$report_rate)) {
+      ans <- with_seed(seed, observe_cases(
+        ans,
+        report_rate    = parameters$report_rate,
+        overdispersion = if (is.null(parameters$overdispersion)) 0 else parameters$overdispersion,
+        weekday_sd     = if (is.null(parameters$weekday_sd)) 0 else parameters$weekday_sd
+      ))
+    }
+    names(ans) <- paste0("day_", if (keep_day_zero) 0:ndays else seq_len(ndays))
     ans
   }
 
@@ -436,8 +507,25 @@ sir_simulator <- function(
 
 #' Create the current epiworldR SEIR simulator
 #'
+#' `parameters$preval` is the share of the population initially exposed. To
+#' start mid-epidemic, `parameters` may also hold `start_infected` and
+#' `start_recovered`: the shares initially infectious and recovered.
+#'
+#' With `parameters$report_rate`, the curve holds reported cases instead of all
+#' new cases: each day's expected count is `report_rate` times the true count
+#' times a weekday factor (seven random factors with mean 1 and log standard
+#' deviation `weekday_sd`), and the count is negative binomial around it with
+#' variance `mean + overdispersion * mean^2` (Poisson when `overdispersion` is
+#' 0 or missing).
+#'
 #' @param ndays Number of returned incidence days.
-#' @param priors Optional named list overriding the default prior ranges.
+#' @param priors Optional named list overriding the default prior ranges
+#'   (`c(min, max)` each): `n`, `recov`, `crate`, `incub`, `R0` and
+#'   `initial_infected` (the number initially exposed). Optional extras:
+#'   `preval`, the share initially exposed, drawn log-uniformly (replaces
+#'   `initial_infected`); `report_rate` and `overdispersion`, drawn
+#'   log-uniformly, and `weekday_sd`, drawn uniformly, which switch on the
+#'   reporting model above.
 #' @export
 seir_simulator <- function(
     ndays = 365,
@@ -450,7 +538,11 @@ seir_simulator <- function(
       crate = c(5, 15),
       incub = c(3, 21),
       R0 = c(1, 5),
-      initial_infected = c(100, 2000)
+      initial_infected = c(100, 2000),
+      preval = NULL,
+      report_rate = NULL,
+      overdispersion = NULL,
+      weekday_sd = NULL
     ),
     priors
   )
@@ -461,16 +553,21 @@ seir_simulator <- function(
       recov = runif(n_sims, p$recov[1], p$recov[2]),
       crate = runif(n_sims, p$crate[1], p$crate[2]),
       incub = runif(n_sims, p$incub[1], p$incub[2]),
-      R0 = runif(n_sims, p$R0[1], p$R0[2]),
-      initial_infected = sample(
-        p$initial_infected[1]:p$initial_infected[2],
-        n_sims,
-        replace = TRUE
-      )
+      R0 = runif(n_sims, p$R0[1], p$R0[2])
     )
+    theta$initial_infected <- if (is.null(p$preval)) {
+      sample(p$initial_infected[1]:p$initial_infected[2], n_sims, replace = TRUE)
+    } else {
+      pmax(1, round(log_uniform(n_sims, p$preval) * theta$n))
+    }
 
     theta$preval <- theta$initial_infected / theta$n
     theta$ptran <- theta$R0 * theta$recov / theta$crate
+    if (!is.null(p$report_rate)) theta$report_rate <- log_uniform(n_sims, p$report_rate)
+    if (!is.null(p$overdispersion)) theta$overdispersion <- log_uniform(n_sims, p$overdispersion)
+    if (!is.null(p$weekday_sd)) {
+      theta$weekday_sd <- runif(n_sims, p$weekday_sd[1], p$weekday_sd[2])
+    }
     theta
   }
 
@@ -484,10 +581,40 @@ seir_simulator <- function(
       transmission_rate = parameters$ptran,
       recovery_rate = parameters$recov
     )
+    if (!is.null(parameters$start_infected) || !is.null(parameters$start_recovered)) {
+      # epiworldR sets the starting state through the share carrying the virus
+      # (exposed + infectious), the infectious share of the carriers, and the
+      # recovered share of everyone else.
+      exposed   <- parameters$preval
+      infected  <- if (is.null(parameters$start_infected)) 0 else parameters$start_infected
+      recovered <- if (is.null(parameters$start_recovered)) 0 else parameters$start_recovered
+      carriers  <- exposed + infected
+      m <- epiworldR::ModelSEIRCONN(
+        name = "sim",
+        n = parameters$n,
+        prevalence = carriers,
+        contact_rate = parameters$crate,
+        incubation_days = parameters$incub,
+        transmission_rate = parameters$ptran,
+        recovery_rate = parameters$recov
+      )
+      epiworldR::initial_states(m, c(
+        if (carriers > 0) infected / carriers else 0,
+        recovered / (1 - carriers)
+      ))
+    }
     epiworldR::verbose_off(m)
     epiworldR::run(m, ndays = ndays + 1L, seed = seed)
 
     ans <- get_incidence(m, ndays, keep_day_zero = FALSE)
+    if (!is.null(parameters$report_rate)) {
+      ans <- with_seed(seed, observe_cases(
+        ans,
+        report_rate    = parameters$report_rate,
+        overdispersion = if (is.null(parameters$overdispersion)) 0 else parameters$overdispersion,
+        weekday_sd     = if (is.null(parameters$weekday_sd)) 0 else parameters$weekday_sd
+      ))
+    }
     names(ans) <- paste0("day_", seq_len(ndays))
     ans
   }
@@ -516,6 +643,7 @@ seir_simulator <- function(
 #' @param save If TRUE, save the bank as CSV files in `output_dir`.
 #' @param name File/model label.
 #' @param output_dir Directory the CSV files are written to when `save = TRUE`.
+#' @param keep_day_zero Passed to `sir_simulator()`.
 #' @export
 generate_sir_training_data <- function(
     n_sims = 5000,
@@ -524,10 +652,11 @@ generate_sir_training_data <- function(
     priors = NULL,
     save = FALSE,
     name = "sir",
-    output_dir = tempdir()
+    output_dir = tempdir(),
+    keep_day_zero = TRUE
 ) {
   bank <- simulate_training_data(
-    simulator = sir_simulator(ndays = ndays, priors = priors),
+    simulator = sir_simulator(ndays = ndays, priors = priors, keep_day_zero = keep_day_zero),
     n_sims = n_sims,
     seed = seed
   )

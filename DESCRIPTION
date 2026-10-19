@@ -3,19 +3,26 @@ Type: Package
 Title: Generic Calibration Interface for Agent-Based Epidemic Models
 Version: 0.5.0
 Authors@R: person("Sima", "Najafzadeh", role = c("aut", "cre"), email = "sima@example.com")
-Description: Provides a three-step generic workflow for epidemic-model calibration: simulation or data import, calibrator training, and evaluation/comparison. Includes epiworldR SIR/SEIR adapters, user-supplied data and simulator interfaces, a generic BiLSTM calibrator, and ABC/optimization benchmark methods.
+Description: Provides a three-step generic workflow for epidemic-model calibration: simulation or data import, calibrator training, and evaluation/comparison. Includes epiworldR SIR/SEIR adapters, user-supplied data and simulator interfaces, a generic BiLSTM calibrator, and ABC/optimization benchmark methods. Ships trained any-length BiLSTM calibrators for windows of daily new infections of the SEIR and SIR models, with R0 ranges, standard ABC-MCMC, ABC-SMC, differential evolution and Nelder-Mead baselines set up the same way, predictions by model simulation or the renewal equation, coverage and interval scores, functions to simulate training data, train and tune such calibrators, plots to compare methods, and real epidemic data (COVID-19 cases in US states and Utah, influenza and COVID-19 hospital admissions in Utah, influenza in Baltimore in 1918).
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
 Imports:
     epiworldR,
-    reticulate
+    graphics,
+    grDevices,
+    jsonlite,
+    parallel,
+    reticulate,
+    stats,
+    utils
 Suggests:
+    data.table,
+    DEoptim,
     DEoptimR,
     dplyr,
-    jsonlite,
     knitr,
     rmarkdown,
     quarto
-VignetteBuilder: quarto
+VignetteBuilder: knitr, quarto
 RoxygenNote: 7.3.3

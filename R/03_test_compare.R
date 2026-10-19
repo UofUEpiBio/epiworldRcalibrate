@@ -719,7 +719,13 @@ make_calibrator <- function(
     }
 
     theta0 <- .bounds_midpoint(bnd)
+    # The midpoint is 0 on the logit scale; rounding can leave values like
+    # 1e-16 there, and optim() sizes its first simplex relative to the start
+    # (10% of it), which would make the simplex vanish and the search stop at
+    # once. Start at exactly 0, with parscale 10 so the first simplex steps are
+    # 1 on the logit scale (about a quarter of each parameter's range).
     z0 <- .to_unconstrained(theta0, bnd)
+    z0[abs(z0) < 1e-8] <- 0
 
     fn_z <- function(z) objective(.from_unconstrained(z, bnd))
 
@@ -727,7 +733,7 @@ make_calibrator <- function(
       par = z0,
       fn = fn_z,
       method = "Nelder-Mead",
-      control = list(maxit = maxit, reltol = reltol)
+      control = list(maxit = maxit, reltol = reltol, parscale = rep(10, length(z0)))
     )
 
     if (restarts > 0L) {

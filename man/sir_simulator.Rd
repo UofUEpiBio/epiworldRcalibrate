@@ -4,14 +4,25 @@
 \alias{sir_simulator}
 \title{Create the current epiworldR SIR simulator}
 \usage{
-sir_simulator(ndays = 60, priors = NULL)
+sir_simulator(ndays = 60, priors = NULL, keep_day_zero = TRUE)
 }
 \arguments{
 \item{ndays}{Number of simulated days. The current SIR adapter preserves the
 historical day-zero convention and returns `ndays + 1` values.}
 
-\item{priors}{Optional named list overriding the default prior ranges.}
+\item{priors}{Optional named list overriding the default prior ranges
+(`c(min, max)` each): `n`, `recov`, `preval`, `crate`, `R0`. Optional
+extras, as in [seir_simulator()]: `report_rate` and `overdispersion`,
+drawn log-uniformly, and `weekday_sd`, drawn uniformly.}
+
+\item{keep_day_zero}{If TRUE (the historical convention), the curve starts
+with day 0, the number initially infected, followed by new infections on
+days 1 to `ndays` (`ndays + 1` values). If FALSE, the curve holds only new
+infections on days 1 to `ndays`, like the SEIR adapter.}
 }
 \description{
-Create the current epiworldR SIR simulator
+`parameters$preval` is the share of the population initially infected. To
+start mid-epidemic, `parameters` may also hold `start_recovered`, the share
+initially recovered. With `parameters$report_rate`, the curve holds reported
+cases, as in [seir_simulator()].
 }

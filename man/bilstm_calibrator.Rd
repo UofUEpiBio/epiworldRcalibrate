@@ -9,7 +9,8 @@ bilstm_calibrator(
   known_names,
   type = "generic",
   name = "BiLSTM",
-  post_process = derive_crate
+  post_process = derive_crate,
+  device = "auto"
 )
 }
 \arguments{
@@ -22,9 +23,13 @@ bilstm_calibrator(
 \item{name}{Calibrator label.}
 
 \item{post_process}{Result transformation. By default, the same as the
-pretrained SIR model: when the model predicts `ptran`, `crate` and `R0`
-and `recov` is known, `crate` is replaced by `R0 * recov / ptran`.
+pretrained SIR model: when the model predicts `ptran` and `R0` and
+`recov` is known, `crate` is set to `R0 * recov / ptran` (replacing the
+network's own `crate`, or added when the model has no `crate` target).
 Use `function(x, ...) x` to keep the raw network output.}
+
+\item{device}{Where to run the model: `"auto"` (a GPU when PyTorch can use
+one, otherwise the CPU), `"cuda"` or `"cpu"`.}
 }
 \value{
 A `calibrator` object.
@@ -32,5 +37,7 @@ A `calibrator` object.
 \description{
 The saved model determines the number of inputs and outputs.  `known_names`
 tells the R wrapper which named values from `...` should be sent to Python.
-Nothing here assumes SIR or SEIR.
+Nothing here assumes SIR or SEIR. Targets trained on the log scale, named
+`log_<name>` (for example `log_preval`), are returned as `<name>` on the
+original scale.
 }

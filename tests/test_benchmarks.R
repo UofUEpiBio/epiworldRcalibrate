@@ -44,3 +44,16 @@ stopifnot(nrow(cmp$summary) == 1)
 stopifnot(nrow(cmp$estimates) == 2)
 
 cat("PASS: generic baseline/benchmark interface\n")
+
+# Nelder-Mead must search even when the box midpoint is not exactly 0 on its
+# logit scale (a = 0.8 to 5 leaves a rounding error of about -4e-16 there,
+# which used to make the first simplex vanish and the search stop at once).
+nm_round <- make_calibrator("NelderMead", simulator = toy_sim,
+                            bounds = list(a = c(0.8, 5), b = c(0, 2)),
+                            maxit = 500, restarts = 1, n_eval_seeds = 1)
+fit_round <- calibrate(obs, nm_round)
+est_round <- calibration_estimate(fit_round)
+stopifnot(fit_round$diagnostics$n_evals > 20)
+stopifnot(abs(est_round[["a"]] - 1) < 0.05, abs(est_round[["b"]] - 0.5) < 0.05)
+
+cat("PASS: Nelder-Mead searches from a rounded midpoint\n")

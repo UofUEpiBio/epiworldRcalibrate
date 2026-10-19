@@ -9,8 +9,24 @@ seir_simulator(ndays = 365, priors = NULL)
 \arguments{
 \item{ndays}{Number of returned incidence days.}
 
-\item{priors}{Optional named list overriding the default prior ranges.}
+\item{priors}{Optional named list overriding the default prior ranges
+(`c(min, max)` each): `n`, `recov`, `crate`, `incub`, `R0` and
+`initial_infected` (the number initially exposed). Optional extras:
+`preval`, the share initially exposed, drawn log-uniformly (replaces
+`initial_infected`); `report_rate` and `overdispersion`, drawn
+log-uniformly, and `weekday_sd`, drawn uniformly, which switch on the
+reporting model above.}
 }
 \description{
-Create the current epiworldR SEIR simulator
+`parameters$preval` is the share of the population initially exposed. To
+start mid-epidemic, `parameters` may also hold `start_infected` and
+`start_recovered`: the shares initially infectious and recovered.
+}
+\details{
+With `parameters$report_rate`, the curve holds reported cases instead of all
+new cases: each day's expected count is `report_rate` times the true count
+times a weekday factor (seven random factors with mean 1 and log standard
+deviation `weekday_sd`), and the count is negative binomial around it with
+variance `mean + overdispersion * mean^2` (Poisson when `overdispersion` is
+0 or missing).
 }

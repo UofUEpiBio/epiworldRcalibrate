@@ -38,3 +38,19 @@ one <- simulate_from_parameters(
 stopifnot(all(one == c(10, 12, 14, 16, 18)))
 
 cat("PASS: generic simulator interface\n")
+
+# Reporting model of the SEIR simulator: reported cases from true cases.
+set.seed(1)
+true_cases <- rep(c(0, 50, 200, 1000), each = 7)
+reported <- epiworldRcalibrate:::observe_cases(true_cases, report_rate = 0.3)
+stopifnot(all(reported[true_cases == 0] == 0))
+stopifnot(abs(sum(reported) / sum(true_cases) - 0.3) < 0.02)
+
+# The noise uses the simulation seed and leaves the caller's random numbers alone.
+set.seed(5); before <- runif(1); set.seed(5)
+a <- epiworldRcalibrate:::with_seed(3, epiworldRcalibrate:::observe_cases(true_cases, 0.5, 0.1, 0.3))
+after <- runif(1)
+b <- epiworldRcalibrate:::with_seed(3, epiworldRcalibrate:::observe_cases(true_cases, 0.5, 0.1, 0.3))
+stopifnot(identical(a, b), identical(before, after))
+
+cat("PASS: reporting model\n")

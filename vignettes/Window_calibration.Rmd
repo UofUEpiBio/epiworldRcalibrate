@@ -1,0 +1,152 @@
+---
+title: "Calibrating a window of daily infections with the SEIR or SIR model"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Calibrating a window of daily infections with the SEIR or SIR model}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+# What this is for
+
+You have a run of **daily new infections** (a *window*, 30 to 365 days long, from any part of
+an epidemic) and you know the population size `n`, the recovery rate `recov` and, for the SEIR
+model, the incubation period `incub` (days). You want R0, the state of the epidemic on the
+first day of the window (how many people are exposed, infectious and recovered), and a
+prediction of the curve.
+
+The package ships two trained **BiLSTM** calibrators, one for `epiworldR::ModelSEIRCONN` and
+one for `ModelSIRCONN`, each the average of 5 networks trained on 1,000,000 simulated
+epidemics. They answer in a fraction of a second, need no settings, and give an R0 range.
+The package also has four standard methods set up the same way (ABC-MCMC, ABC-SMC,
+differential evolution and Nelder-Mead), the scores to compare them, and the functions to
+train and tune your own BiLSTM.
+
+Only R0 = ptran x crate / recov can be learned from a curve: ptran and crate are reported but
+are not separately reliable.
+
+# 1. Calibrate a window
+
+```{r}
+library(epiworldRcalibrate)
+
+cases <- c(12, 15, 19, 22, 30, 35, 41, 50, 61, 70, 84, 95, 110, 121, 140, 152, 170, 181, 196,
+           210, 221, 230, 242, 250, 255, 260, 262, 259, 255, 250)   # daily new infections
+
+bilstm <- window_calibrator("SEIR")
+fit <- calibrate(cases, bilstm, n = 10000, recov = 1 / 7, incub = 5)
+fit                        # R0 with its 95% range, ptran, crate and the starting state
+calibration_estimate(fit)  # the estimates as a named vector
+```
+
+# 2. Predict the cases
+
+`predict_cases()` turns a fit into 95% bands of the daily new infections and of the number
+currently infectious, for the window and `ahead` days after it:
+
+```{r}
+band <- predict_cases(fit, ahead = 14)                       # 500 runs of the epiworldR model
+band <- predict_cases(fit, ahead = 14, method = "renewal")   # the renewal equation, ~200x faster
+
+plot(band$day, band$new_median, type = "l", ylim = range(band[, c("new_lower", "new_upper")]),
+     xlab = "day", ylab = "daily new infections")
+polygon(c(band$day, rev(band$day)), c(band$new_upper, rev(band$new_lower)),
+        col = adjustcolor("forestgreen", 0.3), border = NA)
+points(band$day, band$observed)
+```
+
+The **renewal equation** gives the model's average curve,
+C_t = R0 x (S_{t-1} / n) x sum_k g_k C_{t-k}, where g is the model's generation interval
+(SIR: the infectious time; SEIR: the incubation time plus the infectious time), started from
+the estimated state. With `initial_state = "renewal"` the starting state (the initial cases)
+is worked out by the renewal equation from the observed window instead.
+
+# 3. Score a band
+
+```{r}
+score_band(band)            # coverage (%), band width, error of the median, interval score
+interval_score(y = 25, lower = 10, upper = 30)   # 20: the width of the band
+interval_score(y = 35, lower = 10, upper = 30)   # 220: the width plus 40 x the miss of 5
+```
+
+**Coverage** is the share of days inside the band. The **interval score** is the band width
+plus 40 times how far a day falls outside a 95% band (Gneiting and Raftery, 2007), averaged
+over the days: lower is better, and a band cannot score well just by being wide.
+
+# 4. The standard methods
+
+```{r}
+baselines <- window_baselines("SEIR")      # ABC-MCMC, ABC-SMC, DE, Nelder-Mead
+fit_de <- calibrate(cases, baselines$DE, n = 10000, recov = 1 / 7, incub = 5)
+fit_de$diagnostics                        # seconds and model runs
+
+# Other settings, for example a longer DE run:
+baselines <- window_baselines("SEIR", settings = list(DE = list(itermax = 400)))
+```
+
+They search R0 (0.8 to 5) and the starting state (log10 shares) with the contact rate fixed,
+and fit the curve by least squares (root mean squared error for the ABC methods), running the
+epiworldR model thousands of times per window: see `?window_baselines` for their settings and
+how they stop.
+
+To search ptran and crate instead of R0:
+
+```{r}
+free <- window_baselines("SEIR", methods = "ABC-SMC", unknowns = "ptran_crate")
+fit_free <- calibrate(cases, free$`ABC-SMC`, n = 10000, recov = 1 / 7, incub = 5)
+fit_free$intervals          # 95% ranges of R0, ptran and crate
+plot_ptran_crate(fit_free)  # the draws lie along the curve of constant R0
+```
+
+The ranges of ptran and crate are wide and that of R0 narrow: only R0 = ptran x crate / recov
+shapes the curve, so ptran and crate cannot be told apart from case data.
+
+# 5. Compare methods on many windows
+
+```{r}
+windows <- list(
+  list(cases = cases, n = 10000, recov = 1 / 7, incub = 5),
+  list(cases = cases[11:30], n = 10000, recov = 1 / 7, incub = 5, future = c(245, 240, 236))
+)
+results <- compare_methods(windows, "SEIR", cores = 4)
+aggregate(cbind(coverage, interval_score, seconds) ~ method, results, mean)
+plot_comparison(results)       # scores by method
+plot_estimates(results, "R0")  # estimates and 95% ranges by window
+
+# The bands of several fits side by side:
+plot_bands(lapply(list(BiLSTM = fit, DE = fit_de), predict_cases, ahead = 14))
+```
+
+Add `R0`, `ptran`, `crate` (and `state`) to a window when you know the truth (simulated data)
+to get the errors.
+
+# 6. Real data
+
+The package has daily COVID-19 cases in US states (`covid_us_states`) and Utah (`covid_utah`),
+influenza and COVID-19 hospital admissions in Utah (`admissions_utah`), influenza in Baltimore
+in 1918 (`flu_baltimore_1918`), and the 35 waves used in the report (`real_data_waves`).
+
+```{r}
+wave_data("Utah flu 2022-23")                           # the counts of one wave
+windows <- real_data_windows("Utah flu 2022-23")        # windows from its beginning, middle and end
+results <- compare_methods(windows, "SEIR", cores = 4)
+```
+
+# 7. Train and tune your own BiLSTM
+
+For other ranges of the parameters, or another population size, simulate training data, tune
+the settings and train (a GPU helps: each network took about 4 hours on a recent GPU for the
+shipped SEIR model with 1,000,000 epidemics):
+
+```{r}
+data <- simulate_window_data("SEIR", n_sims = 200000, output_dir = "my_seir_data",
+                             priors = list(R0 = c(0.8, 3)), cores = 16)
+best <- tune_window_calibrator(data, output_dir = "my_seir_tuning", n_trials = 40)
+train_window_calibrator(data, output_dir = "my_seir_model", hyperparameters = best, seeds = 1:3)
+
+my_bilstm <- window_calibrator("SEIR", model_dir = "my_seir_model")
+```

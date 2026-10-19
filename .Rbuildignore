@@ -3,3 +3,9 @@
 ^data/.*\.csv$
 \.github/
 README\.qmd
+^examples$
+^TUTORIAL\.Rmd$
+^TUTORIAL\.html$
+^TUTORIAL_files$
+^data-raw$
+^paper$

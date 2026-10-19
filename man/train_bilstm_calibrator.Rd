@@ -20,7 +20,19 @@ train_bilstm_calibrator(
   hidden_size = 160,
   num_layers = 3,
   dropout = 0.5,
-  physics_weight = 0
+  physics_weight = 0,
+  incidence_max = 1e+05,
+  incidence_transform = "none",
+  output_activation = "sigmoid",
+  device = "auto",
+  window_min = NULL,
+  window_max = NULL,
+  window_stop_zeros = NULL,
+  state_files = NULL,
+  grad_clip = NULL,
+  observation_noise = FALSE,
+  lr_schedule = "none",
+  resume = FALSE
 )
 }
 \arguments{
@@ -59,6 +71,59 @@ session ends.}
 
 \item{physics_weight}{Optional SIR identity penalty. Set to zero for a fully
 generic model.  It is only used when the required columns are present.}
+
+\item{incidence_max}{Observations are divided by this value before they
+enter the network. The original pretrained SIR model used 10000.}
+
+\item{incidence_transform}{`"none"` (default) or `"log1p"`. With `"log1p"`
+the network reads `log(1 + cases) / log(1 + incidence_max)`, which keeps
+small counts readable; the saved model does the same to new curves.}
+
+\item{output_activation}{Activation applied to the scaled outputs:
+`"sigmoid"` or `"softplus"`. Either one value for all targets or one per
+target, in the order of `target_names`. The original pretrained SIR model
+used `c("sigmoid", "softplus", "softplus")` for ptran, crate and R0.}
+
+\item{device}{Where to train: `"auto"` (a GPU when PyTorch can use one,
+otherwise the CPU), `"cpu"` or `"cuda"`. The saved model always runs on
+the CPU.}
+
+\item{window_min, window_max}{Optional. Train on random windows of each curve
+instead of whole curves: every batch gets a window length drawn uniformly
+between `window_min` and `window_max` days, and every curve a start drawn
+uniformly over the positions where the window fits. The saved model then
+accepts curves of any length. `window_max` defaults to the curve length.}
+
+\item{window_stop_zeros}{Optional, with windows. Each curve's informative
+days end at its first run of this many consecutive zero days (for example
+7: a week without cases); windows are drawn only from the informative days
+and the rest of the curve is ignored. The saved model cuts new curves the
+same way.}
+
+\item{state_files}{Optional, with windows. A named character vector of CSV
+files, one per state (same rows and days as the observations), holding the
+value of that state at the start of each day, e.g.
+`c(infected_share = "infected.csv")`. Each becomes an extra estimated
+output: its value at the start of the window. `output_activation` then
+needs one entry per target plus one per state.}
+
+\item{grad_clip}{Optional maximum norm of the gradient in each update
+(gradient clipping). Steadies training on long sequences.}
+
+\item{observation_noise}{If TRUE, the observations are true daily cases and
+the parameter table has `report_rate`, `overdispersion` and `weekday_sd`
+(see [seir_simulator()]): every training batch gets newly drawn reported
+cases, so the network never sees the same noise twice (the validation
+curves get one fixed draw). The saved model reads reported cases.
+Fixed-length curves only.}
+
+\item{lr_schedule}{`"none"` (default, a constant learning rate) or
+`"cosine"`: the learning rate falls smoothly from `learning_rate` to 1% of
+it over the epochs.}
+
+\item{resume}{If TRUE, a checkpoint is saved in `output_dir` after every
+epoch, and training continues from it when it is run again with the same
+settings (for long runs that may be interrupted).}
 }
 \value{
 Invisibly, the path to the trained model directory.
