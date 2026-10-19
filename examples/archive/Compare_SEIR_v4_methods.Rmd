@@ -1,0 +1,613 @@
+---
+title: "SEIR on reported cases: BiLSTM vs ABC-MCMC, ABC-SMC, Nelder-Mead and DE"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  out_dir: "results/seir_v4_method_comparison"
+  test_dir: "results/seir_bilstm_v4/test_bank"
+  calib_dir: "results/seir_bilstm_v4/calibration_bank"
+  real_data_dir: "results/seir_real_data_test/data"
+  models: "SEIR v4=results/seir_bilstm_v4;SEIR v5=results/seir_bilstm_v5;SEIR v5 (128 hidden units)=results/seir_bilstm_v5_h128"
+  seeds: "122,1,2,3,4"
+  n_curves: 100
+  curves: ""
+  with_real: true
+  cores: 1
+  stop_after: ""
+  n_reps: 300
+  n_reps_test: 100
+  k_neighbors: 500
+  quick: false
+  utah_incub: 5
+  flu_incub: 2
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+The SEIR BiLSTMs trained on **reported cases** (`SEIR_v4_BiLSTM.Rmd`: v4, and v5 with new
+noise every epoch) against the four search-based methods in the package, on the same
+curves and with the same unknowns:
+
+| Method | How it estimates | Model runs per curve |
+|---|---|---|
+| BiLSTM (v4, v5) | one pass of the trained network (average of 5 seeds); R0 range from a calibration bank | none |
+| ABC-MCMC | random-walk chain, 3,000 steps (1,500 burn-in), median of the chain | 3,000 |
+| ABC-SMC | 200 particles, 6 generations | up to 8,000 |
+| Nelder-Mead | simplex search, 3 starts of up to 1,000 steps, 3 runs per candidate | up to 9,000 |
+| DE | differential evolution, 50 candidates, up to 120 generations, 3 runs per candidate | up to 18,000 |
+
+Everything is a fair match:
+
+- **Known to every method:** `n`, `recov`, `incub`.
+- **Unknown to every method**, with the same ranges: R0 0.8-5, share initially exposed
+  0.1-40%, share of cases reported 5-100%, noise (overdispersion) 0.001-0.3 and weekday
+  swing 0-0.35. The search methods search the share exposed, the reported share and the
+  noise on the log scale, as the BiLSTM was trained.
+- Only R0 = ptran x crate / recov can be read from a curve, so the search methods search
+  R0 directly (with crate fixed at 10, ptran follows) instead of a ptran-crate ridge.
+- The search methods use the package defaults (distance: root mean squared error between
+  the simulated and observed daily counts). Nothing from the simulated data sets is used
+  apart from the ranges above.
+
+Two kinds of data:
+
+1. **Simulated epidemics of reported cases** with known parameters: the first
+   `r params$n_curves` curves of the v4 test bank.
+2. **Real data** (the main windows of `SEIR_v4_BiLSTM.Rmd`): Utah COVID-19 2024-25
+   (beginning, middle, end of the last 365 days), Utah flu 2022-23 and 2023-24 (hospital
+   admissions), Baltimore flu 1918, Utah COVID-19 summer 2023.
+
+The search methods are slow, so each method's result on each curve is saved as soon as it
+finishes and a re-run skips what is saved: `curves`, `cores` and `stop_after: "methods"`
+let several cluster jobs share the work; a final render builds the report.
+
+```r
+rmarkdown::render("Compare_SEIR_v4_methods.Rmd", output_dir = "results/seir_v4_method_comparison")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+OUT_DIR  <- params$out_dir
+N_CURVES <- params$n_curves
+N_REPS   <- params$n_reps
+N_REPS_TEST <- params$n_reps_test
+K_NB     <- params$k_neighbors
+CORES    <- as.integer(params$cores)
+N_DAYS   <- 61
+KNOWN    <- c("n", "recov", "incub")
+SEARCH_METHODS <- c("ABC-MCMC", "ABC-SMC", "NelderMead", "DE")
+CRATE <- 10
+
+# The search methods' simulator: log-scale parameters in, reported cases out.
+base_sim <- seir_simulator(ndays = N_DAYS)
+search_sim <- new_simulator(
+  sample_parameters = function(n_sims) stop("Not used: the methods draw their own values."),
+  run = function(parameters, seed) {
+    p <- parameters
+    p$preval         <- exp(p$log_preval)
+    p$report_rate    <- exp(p$log_report_rate)
+    p$overdispersion <- exp(p$log_overdispersion)
+    p$crate <- CRATE
+    p$ptran <- p$R0 * p$recov / CRATE
+    p$log_preval <- p$log_report_rate <- p$log_overdispersion <- NULL
+    base_sim$run(p, seed)
+  },
+  type = "SEIR", name = "epiworldR ModelSEIRCONN with reporting, log-scale search"
+)
+BOUNDS <- list(
+  R0 = c(0.8, 5), log_preval = log(c(0.001, 0.4)), log_report_rate = log(c(0.05, 1)),
+  log_overdispersion = log(c(0.001, 0.3)), weekday_sd = c(0, 0.35)
+)
+derive <- function(estimate, known) {
+  c(preval = exp(estimate[["log_preval"]]), report_rate = exp(estimate[["log_report_rate"]]),
+    overdispersion = exp(estimate[["log_overdispersion"]]),
+    ptran = estimate[["R0"]] * known$recov / CRATE, crate = CRATE)
+}
+
+# Package defaults, unless quick: true.
+METHOD_SETTINGS <- if (isTRUE(params$quick)) list(
+  "ABC-MCMC"   = list(n_samples = 60, burnin = 30),
+  "ABC-SMC"    = list(n_particles = 20, n_generations = 2, sim_budget = 400),
+  "NelderMead" = list(maxit = 20, restarts = 0),
+  "DE"         = list(maxiter = 2)
+) else list()
+
+model_specs <- strsplit(strsplit(params$models, ";")[[1]], "=")
+MODELS <- setNames(lapply(model_specs, function(s) {
+  file.path(s[2], paste0("model_seed_", as.integer(strsplit(params$seeds, ",")[[1]])))
+}), vapply(model_specs, `[`, "", 1))
+MODELS <- MODELS[vapply(MODELS, function(d) all(file.exists(file.path(d, "model.pt"))), logical(1))]
+V2_DIRS <- file.path("results/seir_bilstm_v2", paste0("model_seed_", c(122, 1, 2, 3, 4)))
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+run_dir <- file.path(OUT_DIR, "method_runs")
+dir.create(run_dir, showWarnings = FALSE)
+
+knitr::kable(data.frame(
+  setting = c("simulated test curves", "BiLSTM models", "search methods", "fit simulations (real data)",
+              "fit simulations (each test curve)"),
+  value = c(N_CURVES, paste(names(MODELS), collapse = ", "), paste(SEARCH_METHODS, collapse = ", "),
+            N_REPS, N_REPS_TEST)
+))
+```
+
+# The data
+
+```{r data}
+test_bank <- read_training_data(file.path(params$test_dir, "seir_theta.csv"),
+                                file.path(params$test_dir, "seir_observations.csv"), type = "SEIR")
+stopifnot(nrow(test_bank$theta) >= N_CURVES)
+truth <- test_bank$theta[seq_len(N_CURVES), ]
+
+DD <- params$real_data_dir
+covid <- read.csv(file.path(DD, "utah_covid_all_days.csv"))
+covid$Date <- as.Date(covid$Date)
+hhs <- read.csv(file.path(DD, "utah_hhs_hospital_admissions.csv"))
+hhs$date <- as.Date(substr(hhs$date, 1, 10)) - 1   # reported the day after admission
+e1918 <- new.env()
+load(file.path(DD, "Flu1918.rda"), envir = e1918)
+
+windows <- list()
+add_window <- function(id, label, x, cases, n, disease) {
+  windows[[id]] <<- list(id = id, label = label, x = x, cases = cases, n = n,
+                         recov = if (disease == "flu") 0.25 else 1 / 7,
+                         incub = if (disease == "flu") params$flu_incub else params$utah_incub)
+}
+utah <- tail(covid, 365)
+for (pos in c("beginning", "middle", "end")) {
+  s <- switch(pos, beginning = 1, middle = floor((365 - N_DAYS) / 2) + 1, end = 365 - N_DAYS + 1)
+  idx <- s:(s + N_DAYS - 1)
+  add_window(paste0("utah_", pos), paste("Utah COVID-19 2024-25,", pos), utah$Date[idx],
+             utah$Daily.Cases[idx], 5000, "COVID-19")
+}
+peak_window <- function(id, label, x, cases, n, disease) {
+  ma    <- as.numeric(stats::filter(cases, rep(1 / 7, 7), sides = 2))
+  end   <- min(length(cases), which.max(ma) + 7)
+  start <- max(1, end - N_DAYS + 1)
+  idx   <- start:(start + N_DAYS - 1)
+  add_window(id, label, x[idx], cases[idx], n, disease)
+}
+season <- function(d, y, from, to) list(x = d[d >= as.Date(from) & d <= as.Date(to)],
+                                        y = y[d >= as.Date(from) & d <= as.Date(to)])
+f1 <- season(hhs$date, hhs$previous_day_admission_influenza_confirmed, "2022-09-01", "2023-05-31")
+f2 <- season(hhs$date, hhs$previous_day_admission_influenza_confirmed, "2023-09-01", "2024-04-26")
+c3 <- season(covid$Date, covid$Daily.Cases, "2023-06-01", "2023-10-15")
+peak_window("flu_2022", "Utah flu 2022-23", f1$x, f1$y, 5000, "flu")
+peak_window("flu_2023", "Utah flu 2023-24", f2$x, f2$y, 5000, "flu")
+peak_window("flu_1918", "Baltimore flu 1918", seq_along(e1918$Flu1918$incidence),
+            e1918$Flu1918$incidence, 10000, "flu")
+peak_window("covid_2023", "Utah COVID-19 summer 2023", c3$x, c3$y, 10000, "COVID-19")
+knitr::kable(data.frame(window = vapply(windows, `[[`, "", "label"),
+                        first_day = vapply(windows, function(w) format(w$x[1]), ""),
+                        n = vapply(windows, `[[`, 0, "n"), recov = vapply(windows, `[[`, 0, "recov"),
+                        incub = vapply(windows, `[[`, 0, "incub")), digits = 3, row.names = FALSE)
+```
+
+# Step 1: run the search-based methods
+
+One unit of work is one method on one curve; each is saved in `method_runs/` with its
+estimate, its R0 interval and (ABC methods) 300 draws from its posterior.
+
+```{r run-methods}
+parse_curves <- function(x) {
+  if (!nzchar(x)) return(seq_len(N_CURVES))
+  r <- as.integer(strsplit(x, "-")[[1]])
+  r[1]:r[length(r)]
+}
+unit_file <- function(item, method) file.path(run_dir, sprintf("%s_%s.rds", item, method))
+
+posterior_draws <- function(res, n = 300) {
+  post <- res$posterior
+  if (is.null(post)) return(NULL)
+  if (is.matrix(post)) {
+    th <- post[unique(round(seq(1, nrow(post), length.out = n))), , drop = FALSE]
+  } else {
+    th <- post$particles[sample(nrow(post$particles), n, replace = TRUE, prob = post$weights), , drop = FALSE]
+  }
+  as.data.frame(th)
+}
+
+run_unit <- function(item, method) {
+  f <- unit_file(item, method)
+  if (file.exists(f)) return(invisible(f))
+  if (item %in% names(windows)) {
+    w <- windows[[item]]
+    curve <- w$cases
+    known <- list(n = w$n, recov = w$recov, incub = w$incub)
+    set.seed(2025)
+  } else {
+    i     <- as.integer(sub("curve_", "", item))
+    curve <- as.numeric(test_bank$observations[i, ])
+    known <- as.list(test_bank$theta[i, KNOWN])
+    set.seed(i)
+  }
+  cal <- do.call(make_calibrator, c(list(method, search_sim, BOUNDS, KNOWN, derive), METHOD_SETTINGS[[method]]))
+  t0  <- proc.time()[["elapsed"]]
+  # A method that fails on a curve is recorded as a failure rather than stopping the comparison.
+  res <- tryCatch(do.call(calibrate, c(list(curve, cal), known)), error = function(e) e)
+  failed <- inherits(res, "error")
+  seconds <- proc.time()[["elapsed"]] - t0
+  est <- if (failed) NULL else calibration_estimate(res)
+  get <- function(nm) if (failed) NA_real_ else unname(est[[nm]])
+  r0_int <- if (!failed && !is.null(res$intervals) && "R0" %in% rownames(res$intervals)) res$intervals["R0", ] else c(NA, NA)
+  saveRDS(list(
+    est = data.frame(item = item, method = method, R0 = get("R0"), preval = get("preval"),
+                     report_rate = get("report_rate"), overdispersion = get("overdispersion"),
+                     weekday_sd = get("weekday_sd"), ptran = get("ptran"), crate = get("crate"),
+                     R0_low = unname(r0_int[1]), R0_high = unname(r0_int[2]), seconds = seconds,
+                     model_runs = if (failed) NA_real_ else res$diagnostics$n_model_runs,
+                     error = if (failed) conditionMessage(res) else NA_character_),
+    draws = if (failed) NULL else posterior_draws(res)
+  ), f)
+  invisible(f)
+}
+
+items <- sprintf("curve_%04d", parse_curves(params$curves))
+if (isTRUE(params$with_real)) items <- c(items, names(windows))
+units <- expand.grid(item = items, method = SEARCH_METHODS, stringsAsFactors = FALSE)
+# Slowest first, so no core is left with a long unit at the end.
+units <- units[order(match(units$method, c("DE", "NelderMead", "ABC-SMC", "ABC-MCMC"))), ]
+units <- units[!file.exists(unit_file(units$item, units$method)), ]
+if (nrow(units)) {
+  done <- parallel::mclapply(seq_len(nrow(units)), function(k) try(run_unit(units$item[k], units$method[k])),
+                             mc.cores = CORES, mc.preschedule = FALSE)
+  failed <- vapply(done, inherits, logical(1), what = "try-error")
+  if (any(failed)) stop("Failed units: ", paste(units$item[failed], units$method[failed], collapse = "; "))
+}
+cat("Saved units:", length(list.files(run_dir, pattern = "\\.rds$")), "\n")
+```
+
+```{r stop-after-methods, include=FALSE}
+if (identical(params$stop_after, "methods")) knitr::knit_exit()
+```
+
+# Step 2: the BiLSTMs on the same curves
+
+Each BiLSTM is the average of its 5 seeds. Its R0 range and parameter draws come from
+its own estimates on the v4 calibration bank (`r format(K_NB)` most similar estimates), as
+in `SEIR_v4_BiLSTM.Rmd`.
+
+```{r bilstm}
+predict_models <- function(dirs, curves, known) {
+  known <- as.data.frame(known)[, KNOWN, drop = FALSE]
+  ests  <- lapply(dirs, function(d) bilstm_predict_many(d, as.matrix(curves), known, device = params$device))
+  avg   <- Reduce(`+`, ests) / length(ests)
+  avg$crate <- avg$R0 * known$recov / avg$ptran
+  avg
+}
+
+calib_bank <- read_training_data(file.path(params$calib_dir, "seir_theta.csv"),
+                                 file.path(params$calib_dir, "seir_observations.csv"), type = "SEIR")
+features <- function(e, known) cbind(R0 = e$R0, lp = log(e$preval), lr = log(e$report_rate),
+                                     lo = log(e$overdispersion), recov = known$recov, incub = known$incub)
+
+# One "range model" per BiLSTM: its calibration-bank estimates and errors.
+range_model <- function(dirs) {
+  ce <- predict_models(dirs, calib_bank$observations, calib_bank$theta)
+  F  <- features(ce, calib_bank$theta)
+  mu <- colMeans(F); sdv <- apply(F, 2, sd)
+  Ft <- t(scale(F, mu, sdv))
+  th <- calib_bank$theta
+  resid <- data.frame(R0 = th$R0 - ce$R0, lp = log(th$preval) - log(ce$preval),
+                      lr = log(th$report_rate) - log(ce$report_rate),
+                      lo = log(th$overdispersion) - log(ce$overdispersion), wsd = th$weekday_sd - ce$weekday_sd)
+  nb <- function(e, known) {
+    f <- (features(e, known)[1, ] - mu) / sdv
+    d <- colSums((Ft - f)^2)
+    which(d <= sort(d, partial = K_NB)[K_NB])[seq_len(K_NB)]
+  }
+  list(
+    dirs = dirs,
+    range = function(e, known, probs = c(0.025, 0.975)) e$R0 + quantile(resid$R0[nb(e, known)], probs, names = FALSE),
+    draws = function(e, known, n) {
+      j  <- sample(nb(e, known), n, replace = TRUE)
+      R0 <- pmax(0.05, e$R0 + resid$R0[j])
+      data.frame(n = known$n, recov = known$recov, incub = known$incub,
+                 preval = pmin(0.9, exp(log(e$preval) + resid$lp[j])), ptran = e$ptran,
+                 crate = R0 * known$recov / e$ptran,
+                 report_rate = pmin(1, exp(log(e$report_rate) + resid$lr[j])),
+                 overdispersion = exp(log(e$overdispersion) + resid$lo[j]),
+                 weekday_sd = pmax(0, e$weekday_sd + resid$wsd[j]))
+    }
+  )
+}
+ranges <- lapply(MODELS, range_model)
+
+bilstm_est <- do.call(rbind, lapply(names(MODELS), function(m) {
+  e <- predict_models(MODELS[[m]], test_bank$observations[seq_len(N_CURVES), ], truth)
+  r <- t(vapply(seq_len(N_CURVES), function(i) ranges[[m]]$range(e[i, ], truth[i, ]), numeric(2)))
+  data.frame(item = sprintf("curve_%04d", seq_len(N_CURVES)), method = m, R0 = e$R0, preval = e$preval,
+             report_rate = e$report_rate, overdispersion = e$overdispersion, weekday_sd = e$weekday_sd,
+             ptran = e$ptran, crate = e$crate, R0_low = r[, 1], R0_high = r[, 2])
+}))
+v2_est <- predict_models(V2_DIRS, test_bank$observations[seq_len(N_CURVES), ], truth)
+
+# Time for one curve with calibrate() (all 5 seeds) plus its R0 range, as a user would run it.
+bilstm_time <- vapply(names(MODELS), function(m) {
+  cals <- lapply(MODELS[[m]], bilstm_calibrator, known_names = KNOWN, type = "SEIR", device = params$device)
+  th <- test_bank$theta
+  for (cl in cals) calibrate(test_bank$observations[1, ], cl, n = th$n[1], recov = th$recov[1], incub = th$incub[1])
+  t0 <- proc.time()[["elapsed"]]
+  for (i in 1:20) {
+    est <- rowMeans(sapply(cals, function(cl) calibrate(test_bank$observations[i, ], cl, n = th$n[i],
+                                                         recov = th$recov[i], incub = th$incub[i])))
+    ranges[[m]]$range(as.data.frame(as.list(est)), th[i, ])
+  }
+  (proc.time()[["elapsed"]] - t0) / 20
+}, numeric(1))
+```
+
+# Step 3: accuracy on simulated epidemics
+
+```{r collect}
+unit_paths <- unit_file(rep(sprintf("curve_%04d", seq_len(N_CURVES)), each = length(SEARCH_METHODS)),
+                        rep(SEARCH_METHODS, N_CURVES))
+have <- file.exists(unit_paths)
+if (!all(have)) warning(sum(!have), " method results are missing; they are left out.")
+units_sim  <- lapply(unit_paths[have], readRDS)
+method_est <- do.call(rbind, lapply(units_sim, `[[`, "est"))
+draws_sim  <- setNames(lapply(units_sim, `[[`, "draws"), paste(method_est$item, method_est$method))
+
+all_est <- rbind(bilstm_est, method_est[, names(bilstm_est)])
+all_est$curve <- as.integer(sub("curve_", "", all_est$item))
+METHODS <- c(names(MODELS), SEARCH_METHODS)
+METHOD_COLS <- setNames(c("purple", "forestgreen", "darkgreen", "darkorange", "firebrick", "steelblue", "goldenrod")[seq_along(METHODS)], METHODS)
+
+acc <- do.call(rbind, lapply(METHODS, function(m) {
+  e  <- all_est[all_est$method == m, ]
+  ok <- is.finite(e$R0)
+  t  <- truth[e$curve[ok], ]
+  r2 <- function(a, b) 1 - sum((a - b)^2) / sum((b - mean(b))^2)
+  data.frame(method = m, curves = sum(ok), failed = sum(!ok),
+             R0_MAE = mean(abs(e$R0[ok] - t$R0)), R0_R2 = r2(e$R0[ok], t$R0),
+             log_preval_MAE = mean(abs(log(e$preval[ok]) - log(t$preval))),
+             log_reported_share_MAE = mean(abs(log(e$report_rate[ok]) - log(t$report_rate))),
+             R0_in_95_range_pct = if (all(is.na(e$R0_low))) NA else
+               100 * mean(t$R0 >= e$R0_low[ok] & t$R0 <= e$R0_high[ok], na.rm = TRUE),
+             R0_range_width = if (all(is.na(e$R0_low))) NA else mean(e$R0_high[ok] - e$R0_low[ok], na.rm = TRUE))
+}))
+acc <- rbind(acc, data.frame(method = "SEIR v2 (every case; not trained on reported cases)", curves = N_CURVES,
+                             failed = 0, R0_MAE = mean(abs(v2_est$R0 - truth$R0)),
+                             R0_R2 = 1 - sum((v2_est$R0 - truth$R0)^2) / sum((truth$R0 - mean(truth$R0))^2),
+                             log_preval_MAE = mean(abs(log(v2_est$preval) - log(truth$preval))),
+                             log_reported_share_MAE = NA, R0_in_95_range_pct = NA, R0_range_width = NA))
+write.csv(acc, file.path(OUT_DIR, "accuracy_simulated.csv"), row.names = FALSE)
+knitr::kable(acc, digits = 3, row.names = FALSE,
+             caption = "Errors on the log scale for the share exposed and the reported share. Ranges: the BiLSTMs' calibration-bank ranges and the ABC posteriors; Nelder-Mead and DE give one value.")
+```
+
+```{r r0-scatter, fig.width=12, fig.height=6.5}
+op <- par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
+lim <- range(c(truth$R0, all_est$R0), na.rm = TRUE)
+for (m in METHODS) {
+  e <- all_est[all_est$method == m, ]
+  plot(truth$R0[e$curve], e$R0, pch = 16, col = adjustcolor(METHOD_COLS[[m]], 0.7), xlim = lim, ylim = lim,
+       xlab = "true R0", ylab = "estimated R0",
+       main = sprintf("%s\nMAE %.3f", m, acc$R0_MAE[acc$method == m]), cex.main = 0.95)
+  abline(0, 1, lty = 2)
+}
+par(op)
+```
+
+## Recovering the curves
+
+For each test curve, `r N_REPS_TEST` simulations from each method's result: the BiLSTMs'
+parameter draws, the ABC posterior draws, or Nelder-Mead's and DE's single estimate, all
+with the estimated reporting noise. Coverage is the share of observed days inside the 95%
+band; the interval score is the band width plus 40 times how far each observed day falls
+outside it (lower is better).
+
+```{r test-bands}
+sim61 <- seir_simulator(ndays = N_DAYS)
+draws_to_pars <- function(d, known) {
+  data.frame(n = known$n, recov = known$recov, incub = known$incub, preval = exp(d$log_preval),
+             ptran = d$R0 * known$recov / CRATE, crate = CRATE, report_rate = exp(d$log_report_rate),
+             overdispersion = exp(d$log_overdispersion), weekday_sd = d$weekday_sd)
+}
+point_pars <- function(e, known) {
+  data.frame(n = known$n, recov = known$recov, incub = known$incub, preval = e$preval, ptran = e$ptran,
+             crate = e$crate, report_rate = e$report_rate, overdispersion = e$overdispersion,
+             weekday_sd = e$weekday_sd)
+}
+band_from <- function(par_rows) {
+  runs <- vapply(seq_len(nrow(par_rows)), function(i)
+    simulate_from_parameters(sim61, as.list(par_rows[i, ]), seed = i), numeric(N_DAYS))
+  data.frame(median = apply(runs, 1, median), lower = apply(runs, 1, quantile, 0.025),
+             upper = apply(runs, 1, quantile, 0.975))
+}
+score_band <- function(b, y) {
+  c(coverage = 100 * mean(y >= b$lower & y <= b$upper), MAE = mean(abs(b$median - y)),
+    interval_score = mean((b$upper - b$lower) + 40 * pmax(b$lower - y, 0) + 40 * pmax(y - b$upper, 0)))
+}
+pars_for <- function(m, e_row, known, n, item) {
+  if (m %in% names(MODELS)) return(ranges[[m]]$draws(e_row, known, n))
+  d <- draws_sim[[paste(item, m)]]
+  if (!is.null(d)) return(draws_to_pars(d[sample(nrow(d), n, replace = TRUE), ], known))
+  point_pars(e_row, known)[rep(1, n), ]
+}
+
+band_file <- file.path(OUT_DIR, "test_band_scores.rds")
+if (file.exists(band_file) && all(METHODS %in% readRDS(band_file)$method)) {
+  band_scores <- readRDS(band_file)
+} else {
+  band_scores <- do.call(rbind, parallel::mclapply(seq_len(N_CURVES), function(i) {
+    set.seed(i)
+    y <- as.numeric(test_bank$observations[i, ])
+    known <- truth[i, KNOWN]
+    do.call(rbind, lapply(METHODS, function(m) {
+      e <- all_est[all_est$method == m & all_est$curve == i, ]
+      if (!nrow(e) || !is.finite(e$R0)) return(NULL)
+      s <- score_band(band_from(pars_for(m, e, known, N_REPS_TEST, e$item)), y)
+      data.frame(curve = i, method = m, t(s))
+    }))
+  }, mc.cores = max(1, CORES)))
+  saveRDS(band_scores, band_file)
+}
+band_tab <- aggregate(cbind(coverage, MAE, interval_score) ~ method, band_scores, mean)
+band_tab <- band_tab[match(METHODS, band_tab$method), ]
+names(band_tab) <- c("method", "coverage_pct", "MAE", "interval_score")
+write.csv(band_tab, file.path(OUT_DIR, "curve_recovery_simulated.csv"), row.names = FALSE)
+knitr::kable(band_tab, digits = 2, row.names = FALSE)
+```
+
+```{r test-band-boxplot, fig.width=11, fig.height=4.5}
+op <- par(mfrow = c(1, 2), mar = c(9, 4, 2, 1))
+boxplot(coverage ~ factor(method, METHODS), band_scores, las = 2, xlab = "", ylab = "% of days inside the band",
+        col = adjustcolor(METHOD_COLS, 0.4), main = "Coverage per test curve")
+boxplot(interval_score ~ factor(method, METHODS), band_scores, las = 2, xlab = "", log = "y",
+        ylab = "interval score (lower is better)", col = adjustcolor(METHOD_COLS, 0.4), main = "Interval score per test curve")
+par(op)
+```
+
+## Time per curve
+
+```{r timing}
+sim_seconds <- function(dir) as.numeric(readLines(file.path(dir, "simulation_seconds_and_dropped_share.txt"))[1])
+setup_minutes <- vapply(names(MODELS), function(m) {
+  run   <- dirname(MODELS[[m]][1])
+  train <- sum(vapply(MODELS[[m]], function(d) as.numeric(readLines(file.path(d, "training_seconds.txt"))), 0))
+  (sim_seconds(file.path(run, "training_bank")) + sim_seconds(params$calib_dir) + train) / 60
+}, numeric(1))
+time_tab <- rbind(
+  data.frame(method = names(MODELS), seconds_per_curve = bilstm_time, model_runs_per_curve = 0,
+             one_off_setup = sprintf("%.0f min (training and calibration banks on 48 cores + 5 seeds on GPUs, one after another)", setup_minutes)),
+  do.call(rbind, lapply(SEARCH_METHODS, function(m) {
+    e <- method_est[method_est$method == m, ]
+    data.frame(method = m, seconds_per_curve = mean(e$seconds), model_runs_per_curve = mean(e$model_runs, na.rm = TRUE),
+               one_off_setup = "none")
+  }))
+)
+write.csv(time_tab, file.path(OUT_DIR, "time_per_curve.csv"), row.names = FALSE)
+knitr::kable(time_tab, digits = 3, row.names = FALSE,
+             caption = "BiLSTM: calibrate() with all 5 seeds plus the R0 range, on one CPU/GPU node. Search methods: one CPU core.")
+```
+
+# Step 4: real data
+
+Estimates from every method; `r N_REPS` simulations from each method's result (BiLSTM
+draws, ABC posterior draws, or the single Nelder-Mead/DE estimate) with reporting noise.
+
+```{r real-fit}
+real_rows <- list(); real_bands <- list()
+for (id in names(windows)) {
+  w <- windows[[id]]
+  known <- data.frame(n = w$n, recov = w$recov, incub = w$incub)
+  for (m in METHODS) {
+    if (m %in% names(MODELS)) {
+      e <- predict_models(MODELS[[m]], matrix(w$cases, 1), known)
+      r <- ranges[[m]]$range(e, known)
+      secs <- NA
+    } else {
+      f <- unit_file(id, m)
+      if (!file.exists(f)) next
+      u <- readRDS(f)
+      e <- u$est
+      if (!is.finite(e$R0)) next
+      draws_sim[[paste(id, m)]] <- u$draws
+      r <- c(e$R0_low, e$R0_high)
+      secs <- e$seconds
+    }
+    set.seed(1)
+    b <- band_from(pars_for(m, e, known, N_REPS, id))
+    s <- score_band(b, w$cases)
+    real_bands[[paste(id, m)]] <- b
+    real_rows[[length(real_rows) + 1]] <- data.frame(
+      window = w$label, method = m, R0 = e$R0, R0_low = r[1], R0_high = r[2], preval = e$preval,
+      reported_share = e$report_rate, coverage_pct = s[["coverage"]], MAE = s[["MAE"]],
+      interval_score = s[["interval_score"]], seconds = secs)
+  }
+}
+real_tab <- do.call(rbind, real_rows)
+write.csv(real_tab, file.path(OUT_DIR, "real_data_by_method.csv"), row.names = FALSE)
+```
+
+```{r real-plots, fig.width=16, fig.height=7.5, results="asis"}
+for (id in names(windows)) {
+  w <- windows[[id]]
+  cat("\n\n## ", w$label, "\n\n", sep = "")
+  ms <- METHODS[paste(id, METHODS) %in% names(real_bands)]
+  ylim <- range(c(w$cases, unlist(lapply(ms, function(m) unlist(real_bands[[paste(id, m)]][, c("lower", "upper")])))))
+  op <- par(mfrow = c(2, 4), mar = c(3, 4, 3.5, 1))
+  for (m in ms) {
+    b <- real_bands[[paste(id, m)]]
+    r <- real_tab[real_tab$window == w$label & real_tab$method == m, ]
+    plot(w$x, b$median, type = "n", ylim = ylim, xlab = "", ylab = "daily count", cex.main = 0.95,
+         main = sprintf("%s\nR0 %.2f%s | fit %.0f%% | score %.0f", m, r$R0,
+                        if (is.finite(r$R0_low)) sprintf(" (%.2f-%.2f)", r$R0_low, r$R0_high) else "",
+                        r$coverage_pct, r$interval_score))
+    polygon(c(w$x, rev(w$x)), c(b$upper, rev(b$lower)), col = adjustcolor(METHOD_COLS[[m]], 0.3), border = NA)
+    lines(w$x, b$median, col = METHOD_COLS[[m]], lwd = 2)
+    lines(w$x, w$cases, col = "blue", lwd = 1.5)
+    points(w$x, w$cases, col = "blue", pch = 16, cex = 0.4)
+  }
+  par(op)
+  cat("\n\n")
+  print(knitr::kable(real_tab[real_tab$window == w$label, -1], digits = 3, row.names = FALSE))
+}
+```
+
+## All real windows together
+
+```{r real-summary}
+real_summary <- do.call(rbind, lapply(METHODS, function(m) {
+  r <- real_tab[real_tab$method == m, ]
+  data.frame(method = m, windows = nrow(r), mean_coverage_pct = mean(r$coverage_pct),
+             mean_interval_score = mean(r$interval_score),
+             best_interval_score_in = sum(vapply(split(real_tab, real_tab$window), function(x)
+               x$method[which.min(x$interval_score)] == m, logical(1))))
+}))
+write.csv(real_summary, file.path(OUT_DIR, "real_data_summary.csv"), row.names = FALSE)
+knitr::kable(real_summary, digits = 2, row.names = FALSE,
+             caption = "Mean over the real windows; last column: in how many windows the method had the lowest interval score")
+```
+
+# Summary
+
+```{r summary}
+summary_tab <- merge(merge(acc[acc$method %in% METHODS, c("method", "R0_MAE", "R0_R2", "R0_in_95_range_pct")],
+                           band_tab[, c("method", "coverage_pct", "interval_score")], by = "method"),
+                     merge(real_summary[, c("method", "mean_coverage_pct", "mean_interval_score")],
+                           time_tab[, c("method", "seconds_per_curve")], by = "method"), by = "method")
+summary_tab <- summary_tab[match(METHODS, summary_tab$method), ]
+names(summary_tab) <- c("method", "sim R0 MAE", "sim R0 R2", "sim true R0 in 95% range (%)",
+                        "sim curve coverage (%)", "sim interval score", "real coverage (%)",
+                        "real interval score", "seconds per curve")
+write.csv(summary_tab, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_tab, digits = 3, row.names = FALSE)
+```
+
+# Saved files
+
+```{r save}
+saveRDS(list(accuracy = acc, curve_recovery = band_tab, band_scores = band_scores, time = time_tab,
+             real = real_tab, real_summary = real_summary, summary = summary_tab, params = params),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+list.files(OUT_DIR)
+```

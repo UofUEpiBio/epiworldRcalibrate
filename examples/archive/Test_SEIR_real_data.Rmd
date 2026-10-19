@@ -1,0 +1,325 @@
+---
+title: "SEIR v2 and v3 on other real data: Utah flu, Baltimore 1918 flu, Utah COVID 2023"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  v2_models: "results/seir_bilstm_v2/model_seed_122,results/seir_bilstm_v2/model_seed_1,results/seir_bilstm_v2/model_seed_2,results/seir_bilstm_v2/model_seed_3,results/seir_bilstm_v2/model_seed_4"
+  v3_models: "results/seir_variable_length_v3/model_seed_122,results/seir_variable_length_v3/model_seed_1,results/seir_variable_length_v3/model_seed_2,results/seir_variable_length_v3/model_seed_3,results/seir_variable_length_v3/model_seed_4"
+  out_dir: "results/seir_real_data_test"
+  window: 61
+  n_reps: 300
+  flu_recov: 0.25
+  flu_incub: 3
+  covid_recov: 0.142857142857143
+  covid_incub: 5
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+The two SEIR BiLSTM models (both the average of 5 seeds) on real epidemics other than
+the 2024-25 Utah COVID-19 series:
+
+- **SEIR v2** reads exactly 61 days and assumes a fresh epidemic (it estimates the share
+  initially exposed; everyone else is susceptible).
+- **Variable-length v3** reads 30 to 365 days and estimates the shares exposed,
+  infectious and recovered on the first day.
+
+| Dataset | What is counted | Source |
+|---|---|---|
+| Utah flu 2022-23 and 2023-24 | daily confirmed influenza **hospital admissions** in Utah | HHS / CDC "COVID-19 Reported Patient Impact and Hospital Capacity by State Timeseries" (healthdata.gov, `g62h-syeh`) |
+| Baltimore flu 1918 | daily influenza cases, 92 days | Frost & Sydenstricker (1919), as distributed in the EpiEstim R package (`Flu1918`) |
+| Utah COVID-19 summer 2023 | daily cases | Utah DHHS COVID-19 dashboard (same source as the earlier Utah analysis) |
+
+**Windows.** For each epidemic, the 61-day window is the 61 days ending one week after
+the peak of the 7-day average (the rise and the peak). v3 also reads the **whole wave**:
+from the same first day until the 7-day average falls below 5% of its peak.
+
+**Known values.** The models were trained on `n` 5,000-10,000, `recov` 0.071-0.25 and
+`incub` 3-21 days.
+
+- COVID-19: `recov = 1/7`, `incub = `r params$covid_incub`` (as before).
+- Flu: `recov = `r params$flu_recov`` (4 days infectious) and `incub = `r params$flu_incub``.
+  Flu's latent period is about 1-2 days, shorter than anything the models saw, so
+  `r params$flu_incub` days (the shortest they know) is used: flu is at the edge of
+  what the models were trained on.
+- `n` is 5,000 unless the window's cases would need a large share of 5,000 people;
+  then 10,000 (the largest the models know). The table below gives the share.
+
+**Score.** There is no true R0 for real data. Each model's estimates are run
+`r params$n_reps` times through the SEIR simulator from the model's own starting state;
+coverage is the share of observed days inside the 95% band.
+
+To run it (from the `examples/` folder):
+
+```r
+rmarkdown::render("Test_SEIR_real_data.Rmd", output_dir = "results/seir_real_data_test")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+OUT_DIR  <- params$out_dir
+DATA_DIR <- file.path(OUT_DIR, "data")
+WINDOW   <- params$window
+N_REPS   <- params$n_reps
+KNOWN    <- c("n", "recov", "incub")
+STATE_NAMES <- c("exposed_share", "infected_share", "recovered_share")
+
+dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+# Several seeds = average of their estimates, with crate recomputed from the
+# averaged ptran and R0 (as in both reports).
+make_model <- function(dirs) {
+  cls <- lapply(trimws(strsplit(dirs, ",")[[1]]), function(d)
+    bilstm_calibrator(d, known_names = KNOWN, type = "SEIR", device = params$device))
+  if (length(cls) == 1) return(cls[[1]])
+  structure(list(
+    pre_process  = function(x, ...) x,
+    run          = function(x, ...) rowMeans(sapply(cls, function(cl) calibrate(x, cl, ...))),
+    post_process = function(x, recov = NULL, ...) derive_crate(x, recov = recov),
+    type         = "SEIR"
+  ), class = "calibrator")
+}
+models <- list(`SEIR v2` = make_model(params$v2_models),
+               `Variable-length v3` = make_model(params$v3_models))
+MODEL_COLS <- c(`SEIR v2` = "darkorange", `Variable-length v3` = "purple")
+
+cuda_ok <- reticulate::py_eval("__import__('torch').cuda.is_available()")
+cat("BiLSTM predictions on:", if (params$device == "cpu" || !cuda_ok) "cpu" else "cuda", "\n")
+```
+
+# Data
+
+Each file is downloaded once and kept in `r DATA_DIR`.
+
+```{r data}
+# Utah daily influenza hospital admissions. The value reported on a date counts the
+# admissions of the previous day.
+hhs_file <- file.path(DATA_DIR, "utah_hhs_hospital_admissions.csv")
+if (!file.exists(hhs_file)) {
+  download.file(paste0(
+    "https://healthdata.gov/resource/g62h-syeh.csv?state=UT&$limit=5000&$order=date",
+    "&$select=date,previous_day_admission_influenza_confirmed,",
+    "previous_day_admission_influenza_confirmed_coverage"), hhs_file, quiet = TRUE)
+}
+hhs <- read.csv(hhs_file)
+hhs$date <- as.Date(substr(hhs$date, 1, 10)) - 1
+
+# Baltimore 1918 influenza (EpiEstim's Flu1918).
+flu1918_file <- file.path(DATA_DIR, "Flu1918.rda")
+if (!file.exists(flu1918_file)) {
+  download.file("https://raw.githubusercontent.com/mrc-ide/EpiEstim/master/data/Flu1918.rda",
+                flu1918_file, mode = "wb", quiet = TRUE)
+}
+e <- new.env()
+load(flu1918_file, envir = e)
+
+# Utah COVID-19 daily cases, all days (the dashboard stopped updating in May 2025).
+covid_file <- file.path(DATA_DIR, "utah_covid_all_days.csv")
+if (!file.exists(covid_file)) {
+  zip_file <- tempfile(fileext = ".zip")
+  download.file("https://coronavirus-dashboard.utah.gov/Utah_COVID19_data.zip",
+                zip_file, mode = "wb", quiet = TRUE)
+  target <- grep("Trends_Epidemic", unzip(zip_file, list = TRUE)$Name, value = TRUE)[1]
+  u <- read.csv(unz(zip_file, target))
+  unlink(zip_file)
+  u$Date <- as.Date(u$Date)
+  write.csv(u[order(u$Date), c("Date", "Daily.Cases")], covid_file, row.names = FALSE)
+}
+covid <- read.csv(covid_file)
+covid$Date <- as.Date(covid$Date)
+
+season <- function(dates, cases, from, to) {
+  s <- dates >= as.Date(from) & dates <= as.Date(to)
+  list(x = dates[s], cases = cases[s])
+}
+datasets <- list(
+  `Utah flu 2022-23` = c(season(hhs$date, hhs$previous_day_admission_influenza_confirmed,
+                                "2022-09-01", "2023-05-31"),
+                         list(disease = "flu", counted = "hospital admissions")),
+  `Utah flu 2023-24` = c(season(hhs$date, hhs$previous_day_admission_influenza_confirmed,
+                                "2023-09-01", "2024-04-26"),
+                         list(disease = "flu", counted = "hospital admissions")),
+  `Baltimore flu 1918` = list(x = seq_along(e$Flu1918$incidence), cases = e$Flu1918$incidence,
+                              disease = "flu", counted = "cases"),
+  `Utah COVID-19 summer 2023` = c(season(covid$Date, covid$Daily.Cases, "2023-06-01", "2023-10-15"),
+                                  list(disease = "COVID-19", counted = "cases"))
+)
+stopifnot(all(vapply(datasets, function(d) !anyNA(d$cases), logical(1))))
+```
+
+```{r windows}
+# The 61 days ending one week after the peak of the 7-day average, and the whole
+# wave from the same first day until the 7-day average falls below 5% of its peak.
+for (k in names(datasets)) {
+  d   <- datasets[[k]]
+  ma  <- as.numeric(stats::filter(d$cases, rep(1 / 7, 7), sides = 2))
+  pk  <- which.max(ma)
+  end <- min(length(d$cases), pk + 7)
+  start <- max(1, end - WINDOW + 1)
+  after <- which(seq_along(ma) > pk & ma < 0.05 * ma[pk])
+  wave_end <- min(if (length(after)) after[1] else length(d$cases), start + 364)
+  total <- sum(d$cases[start:(start + WINDOW - 1)])
+  datasets[[k]] <- c(d, list(
+    start = start, wave_end = wave_end, total61 = total,
+    n     = if (total > 0.35 * 5000) 10000 else 5000,
+    recov = if (d$disease == "flu") params$flu_recov else params$covid_recov,
+    incub = if (d$disease == "flu") params$flu_incub else params$covid_incub
+  ))
+}
+fmt <- function(d, i) if (inherits(d$x, "Date")) format(d$x[i]) else paste("day", d$x[i])
+win_tab <- do.call(rbind, lapply(names(datasets), function(k) {
+  d <- datasets[[k]]
+  data.frame(dataset = k, counted = d$counted,
+             window_61 = paste(fmt(d, d$start), "to", fmt(d, d$start + WINDOW - 1)),
+             whole_wave = paste(fmt(d, d$start), "to", fmt(d, d$wave_end),
+                                sprintf("(%d days)", d$wave_end - d$start + 1)),
+             peak_per_day = max(d$cases), cases_in_61_days = d$total61, n = d$n,
+             share_of_n = d$total61 / d$n, recov = d$recov, incub = d$incub)
+}))
+write.csv(win_tab, file.path(OUT_DIR, "datasets_and_windows.csv"), row.names = FALSE)
+knitr::kable(win_tab, digits = 3, row.names = FALSE)
+```
+
+```{r data-plot, fig.width=12, fig.height=6}
+op <- par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+for (k in names(datasets)) {
+  d <- datasets[[k]]
+  plot(d$x, d$cases, type = "l", col = "blue", lwd = 1.5, xlab = "", ylab = paste("daily", d$counted),
+       main = k)
+  usr <- par("usr")
+  rect(d$x[d$start], usr[3], d$x[d$wave_end], usr[4], col = adjustcolor("purple", 0.1), border = NA)
+  rect(d$x[d$start], usr[3], d$x[d$start + WINDOW - 1], usr[4], col = adjustcolor("grey40", 0.2), border = NA)
+}
+par(op)
+```
+
+Dark grey: the 61-day window. Light purple: the whole wave read by v3.
+
+# Fits
+
+```{r fit}
+start_state <- function(est) {
+  if (all(STATE_NAMES %in% names(est))) {
+    list(preval = est[["exposed_share"]], start_infected = est[["infected_share"]],
+         start_recovered = est[["recovered_share"]])
+  } else {
+    list(preval = est[["preval"]])
+  }
+}
+
+fit_one <- function(d, model, from, to) {
+  y   <- d$cases[from:to]
+  L   <- length(y)
+  est <- calibrate(y, models[[model]], n = d$n, recov = d$recov, incub = d$incub)
+  pars <- c(list(n = d$n, recov = d$recov, incub = d$incub,
+                 ptran = est[["ptran"]], crate = est[["crate"]]), start_state(est))
+  sim  <- seir_simulator(ndays = L)
+  runs <- vapply(seq_len(N_REPS), function(i) simulate_from_parameters(sim, pars, seed = i), numeric(L))
+  b <- data.frame(median = apply(runs, 1, median),
+                  lower = apply(runs, 1, quantile, 0.025), upper = apply(runs, 1, quantile, 0.975))
+  list(y = y, x = d$x[from:to], est = est, band = b,
+       metrics = data.frame(
+         R0 = est[["R0"]], ptran = est[["ptran"]], crate = est[["crate"]],
+         preval = if ("preval" %in% names(est)) est[["preval"]] else NA,
+         exposed_share   = if ("exposed_share" %in% names(est)) est[["exposed_share"]] else NA,
+         infected_share  = if ("infected_share" %in% names(est)) est[["infected_share"]] else NA,
+         recovered_share = if ("recovered_share" %in% names(est)) est[["recovered_share"]] else NA,
+         coverage_pct = 100 * mean(y >= b$lower & y <= b$upper),
+         RMSE = sqrt(mean((b$median - y)^2)), MAE = mean(abs(b$median - y))))
+}
+
+fits <- list()
+for (k in names(datasets)) {
+  d <- datasets[[k]]
+  fits[[k]] <- list(
+    `SEIR v2, 61 days`            = fit_one(d, "SEIR v2", d$start, d$start + WINDOW - 1),
+    `Variable-length v3, 61 days` = fit_one(d, "Variable-length v3", d$start, d$start + WINDOW - 1),
+    `Variable-length v3, whole wave` = fit_one(d, "Variable-length v3", d$start, d$wave_end)
+  )
+}
+fit_tab <- do.call(rbind, lapply(names(fits), function(k) do.call(rbind, lapply(names(fits[[k]]), function(m)
+  data.frame(dataset = k, fit = m, days = length(fits[[k]][[m]]$y), fits[[k]][[m]]$metrics)))))
+write.csv(fit_tab, file.path(OUT_DIR, "fits.csv"), row.names = FALSE)
+```
+
+```{r fit-plots, fig.width=13, fig.height=4.2, results="asis"}
+for (k in names(fits)) {
+  cat("\n\n## ", k, "\n\n", sep = "")
+  f  <- fits[[k]]
+  op <- par(mfrow = c(1, 3), mar = c(4, 4, 3.5, 1))
+  for (m in names(f)) {
+    r   <- f[[m]]
+    col <- MODEL_COLS[[sub(",.*", "", m)]]
+    # Same y-axis for the two 61-day fits.
+    ylim <- if (grepl("61", m)) range(unlist(lapply(f[grepl("61", names(f))], function(z) c(z$y, z$band$lower, z$band$upper))))
+            else range(c(r$y, r$band$lower, r$band$upper))
+    plot(r$x, r$band$median, type = "n", ylim = ylim, xlab = "", ylab = paste("daily", datasets[[k]]$counted),
+         main = sprintf("%s\nR0 %.2f | coverage %.0f%%", m, r$metrics$R0, r$metrics$coverage_pct))
+    polygon(c(r$x, rev(r$x)), c(r$band$upper, rev(r$band$lower)), col = adjustcolor(col, 0.3), border = NA)
+    lines(r$x, r$band$median, col = col, lwd = 2)
+    lines(r$x, r$y, col = "blue", lwd = 2)
+    points(r$x, r$y, col = "blue", pch = 16, cex = 0.5)
+  }
+  par(op)
+  cat("\n\n")
+  print(knitr::kable(fit_tab[fit_tab$dataset == k, c("fit", "days", "R0", "coverage_pct", "RMSE", "MAE")],
+                     digits = 2, row.names = FALSE))
+}
+```
+
+# Summary
+
+```{r summary}
+summary_tab <- reshape(fit_tab[, c("dataset", "fit", "coverage_pct")], idvar = "dataset",
+                       timevar = "fit", direction = "wide")
+names(summary_tab) <- sub("coverage_pct.", "", names(summary_tab), fixed = TRUE)
+r0_tab <- reshape(fit_tab[, c("dataset", "fit", "R0")], idvar = "dataset", timevar = "fit", direction = "wide")
+names(r0_tab) <- sub("R0.", "R0: ", names(r0_tab), fixed = TRUE)
+summary_tab <- merge(summary_tab, r0_tab, by = "dataset", sort = FALSE)
+write.csv(summary_tab, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_tab, digits = 2, row.names = FALSE,
+             caption = "Coverage % of the 95% band (first three columns) and the R0 estimates")
+```
+
+Notes:
+
+- Flu R0 values depend on the assumed `incub` and `recov`: with a longer latent period
+  than flu really has, a model needs a larger R0 to match the same growth, so the
+  flu R0 values are not comparable with published estimates.
+- The Utah flu data count hospital admissions, a small and fairly constant share of
+  infections, so their shape (not their size) is what the models fit.
+
+# Saved files
+
+```{r save}
+saveRDS(list(windows = win_tab, fits = fit_tab, summary = summary_tab, params = params),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+list.files(OUT_DIR)
+```

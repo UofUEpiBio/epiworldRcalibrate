@@ -1,0 +1,635 @@
+---
+title: "SIR calibration: BiLSTM vs ABC-MCMC, ABC-SMC, Nelder-Mead and DE"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  out_dir: "results/sir_method_comparison"
+  bilstm_model: "results/reproduce_pretrained_sir_75k/model_seed_122"
+  bilstm_model_tuned: "results/sir_bilstm_tuned/model_seed_122"
+  test_dir: "results/reproduce_pretrained_sir_75k/test_bank"
+  utah_file: "results/reproduce_pretrained_sir_75k/utah_covid_last61days.csv"
+  n_curves: 100
+  curves: ""
+  with_utah: true
+  cores: 1
+  stop_after: ""
+  n_reps: 300
+  n_reps_test: 100
+  quick: false
+  keep_day_zero: true
+  main_label: "Retrained BiLSTM (75k)"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+It compares our retrained SIR BiLSTM (from `Reproduce_pretrained_SIR.Rmd`, 75,000
+simulations) with the four search-based calibration methods in the package, on the
+same epidemic curves:
+
+- **Retrained BiLSTM (75k)**: our model, retrained with the pretrained model's recipe.
+- **Tuned SIR BiLSTM**: the same training data, with the settings from the SIR
+  hyperparameter search (included when `bilstm_model_tuned` exists).
+- **Original pretrained BiLSTM**: the model shipped with the package, for context
+  (only with `keep_day_zero: true`, because it needs day 0).
+
+With `keep_day_zero: false` the curves hold only new cases on days 1 to 61 (see
+`SIR_no_day0_BiLSTM.Rmd`); `main_label` names the main BiLSTM.
+- **ABC-MCMC** and **ABC-SMC**: approximate Bayesian computation.
+- **Nelder-Mead** and **DE** (differential evolution): optimisation.
+
+Two kinds of data:
+
+1. **Simulated SIR epidemics** with known parameters: the first
+   `r params$n_curves` curves of the retrained model's test bank.
+2. **Real Utah COVID-19 data**: estimates from every method are used to rebuild the
+   observed curve.
+
+The search-based methods simulate the SIR model thousands of times per curve, so
+they are slow. Each method's result on each curve is saved as soon as it finishes,
+and a re-run skips what is already saved. `curves` (for example `"1-25"`), `cores`
+and `stop_after: "methods"` let several cluster jobs share the work; a final
+render with the defaults builds the report from the saved results.
+`quick: true` runs very short versions of the search methods, only to check that
+the document works.
+
+Run it from the `examples/` folder, for example:
+
+```r
+rmarkdown::render("Compare_SIR_methods.Rmd", output_dir = "results/sir_method_comparison")
+```
+
+# Setup
+
+```{r packages}
+# Load the package from this repository (one folder up).
+pkgload::load_all("..", quiet = TRUE)
+
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+
+# The pretrained scalers were saved with scikit-learn 1.6.1. Newer versions read
+# them correctly but print a version warning every time they are loaded.
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+OUT_DIR  <- params$out_dir
+N_CURVES <- params$n_curves
+N_REPS   <- params$n_reps        # simulations per method for the Utah bands
+N_REPS_TEST <- params$n_reps_test  # simulations per method and test curve for the bands
+CORES    <- as.integer(params$cores)
+
+TARGETS <- c("ptran", "crate", "R0")
+SEARCH_METHODS <- c("ABC-MCMC", "ABC-SMC", "NelderMead", "DE")
+
+# The search-based methods simulate the model, so they also need the starting
+# prevalence. They search crate and ptran over the training ranges of the
+# BiLSTM, and R0 follows from R0 = ptran * crate / recov.
+SEARCH_KNOWN <- c("n", "preval", "recov")
+KDZ <- isTRUE(params$keep_day_zero)
+BOUNDS <- list(crate = c(1, 5), ptran = c(if (KDZ) 0.01 else 0.005, 1))
+derive_R0 <- function(estimate, known) {
+  c(R0 = unname(estimate[["ptran"]] * estimate[["crate"]] / known$recov))
+}
+sim <- if (KDZ) sir_simulator(ndays = 60) else sir_simulator(ndays = 61, keep_day_zero = FALSE)
+
+# Package defaults, unless quick: true.
+METHOD_SETTINGS <- if (isTRUE(params$quick)) list(
+  "ABC-MCMC"   = list(n_samples = 60, burnin = 30),
+  "ABC-SMC"    = list(n_particles = 20, n_generations = 2, sim_budget = 200),
+  "NelderMead" = list(maxit = 20, restarts = 0),
+  "DE"         = list(maxiter = 2)
+) else list()
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+run_dir <- file.path(OUT_DIR, "method_runs")
+dir.create(run_dir, showWarnings = FALSE)
+
+knitr::kable(data.frame(
+  setting = c("test curves", "search bounds", "reconstruction runs", "BiLSTM model"),
+  value   = c(N_CURVES, sprintf("crate 1-5, ptran %g-1", BOUNDS$ptran[1]), N_REPS, params$bilstm_model)
+))
+```
+
+## The methods
+
+| Method | Known values | How it estimates | Model runs per curve |
+|---|---|---|---|
+| Retrained / tuned / original pretrained BiLSTM | `n`, `recov` | one pass of the trained network | none |
+| ABC-MCMC | `n`, `recov`, starting prevalence | random-walk chain, 3,000 steps (1,500 burn-in), median of the chain | 3,000 |
+| ABC-SMC | same | 200 particles, 6 generations | up to 8,000 |
+| Nelder-Mead | same | simplex search, 3 starts of up to 1,000 steps, 3 runs per candidate | up to 9,000 |
+| DE | same | 20 candidates, up to 120 generations, 3 runs per candidate | up to 7,200 |
+
+All settings are the package defaults. The search-based methods need the starting
+number of infected to simulate; with day 0 they read it from day 0 of the curve,
+which is exactly what the BiLSTM sees too. Apart from the search ranges, which are
+the BiLSTM's training ranges, no method uses anything from the simulated data sets.
+
+# Step 1: run the search-based methods
+
+```{r test-bank}
+test_bank <- read_training_data(
+  file.path(params$test_dir, "sir_theta.csv"),
+  file.path(params$test_dir, "sir_observations.csv"),
+  type = "SIR"
+)
+stopifnot(nrow(test_bank$theta) >= N_CURVES)
+truth <- test_bank$theta[seq_len(N_CURVES), TARGETS]
+
+utah     <- read.csv(params$utah_file)
+observed <- utah$Daily.Cases
+UTAH_N     <- 5000
+UTAH_RECOV <- 1 / 7
+# With day 0, day 0 is the number initially infected. Without it, the starting
+# pool is the first day's cases times the infectious period (1 / recov).
+utah_known <- list(n = UTAH_N, recov = UTAH_RECOV,
+                   preval = if (KDZ) observed[1] / UTAH_N else observed[1] / (UTAH_RECOV * UTAH_N))
+```
+
+One unit of work is one method on one curve (or on the Utah data). Each finished
+unit is saved in `method_runs/`.
+
+```{r run-methods}
+parse_curves <- function(x) {
+  if (!nzchar(x)) return(seq_len(N_CURVES))
+  r <- as.integer(strsplit(x, "-")[[1]])
+  r[1]:r[length(r)]
+}
+
+unit_file <- function(item, method) file.path(run_dir, sprintf("%s_%s.rds", item, method))
+
+run_unit <- function(item, method) {
+  f <- unit_file(item, method)
+  if (file.exists(f)) return(invisible(f))
+  if (item == "utah") {
+    curve <- observed
+    known <- utah_known
+    set.seed(2025)
+  } else {
+    i     <- as.integer(sub("curve_", "", item))
+    curve <- as.numeric(test_bank$observations[i, ])
+    known <- as.list(test_bank$theta[i, SEARCH_KNOWN])
+    # With day 0, the starting number of infected is read from the curve itself
+    # (day 0), not from the simulated data set's true parameters.
+    if (KDZ) known$preval <- (curve[1] + 0.5) / known$n
+    set.seed(i)
+  }
+  cal <- do.call(make_calibrator, c(list(method, sim, BOUNDS, SEARCH_KNOWN, derive_R0),
+                                    METHOD_SETTINGS[[method]]))
+  t0  <- proc.time()[["elapsed"]]
+  # A method that fails on a curve (for example, runs out of its simulation
+  # budget) is recorded as a failure rather than stopping the comparison.
+  res <- tryCatch(do.call(calibrate, c(list(curve, cal), known)), error = function(e) e)
+  failed <- inherits(res, "error")
+  est <- if (failed) c(ptran = NA_real_, crate = NA_real_, R0 = NA_real_) else calibration_estimate(res)
+  saveRDS(
+    data.frame(
+      item       = item,
+      method     = method,
+      ptran      = est[["ptran"]],
+      crate      = est[["crate"]],
+      R0         = est[["R0"]],
+      seconds    = proc.time()[["elapsed"]] - t0,
+      model_runs = if (failed) NA_real_ else res$diagnostics$n_model_runs,
+      error      = if (failed) conditionMessage(res) else NA_character_
+    ),
+    f
+  )
+  invisible(f)
+}
+
+items <- sprintf("curve_%04d", parse_curves(params$curves))
+if (isTRUE(params$with_utah)) items <- c(items, "utah")
+units <- expand.grid(item = items, method = SEARCH_METHODS, stringsAsFactors = FALSE)
+units <- units[!file.exists(unit_file(units$item, units$method)), ]
+
+if (nrow(units)) {
+  done <- parallel::mclapply(
+    seq_len(nrow(units)),
+    function(k) try(run_unit(units$item[k], units$method[k])),
+    mc.cores = CORES, mc.preschedule = FALSE
+  )
+  failed <- vapply(done, inherits, logical(1), what = "try-error")
+  if (any(failed)) {
+    stop("Failed units: ", paste(units$item[failed], units$method[failed], collapse = "; "))
+  }
+}
+cat("Saved units:", length(list.files(run_dir, pattern = "\\.rds$")), "\n")
+```
+
+```{r stop-after-methods, include=FALSE}
+if (identical(params$stop_after, "methods")) knitr::knit_exit()
+```
+
+# Step 2: the BiLSTM models on the same curves
+
+```{r bilstm}
+have_tuned <- KDZ && nzchar(params$bilstm_model_tuned) &&
+  file.exists(file.path(params$bilstm_model_tuned, "model.pt"))
+cals <- list()
+cals[[params$main_label]] <- bilstm_calibrator(params$bilstm_model, known_names = c("n", "recov"), type = "SIR")
+if (have_tuned) {
+  cals[["Tuned SIR BiLSTM"]] <- bilstm_calibrator(params$bilstm_model_tuned, known_names = c("n", "recov"), type = "SIR")
+}
+if (KDZ) cals[["Original pretrained BiLSTM"]] <- pretrained_sir_calibrator()
+MAIN <- names(cals)[1]   # the model the others are compared with
+
+bilstm_rows <- function(item, curve, n, recov) {
+  do.call(rbind, lapply(names(cals), function(m) {
+    t0  <- proc.time()[["elapsed"]]
+    est <- calibrate(curve, cals[[m]], n = n, recov = recov)
+    data.frame(item = item, method = m, ptran = est[["ptran"]], crate = est[["crate"]],
+               R0 = est[["R0"]], seconds = proc.time()[["elapsed"]] - t0, model_runs = 0,
+               error = NA_character_)
+  }))
+}
+
+estimates <- rbind(
+  do.call(rbind, lapply(seq_len(N_CURVES), function(i) {
+    bilstm_rows(sprintf("curve_%04d", i), as.numeric(test_bank$observations[i, ]),
+                test_bank$theta$n[i], test_bank$theta$recov[i])
+  })),
+  bilstm_rows("utah", observed, UTAH_N, UTAH_RECOV),
+  do.call(rbind, lapply(
+    list.files(run_dir, pattern = "\\.rds$", full.names = TRUE),
+    function(f) { x <- readRDS(f); if (is.null(x$error)) x$error <- NA_character_; x }
+  ))
+)
+estimates$method[estimates$method == "NelderMead"] <- "Nelder-Mead"
+METHODS <- c(names(cals), "ABC-MCMC", "ABC-SMC", "Nelder-Mead", "DE")
+write.csv(estimates, file.path(OUT_DIR, "estimates.csv"), row.names = FALSE)
+
+sim_est <- estimates[estimates$item != "utah", ]
+sim_est$curve <- as.integer(sub("curve_", "", sim_est$item))
+sim_est <- sim_est[sim_est$curve <= N_CURVES, ]
+missing <- setdiff(
+  paste(rep(sprintf("curve_%04d", seq_len(N_CURVES)), each = length(METHODS)), METHODS),
+  paste(sim_est$item, sim_est$method)
+)
+if (length(missing)) stop(length(missing), " method runs are missing, e.g. ", missing[1])
+```
+
+# Step 3: accuracy on simulated epidemics
+
+Lower MAE and RMSE and higher R² are better. Bias is the mean of estimate minus
+truth. Time is the wall-clock time per curve on one CPU core (BiLSTM time includes
+loading the model).
+
+```{r accuracy}
+accuracy <- do.call(rbind, lapply(METHODS, function(m) {
+  e <- sim_est[sim_est$method == m, ]
+  e <- e[order(e$curve), ]
+  do.call(rbind, lapply(TARGETS, function(p) {
+    err <- e[[p]] - truth[[p]]
+    ok  <- !is.na(err)   # curves the method did not fail on
+    data.frame(
+      parameter = p, method = m,
+      MAE  = mean(abs(err[ok])),
+      RMSE = sqrt(mean(err[ok]^2)),
+      bias = mean(err[ok]),
+      R2   = 1 - sum(err[ok]^2) / sum((truth[[p]][ok] - mean(truth[[p]][ok]))^2),
+      failed_curves = sum(!ok)
+    )
+  }))
+}))
+accuracy <- accuracy[order(match(accuracy$parameter, TARGETS)), ]
+write.csv(accuracy, file.path(OUT_DIR, "accuracy.csv"), row.names = FALSE)
+knitr::kable(accuracy, digits = 3, row.names = FALSE)
+```
+
+```{r r0-scatter, fig.width=13, fig.height=6.5}
+op <- par(mfrow = c(2, ceiling(length(METHODS) / 2)), mar = c(4, 4, 3, 1))
+for (m in METHODS) {
+  e <- sim_est[sim_est$method == m, ]
+  e <- e[order(e$curve), ]
+  plot(truth$R0, e$R0, pch = 16, cex = 0.7, col = adjustcolor("black", 0.5),
+       xlim = range(truth$R0) + c(-0.1, 0.1), ylim = c(0, 6), xlab = "true R0", ylab = "estimated R0", main = m)
+  abline(0, 1, col = "red", lwd = 2)
+}
+par(op)
+```
+
+## Time per run
+
+How long each method takes to give an answer, on one CPU core. The BiLSTM time
+includes loading the saved model from disk; the search-based methods spend almost
+all of their time simulating the model.
+
+```{r timing}
+timing <- do.call(rbind, lapply(METHODS, function(m) {
+  s <- sim_est$seconds[sim_est$method == m]
+  data.frame(
+    method                 = m,
+    median_seconds         = median(s),
+    mean_seconds           = mean(s),
+    fastest_seconds        = min(s),
+    slowest_seconds        = max(s),
+    minutes_for_all_curves = sum(s) / 60,
+    utah_seconds           = estimates$seconds[estimates$item == "utah" & estimates$method == m],
+    model_runs_per_curve   = median(sim_est$model_runs[sim_est$method == m], na.rm = TRUE),
+    failed_curves          = sum(is.na(sim_est$R0[sim_est$method == m]))
+  )
+}))
+timing$times_slower_than_main <- timing$median_seconds / timing$median_seconds[timing$method == MAIN]
+write.csv(timing, file.path(OUT_DIR, "timing.csv"), row.names = FALSE)
+knitr::kable(timing, digits = c(0, 3, 3, 3, 3, 1, 3, 0, 0, 0), row.names = FALSE,
+             caption = paste0("Time per curve over ", N_CURVES, " curves, and for the Utah data"))
+```
+
+```{r timing-plot, fig.width=8, fig.height=4}
+op <- par(mar = c(4, 14, 1, 1))
+barplot(rev(timing$median_seconds), names.arg = rev(timing$method), horiz = TRUE, log = "x",
+        las = 1, col = "grey70", xlab = "median seconds per curve (log scale)")
+par(op)
+```
+
+The BiLSTM is fast because its expensive part is done once, before any data are
+seen: simulating the training bank and training the network. The SIR bank was simulated on one core.
+
+```{r setup-cost}
+setup_cost <- function(name, model_dir) {
+  bank_file <- file.path(dirname(model_dir), "training_bank", "simulation_seconds.txt")
+  cfg <- jsonlite::read_json(file.path(model_dir, "model_config.json"))
+  data.frame(
+    model            = name,
+    bank_minutes     = if (file.exists(bank_file)) as.numeric(readLines(bank_file)) / 60 else NA,
+    training_minutes = as.numeric(readLines(file.path(model_dir, "training_seconds.txt"))) / 60,
+    trained_on       = if (is.null(cfg$device)) "cpu" else cfg$device
+  )
+}
+setup <- rbind(
+  setup_cost(names(cals)[1], params$bilstm_model),
+  if (have_tuned) setup_cost("Tuned SIR BiLSTM", params$bilstm_model_tuned),
+  if (KDZ) data.frame(model = "Original pretrained BiLSTM", bank_minutes = NA, training_minutes = NA,
+             trained_on = "not recorded")
+)
+setup$total_minutes <- setup$bank_minutes + setup$training_minutes
+write.csv(setup, file.path(OUT_DIR, "bilstm_setup_time.csv"), row.names = FALSE)
+knitr::kable(setup, digits = 1, row.names = FALSE, caption = "One-off cost of each BiLSTM")
+
+# After how many curves the one-off cost has paid for itself.
+main_setup <- setup$total_minutes[setup$model == MAIN] * 60
+main_sec   <- timing$median_seconds[timing$method == MAIN]
+search     <- timing[!timing$method %in% names(cals), ]
+break_even <- data.frame(
+  method = search$method,
+  curves_before_the_BiLSTM_is_cheaper = ceiling(main_setup / (search$median_seconds - main_sec))
+)
+write.csv(break_even, file.path(OUT_DIR, "break_even.csv"), row.names = FALSE)
+knitr::kable(break_even, row.names = FALSE,
+             caption = paste("Curves needed before the", MAIN, "costs less time in total"))
+```
+
+## Head to head with the `r MAIN`
+
+For each curve, the other method's absolute `R0` error minus the `r MAIN`'s. A
+positive mean difference means the `r MAIN` is closer to the truth on average; a
+95% interval that excludes 0 means the difference is clear on these curves.
+
+```{r head-to-head}
+ref <- sim_est[sim_est$method == MAIN, ]
+ref <- ref[order(ref$curve), ]
+err_ref <- abs(ref$R0 - truth$R0)
+
+head_to_head <- do.call(rbind, lapply(setdiff(METHODS, MAIN), function(m) {
+  e  <- sim_est[sim_est$method == m, ]
+  e  <- e[order(e$curve), ]
+  d  <- abs(e$R0 - truth$R0) - err_ref
+  ci <- t.test(d)$conf.int
+  data.frame(method = m, R0_MAE = mean(abs(e$R0 - truth$R0), na.rm = TRUE),
+             R0_MAE_main = mean(err_ref[!is.na(d)]),
+             mean_diff = mean(d, na.rm = TRUE), diff_lower_95 = ci[1], diff_upper_95 = ci[2],
+             pct_curves_main_closer = 100 * mean(d > 0, na.rm = TRUE))
+}))
+write.csv(head_to_head, file.path(OUT_DIR, "head_to_head_R0.csv"), row.names = FALSE)
+knitr::kable(head_to_head, digits = 3, row.names = FALSE)
+```
+
+## 95% bands on the test curves
+
+The same check as for the Utah data, on every test curve: each method's estimates
+are run `r N_REPS_TEST` times through the model (a different seed each time, with
+the curve's true `n`, `recov` and starting prevalence), and the observed curve is
+compared with the median and the 95% band of those runs. **True parameters** does
+the same with the parameters that generated the curve, so it shows the best a
+method can do: about 95% of days inside the band.
+
+```{r test-bands}
+band_methods <- c(METHODS, "True parameters")
+band_file    <- file.path(OUT_DIR, "test_bands.rds")
+n_days       <- ncol(test_bank$observations)
+
+band_for <- function(i, m) {
+  est <- if (m == "True parameters") truth[i, ] else sim_est[sim_est$curve == i & sim_est$method == m, ]
+  if (anyNA(c(est$ptran, est$crate))) return(NULL)   # the method failed on this curve
+  pars <- c(as.list(test_bank$theta[i, SEARCH_KNOWN]), list(ptran = est$ptran, crate = est$crate))
+  runs <- vapply(seq_len(N_REPS_TEST), function(r) simulate_from_parameters(sim, pars, seed = r),
+                 numeric(n_days))
+  data.frame(curve = i, method = m, day = seq_len(n_days),
+             median = apply(runs, 1, median),
+             lower  = apply(runs, 1, quantile, probs = 0.025),
+             upper  = apply(runs, 1, quantile, probs = 0.975))
+}
+
+bands <- if (file.exists(band_file)) readRDS(band_file) else NULL
+have  <- if (is.null(bands)) character() else unique(paste(bands$curve, bands$method))
+todo  <- expand.grid(curve = seq_len(N_CURVES), method = band_methods, stringsAsFactors = FALSE)
+todo  <- todo[!paste(todo$curve, todo$method) %in% have, ]
+if (nrow(todo)) {
+  new_bands <- parallel::mclapply(seq_len(nrow(todo)), function(k) band_for(todo$curve[k], todo$method[k]),
+                                  mc.cores = CORES, mc.preschedule = FALSE)
+  bands <- rbind(bands, do.call(rbind, new_bands))
+  saveRDS(bands, band_file)
+}
+
+per_curve <- do.call(rbind, lapply(band_methods, function(m) {
+  do.call(rbind, lapply(seq_len(N_CURVES), function(i) {
+    b <- bands[bands$method == m & bands$curve == i, ]
+    y <- as.numeric(test_bank$observations[i, ])
+    if (!nrow(b)) return(data.frame(method = m, curve = i, coverage_pct = NA, RMSE = NA))
+    data.frame(method = m, curve = i,
+               coverage_pct = 100 * mean(y >= b$lower & y <= b$upper),
+               RMSE = sqrt(mean((b$median - y)^2)))
+  }))
+}))
+band_summary <- do.call(rbind, lapply(band_methods, function(m) {
+  x <- per_curve[per_curve$method == m, ]
+  data.frame(method = m, mean_coverage_pct = mean(x$coverage_pct, na.rm = TRUE),
+             median_coverage_pct = median(x$coverage_pct, na.rm = TRUE),
+             mean_RMSE = mean(x$RMSE, na.rm = TRUE))
+}))
+write.csv(per_curve, file.path(OUT_DIR, "test_band_coverage_per_curve.csv"), row.names = FALSE)
+write.csv(band_summary, file.path(OUT_DIR, "test_band_coverage.csv"), row.names = FALSE)
+knitr::kable(band_summary, digits = 2, row.names = FALSE,
+             caption = "Share of observed days inside each method's 95% band, over all test curves")
+```
+
+```{r test-band-boxplot, fig.width=10, fig.height=4.5}
+op <- par(mar = c(9, 4, 2, 1))
+boxplot(coverage_pct ~ factor(method, levels = band_methods), data = per_curve, las = 2,
+        xlab = "", ylab = "% of days inside the 95% band", col = "grey90")
+abline(h = 95, lty = 2, col = "red")
+par(op)
+```
+
+Four example curves, chosen across the range of true `R0` (rows), with every
+method's band (columns). Blue is the observed curve; red is the median and 95% band.
+
+```{r test-band-examples, fig.width=19, fig.height=10}
+examples <- unique(vapply(c(0.1, 0.4, 0.7, 0.95), function(q) {
+  which.min(abs(truth$R0 - quantile(truth$R0, q)))
+}, integer(1)))
+
+op <- par(mfrow = c(length(examples), length(band_methods)), mar = c(3, 3, 2.5, 0.5), mgp = c(1.8, 0.6, 0))
+for (i in examples) {
+  y    <- as.numeric(test_bank$observations[i, ])
+  rows <- bands[bands$curve == i, ]
+  ylim <- range(c(y, rows$lower, rows$upper))
+  for (m in band_methods) {
+    b <- rows[rows$method == m, ]
+    if (!nrow(b)) { plot.new(); title(main = paste0(m, "\nfailed on this curve"), cex.main = 0.85); next }
+    plot(b$day, b$median, type = "n", ylim = ylim, xlab = "day", ylab = "daily cases",
+         main = sprintf("%s\ncurve %d, true R0 %.2f", m, i, truth$R0[i]), cex.main = 0.85)
+    polygon(c(b$day, rev(b$day)), c(b$upper, rev(b$lower)), col = adjustcolor("red", 0.3), border = NA)
+    lines(b$day, b$median, col = "red", lwd = 2)
+    lines(b$day, y, col = "blue", lwd = 1.5)
+  }
+}
+par(op)
+```
+
+# Step 4: real Utah COVID-19 data
+
+The same 61 days and known values as `Reproduce_pretrained_SIR.Rmd`: `n = 5000` and
+`recov = 1/7`. The search-based methods also get the starting prevalence, the
+first observed day divided by `n`.
+
+```{r utah-estimates}
+utah_est <- estimates[estimates$item == "utah", ]
+utah_est <- utah_est[match(METHODS, utah_est$method), ]
+rownames(utah_est) <- NULL
+write.csv(utah_est, file.path(OUT_DIR, "utah_estimates.csv"), row.names = FALSE)
+knitr::kable(utah_est[, c("method", TARGETS, "seconds", "model_runs")], digits = 4)
+```
+
+Each method's estimates are run `r N_REPS` times through the SIR model (a different
+seed each time), starting from the first observed day as in `Reproduce_pretrained_SIR.Rmd`.
+
+```{r utah-reconstruct}
+recon <- lapply(setNames(METHODS, METHODS), function(m) {
+  est <- utah_est[utah_est$method == m, c("ptran", "crate")]
+  if (anyNA(est)) return(NULL)   # the method failed on the Utah data
+  pars <- c(utah_known, as.list(est))
+  curves <- vapply(seq_len(N_REPS), function(i) simulate_from_parameters(sim, pars, seed = i),
+                   numeric(length(observed)))
+  data.frame(day = seq_along(observed) - KDZ, median = apply(curves, 1, median),
+             lower = apply(curves, 1, quantile, probs = 0.025),
+             upper = apply(curves, 1, quantile, probs = 0.975))
+})
+recon <- Filter(Negate(is.null), recon)
+write.csv(
+  do.call(rbind, lapply(names(recon), function(m) data.frame(method = m, recon[[m]], observed = observed))),
+  file.path(OUT_DIR, "utah_reconstruction.csv"), row.names = FALSE
+)
+```
+
+```{r utah-plot, fig.width=13, fig.height=6.5}
+day  <- seq_along(observed) - KDZ
+ylim <- range(c(observed, unlist(lapply(recon, function(r) c(r$lower, r$upper)))))
+op <- par(mfrow = c(2, ceiling(length(METHODS) / 2)), mar = c(4, 4, 3, 1))
+for (m in names(recon)) {
+  r <- recon[[m]]
+  # Each panel gets its own scale, so one method far off the data does not
+  # flatten the others.
+  ylim <- range(c(observed, r$lower, r$upper))
+  plot(day, r$median, type = "n", ylim = ylim, xlab = "day", ylab = "daily cases", main = m)
+  polygon(c(day, rev(day)), c(r$upper, rev(r$lower)), col = adjustcolor("red", 0.3), border = NA)
+  lines(day, r$median, col = "red", lwd = 2)
+  lines(day, observed, col = "blue", lwd = 2)
+}
+par(op)
+```
+
+Coverage is the share of observed days inside the 95% band. RMSE and MAE compare
+the median simulated curve with the observed cases.
+
+```{r utah-metrics}
+utah_fit <- do.call(rbind, lapply(names(recon), function(m) {
+  r <- recon[[m]]
+  data.frame(method = m,
+             coverage_pct = 100 * mean(observed >= r$lower & observed <= r$upper),
+             RMSE = sqrt(mean((r$median - observed)^2)),
+             MAE  = mean(abs(r$median - observed)))
+}))
+write.csv(utah_fit, file.path(OUT_DIR, "utah_fit_metrics.csv"), row.names = FALSE)
+knitr::kable(utah_fit, digits = 2, row.names = FALSE)
+```
+
+# Summary
+
+```{r summary}
+summary_table <- merge(
+  accuracy[accuracy$parameter == "R0", c("method", "MAE", "R2")],
+  timing[, c("method", "median_seconds")]
+)
+summary_table <- merge(summary_table, utah_fit[, c("method", "coverage_pct", "RMSE")], by = "method")
+summary_table$utah_R0 <- utah_est$R0[match(summary_table$method, utah_est$method)]
+names(summary_table) <- c("method", "R0_MAE", "R0_R2", "seconds_per_curve",
+                          "utah_coverage_pct", "utah_RMSE", "utah_R0")
+summary_table <- summary_table[match(METHODS, summary_table$method), ]
+summary_table$test_band_coverage_pct <-
+  band_summary$mean_coverage_pct[match(summary_table$method, band_summary$method)]
+write.csv(summary_table, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_table, digits = 3, row.names = FALSE)
+```
+
+How to read it:
+
+- **Judge mainly on `R0`.** In the SIR model the curve depends on `ptran` and
+  `crate` mostly through their product, so no method can pin down how `R0` splits
+  into the two; their individual errors are large for every method.
+- **Accuracy and cost together**: the search-based methods simulate the model
+  thousands of times per curve; the BiLSTM does not simulate at all.
+- **Band coverage** on the test curves: close to the true parameters' coverage
+  (about 95%) means the estimates reproduce the observed curves as well as the
+  truth does.
+- **Utah** has no true answer; the rebuilt curves show which estimates reproduce
+  the observed cases.
+
+# Saved files
+
+```{r save}
+saveRDS(
+  list(estimates = estimates, accuracy = accuracy, timing = timing, setup_time = setup,
+       break_even = break_even, head_to_head = head_to_head,
+       test_band_coverage = band_summary,
+       utah_estimates = utah_est, utah_fit = utah_fit, utah_recon = recon, summary = summary_table),
+  file.path(OUT_DIR, "results.rds")
+)
+writeLines(
+  c(capture.output(sessionInfo()), "", capture.output(reticulate::py_config())),
+  file.path(OUT_DIR, "session_info.txt")
+)
+files <- list.files(OUT_DIR, recursive = TRUE)
+files <- files[!startsWith(files, "method_runs/")]
+knitr::kable(data.frame(file = files, size_kb = round(file.size(file.path(OUT_DIR, files)) / 1024, 1)),
+             row.names = FALSE)
+```

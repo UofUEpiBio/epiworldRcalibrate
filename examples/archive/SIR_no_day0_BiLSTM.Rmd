@@ -1,0 +1,712 @@
+---
+title: "SIR BiLSTM trained on curves without day 0"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  n_sims: 75000
+  n_days: 61
+  epochs: 100
+  n_test: 1000
+  n_reps: 300
+  out_dir: "results/sir_no_day0_75k"
+  retrain: false
+  seeds: 122
+  stop_after: ""
+  sim_cores: 1
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+  sir_reference: "results/reproduce_pretrained_sir_75k/model_seed_122"
+  r0_min: 1.1
+  preval_max: 0.02
+  hyperparameters: ""
+  baseline_run: ""
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+It trains a SIR BiLSTM with the same recipe as the SIR reference model
+(`Reproduce_pretrained_SIR.Rmd`, 75,000 simulations), with one change: each curve
+holds **only new cases per day (days 1 to 61)**. The reference model's curves start
+with day 0, the number initially infected, which is a different kind of quantity
+from the new cases that follow. The network is told `n` and the recovery rate
+`recov`, and estimates `ptran`, `crate` and `R0`. It is then checked on:
+
+1. **New simulated SIR epidemics** (also without day 0) with known parameters.
+2. **Real Utah COVID-19 data**, where the estimates are used to rebuild the observed
+   epidemic curve, next to the SIR reference model.
+
+Everything is saved under `params$out_dir` (relative to this file): the training
+bank, the trained models, the test bank, every prediction and every results table.
+Re-knitting reuses the saved training bank and models, so it does not simulate or
+train again unless `retrain: true` is set or the settings change.
+
+`seeds` trains one model per network seed, all on the same training bank. The first
+is the main model; all of them are used to measure how much two trainings with the
+same recipe differ. `stop_after: "bank"` or `stop_after: "training"` stops the
+document after that step, so the slow steps can run as separate cluster jobs.
+`sim_cores` simulates the training bank on several cores. `hyperparameters` is
+an optional JSON file of tuned settings (from `tune_bilstm.py`) that replace the
+recipe's learning rate, batch size, network size, dropout and physics weight.
+`baseline_run` is an optional earlier run's output folder, trained on the same test
+bank, added to the run-to-run variation table for comparison.
+
+Run it from the `examples/` folder, for example:
+
+```r
+rmarkdown::render("SIR_no_day0_BiLSTM.Rmd", output_dir = "results/sir_no_day0_75k")
+```
+
+# Setup
+
+```{r packages}
+# Load the package from this repository (one folder up), so the run uses the
+# current source code rather than an older installed version.
+pkgload::load_all("..", quiet = TRUE)
+
+# Python environment with torch, scikit-learn and joblib.
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+
+# Scalers saved with an older scikit-learn load correctly but print a version
+# warning every time they are read.
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+N_SIMS    <- params$n_sims   # training simulations
+N_DAYS    <- params$n_days   # length of each epidemic curve
+EPOCHS    <- params$epochs
+N_TEST    <- params$n_test   # new simulated test curves
+N_REPS    <- params$n_reps   # simulations per model to rebuild the Utah curve
+RETRAIN   <- isTRUE(params$retrain)
+OUT_DIR   <- params$out_dir
+SIM_CORES <- as.integer(params$sim_cores)
+
+BANK_SEED <- 122                    # training bank
+
+# Training range of R0 and of the share initially infected (sir_simulator()
+# defaults: R0 1.1-5, 0.7-2%). A lower R0 lets the model describe flat or
+# declining epidemics; a higher starting share covers larger infected pools.
+PRIORS <- list(R0 = c(params$r0_min, 5), preval = c(0.007, params$preval_max))
+SEEDS     <- as.integer(params$seeds)  # network initialisation, one model each
+TEST_SEED <- 2025  # test bank: a different seed, so no curve is seen in training
+
+KNOWN   <- c("n", "recov")
+TARGETS <- c("ptran", "crate", "R0")
+
+# Same training recipe as the SIR reference model, which copied the pretrained
+# SIR model (Najafzadehkhoei et al. 2025, arXiv:2509.07013).
+LEARNING_RATE     <- 2.77e-4
+PHYSICS_WEIGHT    <- 1.77e-4
+BATCH_SIZE        <- 64
+HIDDEN_SIZE       <- 160
+NUM_LAYERS        <- 3
+DROPOUT           <- 0.5
+INCIDENCE_MAX     <- 10000                                 # daily cases are divided by this
+OUTPUT_ACTIVATION <- c("sigmoid", "softplus", "softplus")  # for ptran, crate, R0
+
+# Tuned settings, if given, replace the recipe values above.
+if (nzchar(params$hyperparameters)) {
+  hp <- jsonlite::read_json(params$hyperparameters)
+  LEARNING_RATE  <- hp$learning_rate
+  BATCH_SIZE     <- as.integer(hp$batch_size)
+  HIDDEN_SIZE    <- as.integer(hp$hidden_size)
+  NUM_LAYERS     <- as.integer(hp$num_layers)
+  DROPOUT        <- hp$dropout
+  PHYSICS_WEIGHT <- hp$physics_weight
+}
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+settings <- data.frame(
+  setting = c(
+    "training simulations", "days per curve", "epochs", "test curves",
+    "Utah reconstruction runs", "learning rate", "physics weight", "batch size",
+    "hidden units", "BiLSTM layers", "dropout",
+    "daily cases divided by", "output activations", "bank seed", "network seeds",
+    "test seed", "output folder"
+  ),
+  value = c(
+    N_SIMS, N_DAYS, EPOCHS, N_TEST, N_REPS, signif(LEARNING_RATE, 3), signif(PHYSICS_WEIGHT, 3),
+    BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, round(DROPOUT, 3),
+    INCIDENCE_MAX, paste(OUTPUT_ACTIVATION, collapse = ", "),
+    BANK_SEED, paste(SEEDS, collapse = ", "), TEST_SEED, normalizePath(OUT_DIR)
+  )
+)
+write.csv(settings, file.path(OUT_DIR, "settings.csv"), row.names = FALSE)
+knitr::kable(settings)
+```
+
+## Same recipe as the SIR reference model
+
+Only the curve is different`r if (nzchar(params$hyperparameters)) ", plus the tuned settings from the hyperparameter search" else ""`.
+
+| | SIR reference model | This document |
+|---|---|---|
+| Simulator | epiworldR SIR, `sir_simulator()` defaults | same, with `keep_day_zero = FALSE` |
+| Known inputs | `n`, `recov` | same |
+| Estimated | `ptran`, `crate`, `R0` | same |
+| Parameter ranges | `crate` 1-5, `R0` 1.1-5, 0.7-2% initially infected | `crate` 1-5, `R0` `r PRIORS$R0[1]`-`r PRIORS$R0[2]`, `r 100 * PRIORS$preval[1]`-`r 100 * PRIORS$preval[2]`% initially infected |
+| Curve | 61 values: day 0 (initial infected) to day 60 | `r N_DAYS` values: new cases on days 1 to `r N_DAYS` |
+| Training simulations | 75,000: 60,000 for training, the rest for validation | `r format(N_SIMS, big.mark = ",")`: `r format(round(0.8 * N_SIMS), big.mark = ",")` for training |
+| Network | 3-layer BiLSTM, 160 hidden units, dropout 0.5, dense → 64 → 3 | `r NUM_LAYERS`-layer BiLSTM, `r HIDDEN_SIZE` hidden units, dropout `r round(DROPOUT, 3)`, dense → 64 → 3 |
+| Learning rate, batch size, physics weight | 2.77e-4, 64, 1.77e-4 | `r signif(LEARNING_RATE, 3)`, `r BATCH_SIZE`, `r signif(PHYSICS_WEIGHT, 3)` |
+| Epochs | 100, keeps the epoch with the lowest validation loss | `r EPOCHS`, same rule |
+| Daily cases divided by | 10,000 | `r format(INCIDENCE_MAX, big.mark = ",")` |
+| Output layer | sigmoid for `ptran`, softplus for `crate` and `R0` | `r paste(OUTPUT_ACTIVATION, collapse = ", ")` |
+| Post-processing | `crate = R0 * recov / ptran` | same |
+
+Dropping day 0 makes every value the same kind of quantity, new cases per day,
+which is also what real surveillance data report. The starting number of infected
+is no longer part of the curve, so the network has to read it from the early days.
+
+# Step 1: simulate the training bank
+
+The bank is saved as two CSV files. If a bank of the same size is already saved, it
+is read back instead of simulated again. With `sim_cores` above 1 the bank is
+simulated in that many chunks at once; chunk `k` uses seed `BANK_SEED + k - 1`.
+
+```{r training-bank}
+bank_dir   <- file.path(OUT_DIR, "training_bank")
+theta_file <- file.path(bank_dir, "sir_theta.csv")
+obs_file   <- file.path(bank_dir, "sir_observations.csv")
+
+have_bank <- file.exists(theta_file) && file.exists(obs_file) &&
+  nrow(read.csv(theta_file)) == N_SIMS
+
+if (have_bank) {
+  train_bank <- read_training_data(theta_file, obs_file, type = "SIR")
+} else {
+  sim_time <- system.time({
+    if (SIM_CORES > 1) {
+      sizes  <- diff(round(seq(0, N_SIMS, length.out = SIM_CORES + 1)))
+      chunks <- parallel::mclapply(seq_along(sizes), function(k) {
+        generate_sir_training_data(n_sims = sizes[k], ndays = N_DAYS, seed = BANK_SEED + k - 1,
+                                   priors = PRIORS, keep_day_zero = FALSE)
+      }, mc.cores = SIM_CORES)
+      failed <- vapply(chunks, inherits, logical(1), what = "try-error")
+      if (any(failed)) stop("Simulation chunk(s) failed: ", paste(which(failed), collapse = ", "))
+      train_bank <- new_training_data(
+        parameters   = do.call(rbind, lapply(chunks, `[[`, "theta")),
+        observations = do.call(rbind, lapply(chunks, `[[`, "observations")),
+        type         = "SIR",
+        source       = "epiworldR ModelSIRCONN"
+      )
+    } else {
+      train_bank <- generate_sir_training_data(n_sims = N_SIMS, ndays = N_DAYS, seed = BANK_SEED,
+                                               priors = PRIORS, keep_day_zero = FALSE)
+    }
+  })
+  save_training_data(train_bank, name = "sir", output_dir = bank_dir)
+  writeLines(
+    as.character(round(sim_time[["elapsed"]])),
+    file.path(bank_dir, "simulation_seconds.txt")
+  )
+}
+
+train_bank
+summary(train_bank$theta[, c(KNOWN, TARGETS, "initial_infected")])
+```
+
+```{r stop-after-bank, include=FALSE}
+if (identical(params$stop_after, "bank")) knitr::knit_exit()
+```
+
+# Step 2: train and save the model
+
+One model per seed in `seeds`, each saved in its own folder. A model is retrained
+when `retrain: true`, when the bank was just simulated, or when the saved model used
+different settings.
+
+```{r train}
+model_dirs <- file.path(OUT_DIR, paste0("model_seed_", SEEDS))
+model_dir  <- model_dirs[1]   # the main model, looked at in detail below
+
+model_matches <- function(dir, seed) {
+  config_file <- file.path(dir, "model_config.json")
+  if (!file.exists(file.path(dir, "model.pt")) || !file.exists(config_file)) {
+    return(FALSE)
+  }
+  cfg <- jsonlite::read_json(config_file)
+  cfg$epochs == EPOCHS &&
+    cfg$seed == seed &&
+    identical(unlist(cfg$known_names), KNOWN) &&
+    cfg$batch_size == BATCH_SIZE &&
+    cfg$hidden_size == HIDDEN_SIZE &&
+    cfg$num_layers == NUM_LAYERS &&
+    isTRUE(all.equal(cfg$dropout, DROPOUT)) &&
+    isTRUE(all.equal(cfg$learning_rate, LEARNING_RATE)) &&
+    isTRUE(all.equal(cfg$physics_weight, PHYSICS_WEIGHT)) &&
+    isTRUE(all.equal(cfg$incidence_max, INCIDENCE_MAX)) &&
+    identical(unlist(cfg$output_activations), OUTPUT_ACTIVATION)
+}
+
+for (i in seq_along(SEEDS)) {
+  if (RETRAIN || !have_bank || !model_matches(model_dirs[i], SEEDS[i])) {
+    train_time <- system.time(
+      train_bilstm_calibrator(
+        name             = "sir",
+        known_names      = KNOWN,
+        target_names     = TARGETS,
+        type             = "SIR",
+        parameter_file   = theta_file,
+        observation_file = obs_file,
+        output_dir       = model_dirs[i],
+        epochs           = EPOCHS,
+        batch_size       = BATCH_SIZE,
+        learning_rate    = LEARNING_RATE,
+        seed             = SEEDS[i],
+        hidden_size      = HIDDEN_SIZE,
+        num_layers       = NUM_LAYERS,
+        dropout          = DROPOUT,
+        physics_weight   = PHYSICS_WEIGHT,
+        incidence_max    = INCIDENCE_MAX,
+        output_activation = OUTPUT_ACTIVATION,
+        device           = params$device
+      )
+    )
+    writeLines(
+      as.character(round(train_time[["elapsed"]])),
+      file.path(model_dirs[i], "training_seconds.txt")
+    )
+  }
+}
+
+cfg <- jsonlite::read_json(file.path(model_dir, "model_config.json"))
+cat(
+  "Main model: seed", SEEDS[1], "\n",
+  "Best epoch:", cfg$best_epoch, "of", cfg$epochs, "\n",
+  "Trained on:", if (is.null(cfg$device)) "cpu" else cfg$device, "\n",
+  "Training time:",
+  round(as.numeric(readLines(file.path(model_dir, "training_seconds.txt"))) / 3600, 2),
+  "hours\n"
+)
+```
+
+```{r stop-after-training, include=FALSE}
+if (identical(params$stop_after, "training")) knitr::knit_exit()
+```
+
+The trainer's own check on its 20% validation split. These are the raw network
+outputs, before `crate` is recomputed from `R0` and `ptran`:
+
+```{r validation}
+knitr::kable(
+  read.csv(file.path(model_dir, "validation_metrics.csv")),
+  digits = 3, caption = "Validation metrics"
+)
+```
+
+Left: the loss the trainer minimises. Right: only the `R0` part of the validation
+loss. The trainer keeps the epoch with the lowest total validation loss (grey line),
+which is mostly `crate` error (see below), so it need not be the epoch where `R0`
+was best (blue line).
+
+```{r history, fig.width=10, fig.height=4}
+history <- read.csv(file.path(model_dir, "training_history.csv"))
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+matplot(
+  history$epoch, history[, c("train_loss", "validation_loss")],
+  type = "l", lty = 1, lwd = 2, col = c("black", "red"), log = "y",
+  xlab = "epoch", ylab = "loss (log scale)", main = "Training history"
+)
+abline(v = cfg$best_epoch, lty = 2, col = "grey40")
+legend("topright", bty = "n", lwd = 2, col = c("black", "red", "grey40"), lty = c(1, 1, 2),
+       legend = c("train", "validation", "kept epoch"))
+
+plot(
+  history$epoch, history$validation_mse_R0, type = "l", lwd = 2, col = "red", log = "y",
+  xlab = "epoch", ylab = "scaled MSE (log scale)", main = "R0 part of the validation loss"
+)
+abline(v = cfg$best_epoch, lty = 2, col = "grey40")
+abline(v = which.min(history$validation_mse_R0), lty = 3, lwd = 2, col = "blue")
+legend("topright", bty = "n", lwd = 2, col = c("grey40", "blue"), lty = c(2, 3),
+       legend = c("kept epoch", "lowest R0 error"))
+par(op)
+```
+
+The loss is the average of the three parameters' squared errors on the 0-1 scale
+the network is trained on. Splitting the kept model's validation loss by parameter
+shows where it comes from:
+
+```{r loss-split}
+joblib <- reticulate::import("joblib")
+val    <- read.csv(file.path(model_dir, "validation_predictions.csv"))
+target_range <- as.numeric(joblib$load(file.path(model_dir, "scaler_targets.pkl"))$data_range_)
+
+loss_split <- data.frame(
+  parameter  = TARGETS,
+  scaled_MSE = sapply(seq_along(TARGETS), function(j) {
+    p <- TARGETS[j]
+    mean(((val[[paste0("pred_", p)]] - val[[paste0("true_", p)]]) / target_range[j])^2)
+  })
+)
+loss_split$share_of_loss_pct <- 100 * loss_split$scaled_MSE / sum(loss_split$scaled_MSE)
+knitr::kable(loss_split, digits = 4, row.names = FALSE)
+```
+
+Always guessing the middle of the range would give a scaled MSE of about
+1/12 = 0.083, so an error close to that means the curve tells the network almost
+nothing about that parameter (see the Summary).
+
+## Ranges the model was trained on
+
+The min-max scalers saved with the model show the parameter space it has seen.
+
+```{r scaler-ranges}
+known_scaler  <- joblib$load(file.path(model_dir, "scaler_additional.pkl"))
+target_scaler <- joblib$load(file.path(model_dir, "scaler_targets.pkl"))
+cases_scaler  <- joblib$load(file.path(model_dir, "scaler_incidence.pkl"))
+
+scalers <- data.frame(
+  quantity = c(KNOWN, TARGETS, "daily cases divided by", "rows used to fit scalers"),
+  min      = c(as.numeric(known_scaler$data_min_), as.numeric(target_scaler$data_min_), NA, NA),
+  max      = c(as.numeric(known_scaler$data_max_), as.numeric(target_scaler$data_max_),
+               as.numeric(cases_scaler$data_max_)[1], as.numeric(known_scaler$n_samples_seen_))
+)
+write.csv(scalers, file.path(OUT_DIR, "scaler_ranges.csv"), row.names = FALSE)
+knitr::kable(scalers, digits = 4, row.names = FALSE)
+```
+
+# Step 3: new simulated epidemics
+
+`r format(N_TEST, big.mark = ",")` new curves from the same simulator, with a
+different seed from the training bank. The model gets the true `n` and `recov` of
+each curve, and recomputes `crate` from `R0` and `ptran`.
+
+```{r test-bank}
+test_dir        <- file.path(OUT_DIR, "test_bank")
+test_theta_file <- file.path(test_dir, "sir_theta.csv")
+test_obs_file   <- file.path(test_dir, "sir_observations.csv")
+
+if (file.exists(test_theta_file) && nrow(read.csv(test_theta_file)) == N_TEST) {
+  test_bank <- read_training_data(test_theta_file, test_obs_file, type = "SIR")
+} else {
+  test_bank <- generate_sir_training_data(n_sims = N_TEST, ndays = N_DAYS, seed = TEST_SEED,
+                                          priors = PRIORS, keep_day_zero = FALSE)
+  save_training_data(test_bank, name = "sir", output_dir = test_dir)
+}
+```
+
+```{r test-predict}
+new_cal <- bilstm_calibrator(model_dir, known_names = KNOWN, type = "SIR", name = "SIR BiLSTM (no day 0)")
+
+estimate_bank <- function(cal, bank) {
+  est <- vapply(seq_len(nrow(bank$theta)), function(i) {
+    calibrate(
+      bank$observations[i, ], cal,
+      n = bank$theta$n[i], recov = bank$theta$recov[i]
+    )[TARGETS]
+  }, numeric(length(TARGETS)))
+  as.data.frame(t(est))
+}
+
+pred_new <- estimate_bank(new_cal, test_bank)
+truth     <- test_bank$theta[, TARGETS]
+
+test_predictions <- data.frame(
+  curve = seq_len(N_TEST),
+  test_bank$theta[, KNOWN],
+  setNames(truth, paste0("true_", TARGETS)),
+  setNames(pred_new, paste0("estimated_", TARGETS))
+)
+write.csv(test_predictions, file.path(OUT_DIR, "test_predictions.csv"), row.names = FALSE)
+```
+
+## Accuracy
+
+Lower MAE and RMSE and higher R² are better. Bias is the mean of estimate minus truth.
+
+```{r test-metrics}
+accuracy <- function(pred, model) {
+  do.call(rbind, lapply(TARGETS, function(p) {
+    err <- pred[[p]] - truth[[p]]
+    data.frame(
+      parameter = p,
+      model     = model,
+      MAE       = mean(abs(err)),
+      RMSE      = sqrt(mean(err^2)),
+      bias      = mean(err),
+      R2        = 1 - sum(err^2) / sum((truth[[p]] - mean(truth[[p]]))^2)
+    )
+  }))
+}
+
+test_metrics <- accuracy(pred_new, "SIR BiLSTM (no day 0)")
+write.csv(test_metrics, file.path(OUT_DIR, "test_metrics.csv"), row.names = FALSE)
+knitr::kable(test_metrics, digits = 3, row.names = FALSE)
+```
+
+```{r test-scatter, fig.width=10, fig.height=3.8}
+op <- par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+for (p in TARGETS) {
+  lim <- range(truth[[p]], pred_new[[p]])
+  plot(truth[[p]], pred_new[[p]], pch = 16, cex = 0.5, col = adjustcolor("black", 0.35),
+       xlim = lim, ylim = lim, xlab = paste("true", p), ylab = paste("estimated", p),
+       main = p)
+  abline(0, 1, col = "red", lwd = 2)
+}
+par(op)
+```
+
+# Step 4: real Utah COVID-19 data
+
+The last 61 days of statewide daily cases. The file is downloaded once and saved,
+so later runs use the same data.
+
+```{r utah-data}
+utah_file <- file.path(OUT_DIR, "utah_covid_last61days.csv")
+
+if (!file.exists(utah_file)) {
+  zip_file <- tempfile(fileext = ".zip")
+  download.file(
+    "https://coronavirus-dashboard.utah.gov/Utah_COVID19_data.zip",
+    zip_file, mode = "wb", quiet = TRUE
+  )
+  target <- grep("Trends_Epidemic", unzip(zip_file, list = TRUE)$Name, value = TRUE)[1]
+  utah <- read.csv(unz(zip_file, target))
+  unlink(zip_file)
+  utah$Date <- as.Date(utah$Date)
+  utah <- tail(utah[order(utah$Date), c("Date", "Daily.Cases")], 61)
+  write.csv(utah, utah_file, row.names = FALSE)
+}
+
+utah     <- read.csv(utah_file)
+observed <- utah$Daily.Cases
+stopifnot(length(observed) == N_DAYS)
+cat("Dates:", min(utah$Date), "to", max(utah$Date), "\n")
+summary(observed)
+```
+
+The known values are the same as in the SIR reference model, `n = 5000` and
+`recov = 1/7`. The SIR reference model (with day 0) is shown next to the new model
+for comparison.
+
+```{r utah-estimates}
+UTAH_N     <- 5000
+UTAH_RECOV <- 1 / 7
+
+have_sir <- nzchar(params$sir_reference) &&
+  file.exists(file.path(params$sir_reference, "model.pt"))
+if (have_sir) {
+  sir_cal <- bilstm_calibrator(params$sir_reference, known_names = c("n", "recov"), type = "SIR")
+}
+
+utah_estimates <- rbind(
+  `No day 0` = calibrate(observed, new_cal, n = UTAH_N, recov = UTAH_RECOV)[TARGETS],
+  if (have_sir) rbind(
+    `SIR reference` = calibrate(observed, sir_cal, n = UTAH_N, recov = UTAH_RECOV)[TARGETS]
+  )
+)
+write.csv(
+  data.frame(model = rownames(utah_estimates), utah_estimates),
+  file.path(OUT_DIR, "utah_estimates.csv"), row.names = FALSE
+)
+knitr::kable(utah_estimates, digits = 4)
+```
+
+## Rebuilding the epidemic curve
+
+Each model's estimates are run `r N_REPS` times through its own simulator (a
+different seed each time). The starting cases are set from the first observed day:
+
+- **No day 0:** the number infected at the start is taken as the first day's
+  cases times the infectious period (`1 / recov` = 7 days): the infected pool
+  when about as many people fall ill each day as recover, as the flat Utah curve
+  suggests. This is the same rule as for the SEIR model.
+- **SIR reference:** day 0 of the curve is the initial number of infected, as in
+  the SIR reference document.
+
+```{r utah-reconstruct}
+simulate_many <- function(sim, pars) {
+  curves <- vapply(
+    seq_len(N_REPS),
+    function(i) simulate_from_parameters(sim, pars, seed = i),
+    numeric(length(observed))
+  )
+  data.frame(
+    day    = seq_along(observed),
+    median = apply(curves, 1, median),
+    lower  = apply(curves, 1, quantile, probs = 0.025),
+    upper  = apply(curves, 1, quantile, probs = 0.975)
+  )
+}
+
+recon <- list(
+  `No day 0` = simulate_many(sir_simulator(ndays = N_DAYS, keep_day_zero = FALSE), list(
+    n = UTAH_N, recov = UTAH_RECOV,
+    preval = observed[1] / (UTAH_RECOV * UTAH_N),
+    ptran = utah_estimates["No day 0", "ptran"], crate = utah_estimates["No day 0", "crate"]
+  ))
+)
+if (have_sir) {
+  recon[["SIR reference"]] <- simulate_many(sir_simulator(ndays = N_DAYS - 1), list(
+    n = UTAH_N, recov = UTAH_RECOV, preval = observed[1] / UTAH_N,
+    ptran = utah_estimates["SIR reference", "ptran"],
+    crate = utah_estimates["SIR reference", "crate"]
+  ))
+}
+
+write.csv(
+  do.call(rbind, lapply(names(recon), function(m) data.frame(model = m, recon[[m]], observed = observed))),
+  file.path(OUT_DIR, "utah_reconstruction.csv"), row.names = FALSE
+)
+```
+
+```{r utah-plot, fig.width=10, fig.height=4.5}
+day  <- seq_along(observed)
+ylim <- range(c(observed, unlist(lapply(recon, function(r) c(r$lower, r$upper)))))
+
+op <- par(mfrow = c(1, length(recon)), mar = c(4, 4, 3, 1))
+for (m in names(recon)) {
+  r <- recon[[m]]
+  plot(day, r$median, type = "n", ylim = ylim, xlab = "day", ylab = "daily cases",
+       main = paste(m, "model"))
+  polygon(c(day, rev(day)), c(r$upper, rev(r$lower)),
+          col = adjustcolor("red", alpha.f = 0.3), border = NA)
+  lines(day, r$median, col = "red", lwd = 2)
+  lines(day, observed, col = "blue", lwd = 2)
+  points(day, observed, col = "blue", pch = 16, cex = 0.6)
+  legend("topright", bty = "n", lwd = 2, col = c("red", "blue"),
+         legend = c("simulated median (95% band)", "observed"))
+}
+par(op)
+```
+
+Coverage is the share of observed days inside the 95% band. RMSE and MAE compare
+the median simulated curve with the observed cases.
+
+```{r utah-metrics}
+utah_fit <- do.call(rbind, lapply(names(recon), function(m) {
+  r <- recon[[m]]
+  data.frame(
+    model        = m,
+    coverage_pct = 100 * mean(observed >= r$lower & observed <= r$upper),
+    RMSE         = sqrt(mean((r$median - observed)^2)),
+    MAE          = mean(abs(r$median - observed))
+  )
+}))
+write.csv(utah_fit, file.path(OUT_DIR, "utah_fit_metrics.csv"), row.names = FALSE)
+knitr::kable(utah_fit, digits = 2, row.names = FALSE)
+```
+
+# Run-to-run variation
+
+The same recipe and the same training bank, trained with different network seeds
+(different random starting weights and training order). The spread shows how much of
+any difference between two trainings is chance.
+
+```{r seeds}
+seed_row <- function(model, pred, cal, best_epoch, lowest_R0_epoch) {
+  err <- pred$R0 - truth$R0
+  data.frame(
+    model           = model,
+    kept_epoch      = best_epoch,
+    lowest_R0_epoch = lowest_R0_epoch,
+    R0_MAE          = mean(abs(err)),
+    R0_R2           = 1 - sum(err^2) / sum((truth$R0 - mean(truth$R0))^2),
+    ptran_MAE       = mean(abs(pred$ptran - truth$ptran)),
+    crate_MAE       = mean(abs(pred$crate - truth$crate)),
+    utah_R0         = calibrate(observed, cal, n = UTAH_N, recov = UTAH_RECOV)[["R0"]]
+  )
+}
+
+seed_preds <- list()
+seed_table <- NULL
+for (i in seq_along(SEEDS)) {
+  cal  <- bilstm_calibrator(model_dirs[i], known_names = KNOWN, type = "SIR")
+  pred <- if (i == 1) pred_new else estimate_bank(cal, test_bank)
+  hist <- read.csv(file.path(model_dirs[i], "training_history.csv"))
+  seed_preds[[paste0("seed_", SEEDS[i])]] <- pred
+  seed_table <- rbind(seed_table, seed_row(
+    paste("No day 0, seed", SEEDS[i]), pred, cal,
+    best_epoch      = jsonlite::read_json(file.path(model_dirs[i], "model_config.json"))$best_epoch,
+    lowest_R0_epoch = which.min(hist$validation_mse_R0)
+  ))
+}
+
+write.csv(seed_table, file.path(OUT_DIR, "seed_variation.csv"), row.names = FALSE)
+
+# An earlier run on the same test bank, for comparison.
+if (nzchar(params$baseline_run)) {
+  baseline <- read.csv(file.path(params$baseline_run, "seed_variation.csv"))
+  baseline$model <- paste0(basename(params$baseline_run), ": ", baseline$model)
+  seed_table <- rbind(seed_table, baseline)
+}
+write.csv(
+  data.frame(curve = seq_len(N_TEST), true_R0 = truth$R0,
+             sapply(seed_preds, function(p) p$R0)),
+  file.path(OUT_DIR, "seed_test_predictions_R0.csv"), row.names = FALSE
+)
+knitr::kable(seed_table, digits = 4, row.names = FALSE)
+```
+
+# Summary
+
+```{r summary}
+summary_table <- test_metrics[, c("parameter", "MAE", "R2")]
+summary_table$utah_no_day0 <- utah_estimates["No day 0", TARGETS]
+if (have_sir) summary_table$utah_SIR_reference <- utah_estimates["SIR reference", TARGETS]
+write.csv(summary_table, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_table, digits = 3, row.names = FALSE)
+```
+
+How to read it:
+
+- **Judge mainly on `R0`.** The epidemic depends on `ptran` and
+  `crate` mostly through their product (`R0 * recov`), so the curve pins down `R0`
+  but not how it splits into `ptran` and `crate`.
+- **MAE and R²** on the simulated curves say how well the model recovers the
+  parameters when the data come from the model it was trained on.
+- **Run-to-run variation** shows how much a retrained model with the same recipe
+  would differ, on simulated curves and on Utah.
+- **Utah columns** compare the new model and the SIR reference model on the same
+  real data. The Utah series is low and flat, so both models are extrapolating from
+  what they were trained on.
+
+# Saved files
+
+```{r save}
+saveRDS(
+  list(
+    settings         = settings,
+    scalers          = scalers,
+    test_predictions = test_predictions,
+    test_metrics     = test_metrics,
+    utah             = utah,
+    utah_estimates   = utah_estimates,
+    utah_fit         = utah_fit,
+    utah_recon       = recon,
+    seed_variation   = seed_table,
+    summary          = summary_table
+  ),
+  file.path(OUT_DIR, "results.rds")
+)
+
+writeLines(
+  c(capture.output(sessionInfo()), "", capture.output(reticulate::py_config())),
+  file.path(OUT_DIR, "session_info.txt")
+)
+
+files <- list.files(OUT_DIR, recursive = TRUE)
+knitr::kable(
+  data.frame(file = files, size_kb = round(file.size(file.path(OUT_DIR, files)) / 1024, 1)),
+  row.names = FALSE
+)
+```

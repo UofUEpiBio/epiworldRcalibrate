@@ -1,0 +1,688 @@
+---
+title: "SIR v6: any window length (30-365 days) and reported cases"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  n_sims: 300000
+  n_days: 365
+  window_min: 30
+  window_max: 365
+  stop_zeros: 7
+  epochs: 100
+  n_test: 1000
+  n_calib: 100000
+  n_reps: 300
+  k_neighbors: 500
+  min_cases: 20
+  out_dir: "results/sir_v6"
+  bank_dir: ""
+  retrain: false
+  seeds: 122
+  ensemble: false
+  stop_after: ""
+  sim_cores: 1
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+  hyperparameters: "results/seir_vl_tuning/best_params.json"
+  grad_clip: 1
+  sir_vl_models: "results/sir_variable_length_tuned/model_seed_122,results/sir_variable_length_tuned/model_seed_1,results/sir_variable_length_tuned/model_seed_2"
+  sir_61_models: "results/sir_no_day0_75k/model_seed_122,results/sir_no_day0_75k/model_seed_1,results/sir_no_day0_75k/model_seed_2"
+  seir_v6_dir: "results/seir_v6"
+  real_data_dir: "results/seir_real_data_test/data"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+The SIR version of SEIR v6 (`SEIR_v6_BiLSTM.Rmd`): one SIR BiLSTM that reads **30 to 365
+days from the beginning, middle or end** of an epidemic and is trained on **reported
+cases** (a share of the cases, a weekly pattern and extra noise, drawn anew every time).
+
+| | SIR, any length (before) | SIR, 61 days without day 0 (before) | **SIR v6** |
+|---|---|---|---|
+| Days it reads | 30 to 365, any position | 61, from the beginning | **30 to 365, any position** |
+| Training curves | every new case | every new case | **reported cases, new noise every time** |
+| Ranges | R0 1.1-5, 0.7-2% initially infected | same | **R0 0.8-5, 0.1-40% initially infected** |
+| Also estimates | - | - | reported share, noise, weekday swing, shares infectious and recovered at the window start |
+| R0 range | no | no | **yes** |
+
+Known values: `n` and `recov`. Everything else (training steps, R0 range, real data) is
+done as in SEIR v6, with the same network settings, and the last sections put SIR v6 next
+to SEIR v6 on the same real data.
+
+```r
+rmarkdown::render("SIR_v6_BiLSTM.Rmd", output_dir = "results/sir_v6")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+N_SIMS     <- params$n_sims
+N_DAYS     <- params$n_days
+WINDOW_MIN <- params$window_min
+WINDOW_MAX <- params$window_max
+STOP_ZEROS <- params$stop_zeros
+EPOCHS     <- params$epochs
+N_TEST     <- params$n_test
+N_CALIB    <- params$n_calib
+N_REPS     <- params$n_reps
+K_NB       <- params$k_neighbors
+MIN_CASES  <- params$min_cases
+OUT_DIR    <- params$out_dir
+BANK_DIR   <- if (nzchar(params$bank_dir)) params$bank_dir else file.path(OUT_DIR, "training_bank")
+SIM_CORES  <- as.integer(params$sim_cores)
+SEEDS      <- as.integer(params$seeds)
+ENSEMBLE   <- isTRUE(params$ensemble) && length(SEEDS) > 1
+RETRAIN    <- isTRUE(params$retrain)
+
+BANK_SEED <- 122; TEST_SEED <- 2025; CALIB_SEED <- 7
+
+KNOWN   <- c("n", "recov")
+TARGETS <- c("ptran", "R0", "log_report_rate", "log_overdispersion", "weekday_sd")
+STATES  <- c("infected_share", "recovered_share")
+STATE_TARGETS <- paste0("log_", STATES)
+STATE_OFFSET  <- 1e-4   # log(share + 1e-4): shares can be 0; 1e-4 is half a person in 5,000
+OUTPUT_ACTIVATION   <- c("sigmoid", "softplus", "sigmoid", "sigmoid", "sigmoid", rep("sigmoid", 2))
+INCIDENCE_MAX       <- 10000
+INCIDENCE_TRANSFORM <- "log1p"
+
+# preval (share initially infected) is drawn on the log scale below.
+PRIORS <- list(
+  n = c(5000, 10000), recov = c(0.071, 0.25), crate = c(1, 5), R0 = c(0.8, 5), preval = c(0.001, 0.4),
+  report_rate = c(0.05, 1), overdispersion = c(0.001, 0.3), weekday_sd = c(0, 0.35)
+)
+
+# The same network settings as SEIR v6 (tuned search for variable-length SEIR).
+# The physics penalty needs a crate output, so it is off.
+hp <- jsonlite::read_json(params$hyperparameters)
+LEARNING_RATE <- hp$learning_rate
+BATCH_SIZE    <- as.integer(hp$batch_size)
+HIDDEN_SIZE   <- as.integer(hp$hidden_size)
+NUM_LAYERS    <- as.integer(hp$num_layers)
+DROPOUT       <- hp$dropout
+GRAD_CLIP     <- params$grad_clip
+
+GRID_LENGTHS <- c(30, 61, 90, 120, 180, 270, 365)
+POSITIONS    <- c("beginning", "middle", "end")
+VL_DIRS  <- trimws(strsplit(params$sir_vl_models, ",")[[1]])
+F61_DIRS <- trimws(strsplit(params$sir_61_models, ",")[[1]])
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+settings <- data.frame(
+  setting = c("training simulations", "days simulated", "window lengths", "epochs", "test curves",
+              "calibration windows (for the R0 range)", paste("range of", names(PRIORS)),
+              "learning rate", "batch size", "hidden units", "BiLSTM layers", "dropout", "gradient clipping",
+              "informative days end after", "network input", "network seeds"),
+  value = c(N_SIMS, N_DAYS, paste(WINDOW_MIN, "to", WINDOW_MAX), EPOCHS, N_TEST, N_CALIB,
+            vapply(PRIORS, function(r) paste(signif(r, 3), collapse = " to "), ""),
+            signif(LEARNING_RATE, 3), BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, round(DROPOUT, 3), GRAD_CLIP,
+            paste(STOP_ZEROS, "days without cases"), "log(1 + cases) / log(1 + 10,000)",
+            paste(SEEDS, collapse = ", "))
+)
+write.csv(settings, file.path(OUT_DIR, "settings.csv"), row.names = FALSE)
+knitr::kable(settings)
+```
+
+# Step 1: simulate
+
+```{r simulate}
+informative_days <- function(curve, k = STOP_ZEROS) {
+  r   <- rle(as.numeric(curve) == 0)
+  hit <- which(r$values & r$lengths >= k)[1]
+  if (is.na(hit)) length(curve) else sum(r$lengths[seq_len(hit)]) - r$lengths[hit]
+}
+
+# True daily new cases and the shares infectious and recovered at the start of
+# each day; the reporting parameters are drawn too (applied later). The share
+# initially infected is drawn on the log scale.
+simulate_states <- function(n_sims, seed) {
+  base <- sir_simulator(ndays = N_DAYS, priors = PRIORS, keep_day_zero = FALSE)
+  sim  <- new_simulator(
+    sample_parameters = function(n_sims) {
+      th <- base$sample_parameters(n_sims)
+      th$initial_infected <- pmax(1, round(log_uniform(n_sims, PRIORS$preval) * th$n))
+      th$preval <- th$initial_infected / th$n
+      th
+    },
+    run = function(parameters, seed) {
+      m <- epiworldR::ModelSIRCONN(
+        name = "sim", n = parameters$n, prevalence = parameters$preval,
+        contact_rate = parameters$crate, transmission_rate = parameters$ptran, recovery_rate = parameters$recov
+      )
+      epiworldR::verbose_off(m)
+      epiworldR::run(m, ndays = N_DAYS, seed = seed)
+      h <- epiworldR::get_hist_total(m)
+      h <- h[order(h$date), ]
+      at_start <- function(state) {
+        x <- h$counts[h$state == state] / parameters$n
+        c(x, rep(x[length(x)], N_DAYS))[seq_len(N_DAYS)]
+      }
+      c(get_incidence(m, N_DAYS, keep_day_zero = FALSE), at_start("Infected"), at_start("Recovered"))
+    },
+    type = "SIR"
+  )
+  simulate_training_data(sim, n_sims = n_sims, seed = seed)
+}
+
+simulate_bank <- function(n_keep, seed, reported) {
+  n_draw <- ceiling(1.15 * n_keep)
+  sizes  <- diff(round(seq(0, n_draw, length.out = max(SIM_CORES, 1) + 1)))
+  chunks <- parallel::mclapply(seq_along(sizes), function(k) simulate_states(sizes[k], seed + k - 1),
+                               mc.cores = max(SIM_CORES, 1))
+  failed <- vapply(chunks, inherits, logical(1), what = "try-error")
+  if (any(failed)) stop("Simulation chunk(s) failed: ", paste(which(failed), collapse = ", "))
+  theta <- do.call(rbind, lapply(chunks, `[[`, "theta"))
+  part  <- function(j) do.call(rbind, lapply(chunks, function(x) x$observations[, j * N_DAYS + seq_len(N_DAYS), drop = FALSE]))
+  cases <- part(0)
+  states <- setNames(lapply(seq_along(STATES), part), STATES)
+  rm(chunks)
+  if (reported) {
+    set.seed(seed)
+    cases <- t(vapply(seq_len(nrow(cases)), function(i)
+      observe_cases(cases[i, ], theta$report_rate[i], theta$overdispersion[i], theta$weekday_sd[i]),
+      numeric(N_DAYS)))
+    n_reported <- rowSums(cases)
+  } else {
+    n_reported <- theta$report_rate * rowSums(cases)
+  }
+  keep <- which(n_reported >= MIN_CASES)
+  if (length(keep) < n_keep) stop("Only ", length(keep), " epidemics with enough cases.")
+  keep <- keep[seq_len(n_keep)]
+  theta <- theta[keep, ]
+  rownames(theta) <- NULL
+  for (v in c("preval", "report_rate", "overdispersion")) theta[[paste0("log_", v)]] <- log(theta[[v]])
+  list(theta = theta, cases = cases[keep, , drop = FALSE],
+       states = lapply(states, function(s) s[keep, , drop = FALSE]),
+       dropped_share = mean(n_reported < MIN_CASES))
+}
+
+write_matrix <- function(x, file) data.table::fwrite(as.data.frame(round(x, 5)), file)
+train_files <- c(theta = file.path(BANK_DIR, "sir_theta.csv"), cases = file.path(BANK_DIR, "sir_observations.csv"),
+                 setNames(file.path(BANK_DIR, paste0("sir_", STATE_TARGETS, ".csv")), STATE_TARGETS))
+
+fresh_bank <- FALSE
+if (!all(file.exists(train_files)) || nrow(data.table::fread(train_files[["theta"]], select = 1L)) != N_SIMS) {
+  t_sim <- system.time(b <- simulate_bank(N_SIMS, BANK_SEED, reported = FALSE))
+  dir.create(BANK_DIR, recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(b$theta, train_files[["theta"]])
+  write_matrix(b$cases, train_files[["cases"]])
+  for (k in seq_along(STATES)) write_matrix(log(b$states[[k]] + STATE_OFFSET), train_files[[STATE_TARGETS[k]]])
+  writeLines(as.character(c(round(t_sim[["elapsed"]]), b$dropped_share)), file.path(BANK_DIR, "simulation_seconds_and_dropped_share.txt"))
+  rm(b); gc()
+  fresh_bank <- TRUE
+}
+
+test_file  <- file.path(OUT_DIR, "test_bank.rds")
+calib_file <- file.path(OUT_DIR, "calibration_windows.rds")
+if (!file.exists(test_file)) saveRDS(simulate_bank(N_TEST, TEST_SEED, reported = TRUE), test_file)
+if (!file.exists(calib_file)) {
+  t_cal <- system.time(b <- simulate_bank(N_CALIB, CALIB_SEED, reported = TRUE))
+  set.seed(CALIB_SEED)
+  active <- apply(b$cases, 1, informative_days)
+  use <- which(active >= WINDOW_MIN)
+  L <- vapply(use, function(i) if (min(WINDOW_MAX, active[i]) == WINDOW_MIN) WINDOW_MIN else
+    sample(WINDOW_MIN:min(WINDOW_MAX, active[i]), 1), numeric(1))
+  s <- vapply(seq_along(use), function(j) sample.int(active[use[j]] - L[j] + 1, 1), numeric(1))
+  saveRDS(list(
+    theta = b$theta[use, ], start = s, length = L,
+    cases = lapply(seq_along(use), function(j) b$cases[use[j], s[j]:(s[j] + L[j] - 1)]),
+    state = data.frame(lapply(b$states, function(m) m[cbind(use, s)])),
+    seconds = t_cal[["elapsed"]]
+  ), calib_file)
+  rm(b); gc()
+}
+test  <- readRDS(test_file)
+calib <- readRDS(calib_file)
+info  <- readLines(file.path(BANK_DIR, "simulation_seconds_and_dropped_share.txt"))
+cat("Training bank:", format(N_SIMS, big.mark = ","), "epidemics, simulated in", round(as.numeric(info[1]) / 60, 1),
+    "minutes;", sprintf("%.1f%%", 100 * as.numeric(info[2])), "dropped (fewer than", MIN_CASES, "reported cases)\n")
+cat("Calibration windows:", format(length(calib$cases), big.mark = ","), "\n")
+```
+
+```{r example-curves, fig.width=11, fig.height=5}
+set.seed(1)
+op <- par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
+for (i in sample(N_TEST, 8)) {
+  th <- test$theta[i, ]
+  plot(test$cases[i, ], type = "h", col = "blue", xlab = "day", ylab = "reported cases", cex.main = 0.9,
+       main = sprintf("R0 %.1f, %.0f%% reported\nnoise %.2f, weekday %.2f", th$R0, 100 * th$report_rate,
+                      th$overdispersion, th$weekday_sd))
+}
+par(op)
+```
+
+```{r stop-after-bank, include=FALSE}
+if (identical(params$stop_after, "bank")) knitr::knit_exit()
+```
+
+# Step 2: train
+
+```{r train}
+model_dirs <- file.path(OUT_DIR, paste0("model_seed_", SEEDS))
+model_matches <- function(dir, seed) {
+  f <- file.path(dir, "model_config.json")
+  if (!file.exists(file.path(dir, "model.pt")) || !file.exists(f)) return(FALSE)
+  cfg <- jsonlite::read_json(f)
+  cfg$epochs == EPOCHS && cfg$seed == seed && isTRUE(cfg$variable_length) && isTRUE(cfg$observation_noise) &&
+    cfg$window_min == WINDOW_MIN && cfg$window_max == WINDOW_MAX && cfg$window_stop_zeros == STOP_ZEROS &&
+    identical(unlist(cfg$target_names), c(TARGETS, STATE_TARGETS)) &&
+    cfg$hidden_size == HIDDEN_SIZE && cfg$batch_size == BATCH_SIZE &&
+    isTRUE(all.equal(cfg$learning_rate, LEARNING_RATE))
+}
+for (i in seq_along(SEEDS)) {
+  if (RETRAIN || fresh_bank || !model_matches(model_dirs[i], SEEDS[i])) {
+    t <- system.time(train_bilstm_calibrator(
+      name = "sir", known_names = KNOWN, target_names = TARGETS, type = "SIR",
+      parameter_file = train_files[["theta"]], observation_file = train_files[["cases"]],
+      output_dir = model_dirs[i], epochs = EPOCHS, batch_size = BATCH_SIZE, learning_rate = LEARNING_RATE,
+      seed = SEEDS[i], hidden_size = HIDDEN_SIZE, num_layers = NUM_LAYERS, dropout = DROPOUT,
+      physics_weight = 0, incidence_max = INCIDENCE_MAX, incidence_transform = INCIDENCE_TRANSFORM,
+      output_activation = OUTPUT_ACTIVATION, window_min = WINDOW_MIN, window_max = WINDOW_MAX,
+      window_stop_zeros = STOP_ZEROS, state_files = train_files[STATE_TARGETS], grad_clip = GRAD_CLIP,
+      observation_noise = TRUE, device = params$device
+    ))
+    writeLines(as.character(round(t[["elapsed"]])), file.path(model_dirs[i], "training_seconds.txt"))
+  }
+}
+knitr::kable(do.call(rbind, lapply(seq_along(SEEDS), function(i) {
+  cfg <- jsonlite::read_json(file.path(model_dirs[i], "model_config.json"))
+  data.frame(seed = SEEDS[i], best_epoch = cfg$best_epoch, trained_on = cfg$device,
+             minutes = round(as.numeric(readLines(file.path(model_dirs[i], "training_seconds.txt"))) / 60))
+})), row.names = FALSE)
+```
+
+```{r stop-after-training, include=FALSE}
+if (identical(params$stop_after, "training")) knitr::knit_exit()
+```
+
+```{r history, fig.width=11, fig.height=4}
+op <- par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+for (what in c("validation_loss", "validation_mse_R0", "validation_mse_log_infected_share")) {
+  h <- lapply(model_dirs, function(d) read.csv(file.path(d, "training_history.csv")))
+  plot(NA, xlim = c(1, EPOCHS), ylim = range(unlist(lapply(h, `[[`, what))), log = "y",
+       xlab = "epoch", ylab = what, main = what)
+  for (k in seq_along(h)) lines(h[[k]]$epoch, h[[k]][[what]], col = k, lwd = 1.5)
+}
+par(op)
+```
+
+# Step 3: new simulated epidemics
+
+```{r predict-helpers}
+predict_models <- function(dirs, curves, known, state_offset = 0) {
+  known <- as.data.frame(known)[, KNOWN, drop = FALSE]
+  ests  <- lapply(dirs, function(d) bilstm_predict_many(d, curves, known, device = params$device))
+  avg   <- Reduce(`+`, ests) / length(ests)
+  avg$crate <- avg$R0 * known$recov / avg$ptran
+  for (s in STATES) if (s %in% names(avg)) avg[[s]] <- pmax(avg[[s]] - state_offset, 0)
+  avg
+}
+predict_v6 <- function(dirs, curves, known) predict_models(dirs, curves, known, state_offset = STATE_OFFSET)
+V6_DIRS  <- if (ENSEMBLE) model_dirs else model_dirs[1]
+V6_LABEL <- if (ENSEMBLE) sprintf("SIR v6 (average of %d seeds)", length(SEEDS)) else "SIR v6"
+
+cal <- bilstm_calibrator(model_dirs[1], known_names = KNOWN, type = "SIR", device = params$device)
+y1  <- test$cases[1, 1:90]
+one <- calibrate(y1, cal, n = test$theta$n[1], recov = test$theta$recov[1])
+many <- predict_v6(model_dirs[1], list(y1), test$theta[1, ])
+stopifnot(isTRUE(all.equal(unname(one[c("R0", "report_rate")]), unname(unlist(many[1, c("R0", "report_rate")])),
+                           tolerance = 1e-5)))
+```
+
+Windows of each length at the beginning, middle and end of each test epidemic's
+informative days. The two earlier SIR models were trained on every case, not reported cases.
+
+```{r grid}
+active <- apply(test$cases, 1, informative_days)
+win_start <- function(pos, L, a) switch(pos, beginning = 1, middle = floor((a - L) / 2) + 1, end = a - L + 1)
+grid <- expand.grid(length = GRID_LENGTHS, position = POSITIONS, curve = seq_len(N_TEST), stringsAsFactors = FALSE)
+grid <- grid[active[grid$curve] >= grid$length, ]
+grid$start <- mapply(win_start, grid$position, grid$length, active[grid$curve])
+windows <- lapply(seq_len(nrow(grid)), function(k) test$cases[grid$curve[k], grid$start[k]:(grid$start[k] + grid$length[k] - 1)])
+known_g <- test$theta[grid$curve, KNOWN]
+
+e6  <- predict_v6(V6_DIRS, windows, known_g)
+evl <- predict_models(VL_DIRS, windows, known_g)
+b61 <- which(grid$length == 61 & grid$position == "beginning")
+e61 <- predict_models(F61_DIRS, do.call(rbind, windows[b61]), known_g[b61, ])
+
+truth_R0 <- test$theta$R0[grid$curve]
+LABEL_VL  <- "SIR any length (every case)"
+LABEL_61  <- "SIR 61 days, no day 0 (every case)"
+grid_est <- rbind(
+  data.frame(model = V6_LABEL, grid, R0 = e6$R0),
+  data.frame(model = LABEL_VL, grid, R0 = evl$R0),
+  data.frame(model = LABEL_61, grid[b61, ], R0 = e61$R0)
+)
+grid_est$R0_abs_error <- abs(grid_est$R0 - test$theta$R0[grid_est$curve])
+r0_tab <- aggregate(R0_abs_error ~ model + length + position, grid_est, mean)
+write.csv(r0_tab, file.path(OUT_DIR, "R0_MAE_by_length_and_position.csv"), row.names = FALSE)
+w <- reshape(r0_tab[r0_tab$model == V6_LABEL, -1], idvar = "length", timevar = "position", direction = "wide")
+names(w) <- sub("R0_abs_error.", "", names(w), fixed = TRUE)
+knitr::kable(w[order(w$length), c("length", POSITIONS)], digits = 3, row.names = FALSE,
+             caption = paste(V6_LABEL, ": R0 mean absolute error by window length and position"))
+cat("Windows tested:", nrow(grid), "\n")
+```
+
+```{r grid-compare}
+cmp <- do.call(rbind, lapply(split(grid_est, grid_est$model), function(g)
+  data.frame(model = g$model[1], windows = nrow(g), R0_MAE = mean(g$R0_abs_error))))
+same61 <- grid_est[grid_est$length == 61 & grid_est$position == "beginning", ]
+cmp61  <- aggregate(R0_abs_error ~ model, same61, mean)
+names(cmp61)[2] <- "R0_MAE_61_days_beginning"
+cmp <- merge(cmp, cmp61, by = "model", all = TRUE)
+write.csv(cmp, file.path(OUT_DIR, "R0_MAE_compared.csv"), row.names = FALSE)
+knitr::kable(cmp, digits = 3, row.names = FALSE,
+             caption = "R0 mean absolute error over all windows each model can read, and on the same 61-day windows from the beginning")
+```
+
+```{r grid-plot, fig.width=9, fig.height=4.5}
+cols <- c(beginning = "black", middle = "blue", end = "red")
+g6 <- r0_tab[r0_tab$model == V6_LABEL, ]
+plot(NA, xlim = range(GRID_LENGTHS), ylim = c(0, max(g6$R0_abs_error)), xlab = "window length (days)",
+     ylab = "R0 mean absolute error", main = "SIR v6: accuracy by window length and position (reported cases)")
+for (p in POSITIONS) lines(g6$length[g6$position == p], g6$R0_abs_error[g6$position == p], type = "b", pch = 16, lwd = 2, col = cols[p])
+legend("topright", bty = "n", lwd = 2, col = cols, legend = POSITIONS)
+```
+
+## The other outputs
+
+ptran and crate are shown with a baseline that knows the true R0 and makes the best guess
+for the split (the curve only shows R0 = ptran x crate / recov).
+
+```{r other-outputs}
+th <- test$theta[grid$curve, ]
+st_true <- data.frame(lapply(test$states, function(m) m[cbind(grid$curve, grid$start)]))
+r2 <- function(e, t) 1 - sum((e - t)^2) / sum((t - mean(t))^2)
+best_ptran <- th$R0 * th$recov * log(PRIORS$crate[2] / PRIORS$crate[1]) / diff(PRIORS$crate)
+out_tab <- data.frame(
+  output = c("R0", "ptran", "ptran: baseline (true R0, best guess of the split)", "crate",
+             "crate: baseline (middle of its range)", "log reported share", "log noise (overdispersion)",
+             "weekday swing", "log share infectious at window start", "log share recovered at window start"),
+  MAE = c(mean(abs(e6$R0 - th$R0)), mean(abs(e6$ptran - th$ptran)), mean(abs(best_ptran - th$ptran)),
+          mean(abs(e6$crate - th$crate)), mean(abs(mean(PRIORS$crate) - th$crate)),
+          mean(abs(log(e6$report_rate) - log(th$report_rate))), mean(abs(log(e6$overdispersion) - log(th$overdispersion))),
+          mean(abs(e6$weekday_sd - th$weekday_sd)),
+          vapply(STATES, function(s) mean(abs(log(e6[[s]] + STATE_OFFSET) - log(st_true[[s]] + STATE_OFFSET))), 0)),
+  R2 = c(r2(e6$R0, th$R0), r2(e6$ptran, th$ptran), r2(best_ptran, th$ptran), r2(e6$crate, th$crate), NA,
+         r2(log(e6$report_rate), log(th$report_rate)), r2(log(e6$overdispersion), log(th$overdispersion)),
+         r2(e6$weekday_sd, th$weekday_sd),
+         vapply(STATES, function(s) r2(log(e6[[s]] + STATE_OFFSET), log(st_true[[s]] + STATE_OFFSET)), 0))
+)
+write.csv(out_tab, file.path(OUT_DIR, "all_outputs.csv"), row.names = FALSE)
+knitr::kable(out_tab, digits = 3, row.names = FALSE, caption = "Over all test windows")
+```
+
+# Step 4: a range for R0
+
+```{r calibration}
+calib_est <- predict_v6(V6_DIRS, calib$cases, calib$theta)
+lg <- function(x) log(x + STATE_OFFSET)
+features <- function(e, known, L) cbind(R0 = e$R0, lr = log(e$report_rate), lo = log(e$overdispersion),
+                                        li = lg(e$infected_share), lrec = lg(e$recovered_share),
+                                        recov = known$recov, lL = log(L))
+F_cal <- features(calib_est, calib$theta, calib$length)
+F_mu <- colMeans(F_cal); F_sd <- apply(F_cal, 2, sd)
+F_t  <- t(scale(F_cal, F_mu, F_sd))
+resid <- data.frame(
+  R0 = calib$theta$R0 - calib_est$R0,
+  lr = log(calib$theta$report_rate) - log(calib_est$report_rate),
+  lo = log(calib$theta$overdispersion) - log(calib_est$overdispersion),
+  wsd = calib$theta$weekday_sd - calib_est$weekday_sd,
+  li = lg(calib$state$infected_share) - lg(calib_est$infected_share),
+  lrec = lg(calib$state$recovered_share) - lg(calib_est$recovered_share)
+)
+neighbours <- function(e, known, L) {
+  f <- (features(e, known, L)[1, ] - F_mu) / F_sd
+  d <- colSums((F_t - f)^2)
+  which(d <= sort(d, partial = K_NB)[K_NB])[seq_len(K_NB)]
+}
+r0_range <- function(e, nb, probs = c(0.025, 0.975)) e$R0 + quantile(resid$R0[nb], probs, names = FALSE)
+draw_parameters <- function(e, known, nb, n) {
+  j  <- sample(nb, n, replace = TRUE)
+  R0 <- pmax(0.05, e$R0 + resid$R0[j])
+  back <- function(est, r) pmax(exp(lg(est) + r) - STATE_OFFSET, 0)
+  I  <- back(e$infected_share, resid$li[j])
+  Rc <- back(e$recovered_share, resid$lrec[j])
+  # Drawn separately; if together above 95% of the population, scaled down.
+  f  <- pmin(1, 0.95 / pmax(I + Rc, 1e-12))
+  data.frame(n = known$n, recov = known$recov, ptran = e$ptran, crate = R0 * known$recov / e$ptran,
+             report_rate = pmin(1, exp(log(e$report_rate) + resid$lr[j])),
+             overdispersion = exp(log(e$overdispersion) + resid$lo[j]),
+             weekday_sd = pmax(0, e$weekday_sd + resid$wsd[j]),
+             preval = I * f, start_recovered = Rc * f)
+}
+
+set.seed(3)
+check <- sample(nrow(grid), min(3000, nrow(grid)))
+rng <- t(vapply(check, function(k) r0_range(e6[k, ], neighbours(e6[k, ], known_g[k, ], grid$length[k])), numeric(2)))
+inside <- truth_R0[check] >= rng[, 1] & truth_R0[check] <= rng[, 2]
+range_tab <- aggregate(cbind(inside = 100 * inside, width = rng[, 2] - rng[, 1]) ~ length, data.frame(length = grid$length[check]), mean)
+range_tab <- rbind(range_tab, data.frame(length = "all", inside = 100 * mean(inside), width = mean(rng[, 2] - rng[, 1])))
+names(range_tab) <- c("window length", "true R0 inside the 95% range (%)", "mean width")
+write.csv(range_tab, file.path(OUT_DIR, "R0_range_check.csv"), row.names = FALSE)
+knitr::kable(range_tab, digits = 2, row.names = FALSE)
+```
+
+# Step 5: real data
+
+The same windows as SEIR v6. The simulations start from SIR v6's estimated state at the
+first day (shares infectious and recovered) and include its estimated reporting. SEIR v6's
+results on the same windows are copied from its report.
+
+```{r real-data}
+DD <- params$real_data_dir
+covid <- read.csv(file.path(DD, "utah_covid_all_days.csv")); covid$Date <- as.Date(covid$Date)
+hhs <- read.csv(file.path(DD, "utah_hhs_hospital_admissions.csv")); hhs$date <- as.Date(substr(hhs$date, 1, 10)) - 1
+e1918 <- new.env(); load(file.path(DD, "Flu1918.rda"), envir = e1918)
+flu <- hhs$previous_day_admission_influenza_confirmed
+
+real <- list()
+add <- function(label, x, y, n, disease) {
+  real[[length(real) + 1]] <<- list(label = label, x = x, y = as.numeric(y), n = n,
+                                    recov = if (disease == "flu") 0.25 else 1 / 7)
+}
+utah <- tail(covid, 365)
+for (L in GRID_LENGTHS) add(sprintf("Utah COVID-19, last %d days", L), tail(utah$Date, L), tail(utah$Daily.Cases, L), 5000, "COVID-19")
+for (pos in c("beginning", "middle")) {
+  s <- switch(pos, beginning = 1, middle = 153)
+  add(sprintf("Utah COVID-19 2024-25, 61 days (%s)", pos), utah$Date[s:(s + 60)], utah$Daily.Cases[s:(s + 60)], 5000, "COVID-19")
+}
+season <- function(from, to, d, y) {
+  s <- which(d >= as.Date(from) & d <= as.Date(to)); y <- y[s]
+  ma <- as.numeric(stats::filter(y, rep(1 / 7, 7), sides = 2)); pk <- which.max(ma)
+  zero_week <- vapply(seq_along(y), function(i) i >= STOP_ZEROS && all(y[(i - STOP_ZEROS + 1):i] == 0), logical(1))
+  first <- max(c(0, which(zero_week & seq_along(y) < pk))) + 1
+  after <- which(zero_week & seq_along(y) > pk)
+  last  <- if (length(after)) after[1] - STOP_ZEROS else length(y)
+  list(x = d[s][first:last], y = y[first:last])
+}
+peak61 <- function(x, y) {
+  ma <- as.numeric(stats::filter(y, rep(1 / 7, 7), sides = 2)); end <- min(length(y), which.max(ma) + 7)
+  s <- max(1, end - 60); list(x = x[s:(s + 60)], y = y[s:(s + 60)])
+}
+f1 <- season("2022-09-01", "2023-05-31", hhs$date, flu); f2 <- season("2023-09-01", "2024-04-26", hhs$date, flu)
+c3 <- season("2023-06-01", "2023-10-15", covid$Date, covid$Daily.Cases)
+b18 <- list(x = seq_along(e1918$Flu1918$incidence), y = e1918$Flu1918$incidence)
+add("Utah flu 2022-23, season (no week without admissions)", f1$x, f1$y, 5000, "flu")
+add("Utah flu 2023-24, season (no week without admissions)", f2$x, f2$y, 5000, "flu")
+add("Baltimore flu 1918, all 92 days", b18$x, b18$y, 10000, "flu")
+add("Utah COVID-19 summer 2023, whole wave", c3$x, c3$y, 10000, "COVID-19")
+for (d in list(list("Utah flu 2022-23", f1, "flu", 5000), list("Utah flu 2023-24", f2, "flu", 5000),
+               list("Baltimore flu 1918", b18, "flu", 10000), list("Utah COVID-19 summer 2023", c3, "COVID-19", 10000))) {
+  p <- peak61(d[[2]]$x, d[[2]]$y)
+  add(paste0(d[[1]], ", 61 days to a week after the peak"), p$x, p$y, d[[4]], d[[3]])
+}
+```
+
+```{r real-fit}
+band <- function(par_rows, L) {
+  sim  <- sir_simulator(ndays = L, keep_day_zero = FALSE)
+  runs <- vapply(seq_len(nrow(par_rows)), function(i) simulate_from_parameters(sim, as.list(par_rows[i, ]), seed = i), numeric(L))
+  data.frame(median = apply(runs, 1, median), lower = apply(runs, 1, quantile, 0.025), upper = apply(runs, 1, quantile, 0.975))
+}
+score <- function(b, y) c(coverage = 100 * mean(y >= b$lower & y <= b$upper),
+                          interval_score = mean((b$upper - b$lower) + 40 * pmax(b$lower - y, 0) + 40 * pmax(y - b$upper, 0)))
+fit_v6 <- function(y, known) {
+  e  <- predict_v6(V6_DIRS, list(y), known)
+  nb <- neighbours(e, known, min(length(y), informative_days(y)))
+  list(e = e, r = r0_range(e, nb), b = band(draw_parameters(e, known, nb, N_REPS), length(y)))
+}
+
+set.seed(2026)
+fits <- lapply(real, function(w) c(list(w = w), fit_v6(w$y, data.frame(n = w$n, recov = w$recov))))
+seir <- read.csv(file.path(params$seir_v6_dir, "real_data.csv"))
+real_tab <- do.call(rbind, lapply(fits, function(f) {
+  s <- score(f$b, f$w$y); q <- seir[seir$window == f$w$label, ]
+  data.frame(window = f$w$label, days = length(f$w$y), R0_sir = f$e$R0, R0_sir_low = f$r[1], R0_sir_high = f$r[2],
+             reported_share_sir = f$e$report_rate, coverage_sir = s[["coverage"]], interval_score_sir = s[["interval_score"]],
+             R0_seir = if (nrow(q)) q$R0_v6 else NA, coverage_seir = if (nrow(q)) q$coverage_v6 else NA,
+             interval_score_seir = if (nrow(q)) q$interval_score_v6 else NA)
+}))
+write.csv(real_tab, file.path(OUT_DIR, "real_data.csv"), row.names = FALSE)
+knitr::kable(real_tab, digits = 2, row.names = FALSE,
+             col.names = c("window", "days", "R0 SIR v6", "low", "high", "reported share", "coverage %", "score",
+                           "R0 SEIR v6", "coverage % SEIR v6", "score SEIR v6"))
+```
+
+```{r real-plots, fig.width=7, fig.height=4.2, results="asis"}
+for (f in fits) {
+  cat("\n\n## ", f$w$label, "\n\n", sep = "")
+  s <- score(f$b, f$w$y)
+  plot(f$w$x, f$b$median, type = "n", ylim = range(c(f$w$y, f$b$lower, f$b$upper)), xlab = "", ylab = "daily count",
+       cex.main = 0.95, main = sprintf("SIR v6: R0 %.2f (%.2f-%.2f)\ncoverage %.0f%% | score %.0f", f$e$R0, f$r[1], f$r[2],
+                                      s[["coverage"]], s[["interval_score"]]))
+  polygon(c(f$w$x, rev(f$w$x)), c(f$b$upper, rev(f$b$lower)), col = adjustcolor("darkorange", 0.3), border = NA)
+  lines(f$w$x, f$b$median, col = "darkorange", lwd = 2)
+  lines(f$w$x, f$w$y, col = "blue", lwd = 1.5)
+  cat("\n\n")
+}
+```
+
+# Step 6: other US states
+
+As in SEIR v6: Johns Hopkins daily cases, scaled to cases per 10,000 people (`n = 10,000`);
+for each state and wave, the 61 days ending a week after the peak and the whole wave.
+
+```{r states}
+st  <- read.csv(file.path(DD, "state_covid_daily_cases_jhu.csv")); st$date <- as.Date(st$date)
+pop <- read.csv(file.path(DD, "state_population.csv"))
+STATES_TESTED <- c("Wyoming", "Vermont", "Utah", "Oregon", "New York", "Texas")
+WAVES <- list(`fall 2020` = c("2020-09-01", "2021-02-28"), `Delta 2021` = c("2021-06-15", "2021-11-30"),
+              `Omicron 2021-22` = c("2021-12-01", "2022-03-31"))
+STATE_N <- 10000
+
+set.seed(2027)
+state_fits <- list()
+for (s in STATES_TESTED) for (wv in names(WAVES)) {
+  d <- st[st$state == s, ]
+  scaled <- round(d$daily_cases * STATE_N / pop$population[pop$state == s])
+  whole  <- season(WAVES[[wv]][1], WAVES[[wv]][2], d$date, scaled)
+  in_wave <- d$date >= as.Date(WAVES[[wv]][1]) & d$date <= as.Date(WAVES[[wv]][2])
+  w61    <- peak61(d$date[in_wave], scaled[in_wave])
+  known  <- data.frame(n = STATE_N, recov = 1 / 7)
+  state_fits[[paste(s, wv)]] <- list(state = s, wave = wv, fits = list(
+    `v6, 61 days`    = c(fit_v6(w61$y, known), list(x = w61$x, y = w61$y)),
+    `v6, whole wave` = c(fit_v6(whole$y, known), list(x = whole$x, y = whole$y))))
+}
+seir_st <- read.csv(file.path(params$seir_v6_dir, "states.csv"))
+state_tab <- do.call(rbind, lapply(state_fits, function(sf) do.call(rbind, lapply(names(sf$fits), function(m) {
+  f <- sf$fits[[m]]; sc <- score(f$b, f$y)
+  q <- seir_st[seir_st$state == sf$state & seir_st$wave == sf$wave & seir_st$fit == m, ]
+  data.frame(state = sf$state, wave = sf$wave, fit = m, days = length(f$y),
+             R0_sir = f$e$R0, R0_sir_low = f$r[1], R0_sir_high = f$r[2],
+             coverage_sir = sc[["coverage"]], interval_score_sir = sc[["interval_score"]],
+             R0_seir = q$R0, coverage_seir = q$coverage, interval_score_seir = q$interval_score)
+}))))
+rownames(state_tab) <- NULL
+write.csv(state_tab, file.path(OUT_DIR, "states.csv"), row.names = FALSE)
+knitr::kable(state_tab, digits = 2, row.names = FALSE,
+             col.names = c("state", "wave", "fit", "days", "R0 SIR v6", "low", "high", "coverage %", "score",
+                           "R0 SEIR v6", "coverage % SEIR v6", "score SEIR v6"))
+state_summary <- aggregate(cbind(coverage_sir, interval_score_sir, coverage_seir, interval_score_seir) ~ fit, state_tab, mean)
+write.csv(state_summary, file.path(OUT_DIR, "states_summary.csv"), row.names = FALSE)
+knitr::kable(state_summary, digits = 2, row.names = FALSE,
+             col.names = c("fit", "coverage % SIR v6", "score SIR v6", "coverage % SEIR v6", "score SEIR v6"),
+             caption = "Mean over 6 states x 3 waves")
+```
+
+```{r states-plots, fig.width=10, fig.height=10, results="asis"}
+for (s in STATES_TESTED) {
+  cat("\n\n## ", s, "\n\n", sep = "")
+  op <- par(mfrow = c(3, 2), mar = c(3, 4, 3.5, 1))
+  for (wv in names(WAVES)) for (m in c("v6, 61 days", "v6, whole wave")) {
+    f <- state_fits[[paste(s, wv)]]$fits[[m]]; sc <- score(f$b, f$y)
+    plot(f$x, f$b$median, type = "n", ylim = range(c(f$y, f$b$lower, f$b$upper)), xlab = "", ylab = "cases per 10,000",
+         cex.main = 0.9, main = sprintf("%s, SIR %s: R0 %.2f (%.2f-%.2f)\ncoverage %.0f%% | score %.0f", wv, m, f$e$R0,
+                                       f$r[1], f$r[2], sc[["coverage"]], sc[["interval_score"]]))
+    polygon(c(f$x, rev(f$x)), c(f$b$upper, rev(f$b$lower)), col = adjustcolor("darkorange", 0.3), border = NA)
+    lines(f$x, f$b$median, col = "darkorange", lwd = 2)
+    lines(f$x, f$y, col = "blue", lwd = 1.2)
+  }
+  par(op)
+  cat("\n\n")
+}
+```
+
+# Run-to-run variation
+
+```{r seeds}
+seed_tab <- do.call(rbind, lapply(seq_along(SEEDS), function(k) {
+  e <- predict_v6(model_dirs[k], windows, known_g)
+  data.frame(model = paste("seed", SEEDS[k]), R0_MAE_all_windows = mean(abs(e$R0 - truth_R0)))
+}))
+if (ENSEMBLE) seed_tab <- rbind(seed_tab, data.frame(model = V6_LABEL, R0_MAE_all_windows = mean(abs(e6$R0 - truth_R0))))
+write.csv(seed_tab, file.path(OUT_DIR, "seed_variation.csv"), row.names = FALSE)
+knitr::kable(seed_tab, digits = 3, row.names = FALSE)
+```
+
+# Summary
+
+```{r summary}
+summary_tab <- data.frame(
+  measure = c("R0 MAE, all test windows (30-365 days, any position)",
+              "R0 MAE, 61-day windows from the beginning: SIR v6",
+              paste("R0 MAE, 61-day windows from the beginning:", LABEL_61),
+              "True R0 inside SIR v6's 95% range (%)",
+              "Real data (Utah, flu, 1918), mean coverage %: SIR v6", "Real data, mean coverage %: SEIR v6",
+              "Six states, mean coverage %: SIR v6 (whole waves)", "Six states, mean coverage %: SEIR v6 (whole waves)"),
+  value = c(cmp$R0_MAE[cmp$model == V6_LABEL], cmp61$R0_MAE_61_days_beginning[cmp61$model == V6_LABEL],
+            cmp61$R0_MAE_61_days_beginning[cmp61$model == LABEL_61], range_tab[nrow(range_tab), 2],
+            mean(real_tab$coverage_sir), mean(real_tab$coverage_seir, na.rm = TRUE),
+            state_summary$coverage_sir[state_summary$fit == "v6, whole wave"],
+            state_summary$coverage_seir[state_summary$fit == "v6, whole wave"])
+)
+write.csv(summary_tab, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_tab, digits = 3, row.names = FALSE)
+```
+
+```{r save}
+saveRDS(list(settings = settings, r0 = r0_tab, compared = cmp, outputs = out_tab, R0_range = range_tab,
+             real = real_tab, states = state_tab, states_summary = state_summary, seeds = seed_tab,
+             summary = summary_tab, params = params),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+```

@@ -1,0 +1,1315 @@
+---
+title: "BiLSTM calibration of SEIR and SIR models: simulated and real data"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+params:
+  results: "results"
+  # The BiLSTM models used (folders in results/).
+  model_folders: "SEIR=seir_clean_big;SIR=sir_clean_big"
+  # Saved results of the method comparisons (made by Compare_methods_simulated.Rmd and Real_data.Rmd).
+  sim_folder: "simulated_baselines"
+  real_folder: "real_data"
+  out_dir: "results/report"
+  seeds: "122,1,2,3,4"
+  device: "cpu"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) reticulate::use_condaenv(params$condaenv, required = TRUE)
+reticulate::py_run_string(paste("import warnings", "from sklearn.exceptions import InconsistentVersionWarning",
+                                "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)", sep = "\n"))
+R <- params$results
+OUT <- params$out_dir
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT), "figures", ""))
+SEEDS <- as.integer(strsplit(params$seeds, ",")[[1]])
+STATE_OFFSET <- 1e-4
+LENGTHS <- c(30, 61, 90, 120, 180, 270, 365)
+POSITIONS <- c("beginning", "middle", "end")
+COLS <- c(SEIR = "#1b7837", SIR = "#2166ac")
+METHOD_COLS <- c(BiLSTM = "forestgreen", `ABC-MCMC` = "firebrick", `ABC-SMC` = "purple", DE = "goldenrod", NelderMead = "steelblue")
+METHODS <- names(METHOD_COLS)
+BASELINES <- METHODS[-1]
+SIM  <- file.path(R, params$sim_folder)
+REAL <- file.path(R, params$real_folder)
+tab <- function(x, digits = 3, ...) knitr::kable(x, format = "html", digits = digits, row.names = FALSE,
+                                                table.attr = "class='table table-condensed' style='width:auto'", ...)
+# Table and figure numbers, in the order they appear.
+tn <- local({ i <- 0; function(txt) { i <<- i + 1; sprintf("Table %d. %s", i, txt) } })
+fc <- local({ i <- 0; function(txt) { i <<- i + 1; sprintf("Figure %d. %s", i, txt) } })
+fig <- function(...) {
+  f <- file.path(R, ...); f <- f[file.exists(f)]
+  if (length(f)) knitr::include_graphics(normalizePath(f), rel_path = FALSE)
+}
+FOLDERS <- local({ s <- strsplit(strsplit(params$model_folders, ";")[[1]], "="); setNames(vapply(s, `[`, "", 2), vapply(s, `[`, "", 1)) })
+INFO <- list(
+  SEIR = list(dir = file.path(R, FOLDERS[["SEIR"]]), known = c("n", "recov", "incub"), crate = c(5, 15),
+              states = c("exposed_share", "infected_share", "recovered_share")),
+  SIR  = list(dir = file.path(R, FOLDERS[["SIR"]]), known = c("n", "recov"), crate = c(1, 5),
+              states = c("infected_share", "recovered_share"))
+)
+predict_model <- function(M, curves, known) {
+  info <- INFO[[M]]
+  known <- as.data.frame(known)[, info$known, drop = FALSE]
+  curves <- unname(curves)
+  ests <- lapply(file.path(info$dir, paste0("model_seed_", SEEDS)), function(d)
+    bilstm_predict_many(d, curves, known, device = params$device))
+  avg <- Reduce(`+`, ests) / length(ests)
+  avg$crate <- avg$R0 * known$recov / avg$ptran
+  avg
+}
+informative_days <- function(curve, k = 7) {
+  r <- rle(as.numeric(curve) == 0); hit <- which(r$values & r$lengths >= k)[1]
+  if (is.na(hit)) length(curve) else sum(r$lengths[seq_len(hit)]) - r$lengths[hit]
+}
+f2 <- function(x, d = 2) formatC(x, digits = d, format = "f")
+pct <- function(x) sprintf("%.0f%%", x)
+rng <- function(x, d = 2) paste(formatC(range(x), digits = d, format = "f"), collapse = "-")
+hp_txt <- function(M) {
+  cfg <- jsonlite::read_json(file.path(INFO[[M]]$dir, "model_seed_122", "model_config.json"))
+  sprintf("%d layers of %d units, dropout %.2f, learning rate %.1e%s, batch %d, %d epochs", cfg$num_layers,
+          cfg$hidden_size, cfg$dropout, cfg$learning_rate,
+          if (identical(cfg$lr_schedule, "cosine")) " falling to 1% of it" else "", cfg$batch_size, cfg$epochs)
+}
+blank_repeats <- function(x, col) { x[[col]][duplicated(x[[col]])] <- ""; x }
+```
+
+```{r sim-compute}
+# The BiLSTM alone on the noise-free test epidemics: windows of each length at the
+# beginning, middle and end of each epidemic, as in Clean_any_length.Rmd; estimates cached.
+sim <- lapply(setNames(names(INFO), names(INFO)), function(M) {
+  info <- INFO[[M]]
+  test <- readRDS(file.path(info$dir, "test_bank.rds"))
+  active <- apply(test$cases, 1, informative_days)
+  win_start <- function(pos, L, a) switch(pos, beginning = 1, middle = floor((a - L) / 2) + 1, end = a - L + 1)
+  g <- expand.grid(length = LENGTHS, position = POSITIONS, curve = seq_len(nrow(test$theta)), stringsAsFactors = FALSE)
+  g <- g[active[g$curve] >= g$length, ]
+  g$start <- mapply(win_start, g$position, g$length, active[g$curve])
+  cache <- file.path(OUT, paste0("simulated_estimates_", basename(info$dir), ".csv"))
+  if (file.exists(cache)) {
+    e <- read.csv(cache)
+  } else {
+    curves <- lapply(seq_len(nrow(g)), function(k) test$cases[g$curve[k], g$start[k]:(g$start[k] + g$length[k] - 1)])
+    e <- predict_model(M, curves, test$theta[g$curve, ])[, c("R0", "ptran", "crate")]
+    write.csv(e, cache, row.names = FALSE)
+  }
+  th <- test$theta[g$curve, ]
+  lo <- info$crate[1]; hi <- info$crate[2]
+  data.frame(model = M, g, R0_true = th$R0, ptran_true = th$ptran, crate_true = th$crate,
+             R0 = e$R0, ptran = e$ptran, crate = e$crate,
+             # Best guesses when R0 is known exactly but the split into ptran and crate is not.
+             ptran_baseline = th$R0 * th$recov * log(hi / lo) / (hi - lo), crate_baseline = (lo + hi) / 2)
+})
+sim_all <- do.call(rbind, sim)
+mae_by <- function(d) data.frame(
+  windows = nrow(d),
+  R0_MAE = mean(abs(d$R0 - d$R0_true)),
+  ptran_MAE = mean(abs(d$ptran - d$ptran_true)), ptran_baseline_MAE = mean(abs(d$ptran_baseline - d$ptran_true)),
+  crate_MAE = mean(abs(d$crate - d$crate_true)), crate_baseline_MAE = mean(abs(d$crate_baseline - d$crate_true)))
+sim_tab <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(LENGTHS, function(L) {
+  d <- sim_all[sim_all$model == M & sim_all$length == L & sim_all$position == "beginning", ]
+  if (!nrow(d)) return(NULL)
+  cbind(model = M, length = L, mae_by(d),
+        R0_MAE_all_positions = mean(abs(sim_all$R0 - sim_all$R0_true)[sim_all$model == M & sim_all$length == L]))
+}))))
+extras <- do.call(rbind, lapply(names(INFO), function(M) {
+  rr <- read.csv(file.path(INFO[[M]]$dir, "R0_range_check.csv"), check.names = FALSE)
+  cv <- read.csv(file.path(INFO[[M]]$dir, "coverage_by_length_and_position.csv"))
+  data.frame(model = M, length = LENGTHS,
+             R0_in_range = as.numeric(rr[match(LENGTHS, rr[[1]]), 2]),
+             cov_new = vapply(LENGTHS, function(L) mean(cv$new_infections[cv$length == L]), 0),
+             cov_infected = vapply(LENGTHS, function(L) mean(cv$currently_infected[cv$length == L]), 0))
+}))
+sim_tab <- merge(sim_tab, extras, by = c("model", "length"), sort = FALSE)
+write.csv(sim_tab, file.path(OUT, "simulated_results.csv"), row.names = FALSE)
+s_row <- function(M, L, col) sim_tab[[col]][sim_tab$model == M & sim_tab$length == L]
+rng_txt <- function(M) paste(round(range(sim_tab$R0_in_range[sim_tab$model == M])), collapse = "-")
+```
+
+```{r comparisons}
+# The saved method comparisons: simulated windows and real data.
+sbr <- read.csv(file.path(SIM, "results_by_window.csv"))
+sbr <- sbr[sbr$method %in% METHODS, ]
+sbr_ok <- sbr[!sbr$failed, ]
+real <- read.csv(file.path(REAL, "results_by_window.csv"))
+real <- real[real$method %in% METHODS, ]
+real_ok <- real[!real$failed, ]
+rwin <- readRDS(file.path(REAL, "windows.rds"))
+rwaves <- readRDS(file.path(REAL, "waves.rds"))
+rfit <- function(M, id, m) readRDS(file.path(REAL, "fits", sprintf("%s_%s_%s.rds", M, id, m)))
+speed <- tapply(sbr_ok$seconds, sbr_ok$method, mean)
+
+sim_summary <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(METHODS, function(m) {
+  d <- sbr_ok[sbr_ok$model == M & sbr_ok$method == m, ]
+  data.frame(Model = M, Method = m,
+             `Windows (failed)` = sprintf("%d (%d)", nrow(d), sum(sbr$failed[sbr$model == M & sbr$method == m])),
+             `R0 MAE` = mean(d$error), `R0 MAE: beginning` = mean(d$error[d$position == "beginning"]),
+             `R0 MAE: middle` = mean(d$error[d$position == "middle"]), `R0 MAE: end` = mean(d$error[d$position == "end"]),
+             `True R0 in 95% range (%)` = if (all(is.na(d$inside))) NA else 100 * mean(d$inside, na.rm = TRUE),
+             `Starting state error (% points)` = mean(d$state_error),
+             `Coverage: new infections (%)` = mean(d$cov_new), `Coverage: currently infected (%)` = mean(d$cov_infected),
+             `Coverage: next 14 days (%)` = mean(d$cov_future, na.rm = TRUE),
+             `Interval score: new infections` = mean(d$IS_new), `Interval score: currently infected` = mean(d$IS_infected),
+             `Interval score: next 14 days` = mean(d$IS_future, na.rm = TRUE),
+             `Seconds per window` = mean(d$seconds), `Model runs per window` = mean(d$model_runs), check.names = FALSE)
+}))))
+sim_get <- function(M, m, col) sim_summary[[col]][sim_summary$Model == M & sim_summary$Method == m]
+
+real_summary <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(c("US states", "Utah and Baltimore"), function(g)
+  do.call(rbind, lapply(METHODS, function(m) {
+    d <- real_ok[real_ok$model == M & real_ok$group == g & real_ok$method == m, ]
+    data.frame(Model = M, Data = g, Method = m,
+               `Windows (failed)` = sprintf("%d (%d)", nrow(d), sum(real$failed[real$model == M & real$group == g & real$method == m])),
+               `Coverage (%)` = mean(d$coverage), `Interval score` = mean(d$interval_score), `Band width` = mean(d$width),
+               `Error of the median` = mean(d$MAE), `Coverage: next 14 days (%)` = mean(d$cov_future, na.rm = TRUE),
+               `Interval score: next 14 days` = mean(d$is_future, na.rm = TRUE),
+               `Seconds per window` = mean(d$seconds), `Model runs per window` = mean(d$model_runs), check.names = FALSE)
+  }))))))
+real_get <- function(M, g, m, col) real_summary[[col]][real_summary$Model == M & real_summary$Data == g & real_summary$Method == m]
+utah <- real_ok[grepl("Utah COVID", real_ok$wave), ]
+utah_cov <- function(M, m) mean(utah$coverage[utah$model == M & utah$method == m])
+```
+
+# Summary
+
+**What was done.** Two BiLSTM models, one for SEIR and one for SIR, were trained on
+**noise-free simulated epidemics** (every new infection counted) to estimate R0, ptran and
+crate, and the state of the epidemic at the start of the window, from a window of daily new
+infections of **any length from 30 to 365 days**, taken from the beginning, middle or end of an
+epidemic. Known values: population `n`, recovery rate `recov` and (SEIR) incubation period
+`incub`. Each model is the average of 5 networks trained on 1,000,000 simulated epidemics.
+The BiLSTM was then compared with four standard calibration methods (ABC-MCMC, ABC-SMC,
+differential evolution and Nelder-Mead) on simulated windows, where the truth is known, and on
+real data: COVID-19 waves in 10 US states, Utah COVID-19 and influenza, and Baltimore 1918.
+
+**Main findings**
+
+1. **R0 is estimated accurately on simulated data, and better with longer windows.** For
+   windows starting at the beginning of an epidemic, the R0 error falls from
+   `r f2(s_row("SEIR", 30, "R0_MAE"))` (SEIR) and `r f2(s_row("SIR", 30, "R0_MAE"))` (SIR) at
+   30 days to `r f2(s_row("SEIR", 180, "R0_MAE"))` and `r f2(s_row("SIR", 180, "R0_MAE"))` at
+   180 days. The true R0 is inside the model's 95% range
+   `r rng_txt("SEIR")`% (SEIR) and `r rng_txt("SIR")`% (SIR) of the time, depending on the window length.
+2. **ptran and crate cannot be estimated separately.** Only their combination
+   R0 = ptran x crate / recov shapes an epidemic curve. The crate error is no better than always
+   guessing the middle of its range, and the ptran error is about the same as knowing R0
+   exactly and guessing the split.
+3. **The epidemic is recovered well.** Simulating the model forward from its estimates, the
+   true daily new infections are inside the 95% band on 96-99% of days at every window
+   length, and the number currently infected (which the model never sees) on 94-99% of days.
+4. **Against standard calibration methods** (simulated windows, true values known; ABC-MCMC,
+   ABC-SMC, DE and Nelder-Mead with their default settings), the BiLSTM's R0 error is
+   `r f2(sim_get("SEIR", "BiLSTM", "R0 MAE"))` (SEIR) and `r f2(sim_get("SIR", "BiLSTM", "R0 MAE"))`
+   (SIR), against `r rng(sapply(BASELINES, function(m) sim_get("SEIR", m, "R0 MAE")))` and
+   `r rng(sapply(BASELINES, function(m) sim_get("SIR", m, "R0 MAE")))`. It also recovers the starting
+   state and the hidden number currently infected best. Near the beginning of an epidemic the
+   baselines come close; in the middle and at the end they are several times less accurate.
+   DE matches the *observed* curve about as closely as the BiLSTM.
+5. **On real data** there are no true parameter values; methods are compared by how well their
+   simulated curves cover the observed counts. On COVID-19 waves of **10 US states** the BiLSTM
+   covers `r pct(real_get("SEIR", "US states", "BiLSTM", "Coverage (%)"))` (SEIR) and
+   `r pct(real_get("SIR", "US states", "BiLSTM", "Coverage (%)"))` (SIR) of the observed days,
+   close to ABC-MCMC and ABC-SMC and above DE and Nelder-Mead. On **Utah COVID-19** cases the
+   package's ABC-MCMC fits best (`r pct(utah_cov("SEIR", "ABC-MCMC"))` vs
+   `r pct(utah_cov("SEIR", "BiLSTM"))` for the BiLSTM, SEIR): those case reports have weekday
+   swings, reporting spikes and several waves, which noise-free training curves do not have.
+6. **Improving the BiLSTM:** a new hyperparameter search alone did not help; training on
+   1,000,000 instead of 300,000 epidemics with a falling learning rate made R0 errors 3-12%
+   smaller for windows from the beginning of an epidemic, but did not change windows from the end.
+7. **Speed:** a BiLSTM estimate takes about `r f2(speed[["BiLSTM"]], 3)` seconds per window
+   (one network pass for many windows); the baselines take on average
+   `r round(speed[["NelderMead"]])` seconds (Nelder-Mead), `r round(speed[["ABC-MCMC"]])` seconds
+   (ABC-MCMC), `r round(speed[["DE"]] / 60, 1)` minutes (DE) and `r round(speed[["ABC-SMC"]] / 60, 1)`
+   minutes (ABC-SMC) per window, after a one-time cost of simulating the training epidemics and
+   training the networks (Section "Computational cost").
+
+**Using the package.** Everything here can be done with the package's functions; the section
+"Using the package: a guide" shows how (calibrating with the BiLSTM and the standard methods,
+ptran and crate, predictions and scores, comparing methods with plots, the real data shipped
+with the package, and training your own model).
+
+# Setup
+
+## The models
+
+| | SEIR | SIR |
+|---|---|---|
+| Model (epiworldR) | `ModelSEIRCONN` | `ModelSIRCONN` |
+| Known | `n` (5,000-10,000), `recov` (0.071-0.25), `incub` (1-21 days) | `n`, `recov` |
+| Estimated | R0 (0.8-5), ptran, crate (5-15), and the state at the window start | R0 (0.8-5), ptran, crate (1-5), and the state at the window start |
+| Training data | 1,000,000 simulated epidemics of 365 days, noise-free | same |
+| Network | BiLSTM, `r hp_txt("SEIR")`; average of 5 seeds | BiLSTM, `r hp_txt("SIR")`; average of 5 seeds |
+| Window lengths | 30 to 365 days, from the beginning, middle or end of an epidemic | same |
+
+## The methods compared
+
+The BiLSTM and four standard calibration methods, used as someone with basic knowledge of them
+would use them. All get the same windows, known values (`n`, `recov`, and `incub` for SEIR) and
+ranges: R0 between 0.8 and 5 and the state on the first day of the window (the baselines search
+the shares exposed, infectious and recovered on the log10 scale, 0.0001 to 0.4, 0.95 for
+recovered), with the contact rate fixed at the middle of its range (only R0 shapes a curve).
+The baselines fit the observed daily counts by least squares (root mean squared error for the
+package's ABC methods); DE and Nelder-Mead use one model run with a fixed seed per candidate,
+so the same candidate always gets the same fit. Code: `methods_common.R`.
+
+| Method | Library and settings | Model runs per window | What the user must decide |
+|---|---|---|---|
+| BiLSTM | this package: one pass of the trained network (average of 5 seeds), with an R0 range from similar calibration windows | none | nothing: the daily counts and the known values |
+| ABC-MCMC | this package (`make_calibrator("ABC-MCMC")`), defaults: 3,000 random-walk steps (1,500 burn-in), proposal sd 8% of each range, tolerance 0.30 x the size of the counts | 3,000 | ranges, chain length, tolerance, step size |
+| ABC-SMC | this package (`make_calibrator("ABC-SMC")`), defaults (200 particles, 6 generations, each tolerance the median distance of the previous generation) with its limits raised to 30,000 model runs and 20,000 attempts per generation so that it finishes | up to 30,000 | ranges, particles, generations, tolerances, budget |
+| DE | `DEoptim`, defaults: population 10 x the number of unknowns, 200 generations, F = 0.8, CR = 0.5 | 6,000-8,000 | ranges, population, generations |
+| Nelder-Mead | `stats::optim`, defaults, started at the middle of the ranges; values outside the ranges rejected | 100-500 | ranges, starting point |
+
+## How the methods are scored
+
+**Parameter errors** (simulated data only, where the true values are known). For $N$ windows
+with true value $\theta_i$ and estimate $\hat\theta_i$,
+
+$$\text{MAE} = \frac{1}{N}\sum_{i=1}^{N} \left|\hat\theta_i - \theta_i\right| .$$
+
+The **starting state error** is the same for the shares of the population in each state on the
+first day of the window (exposed, infectious, recovered), averaged over the states, in
+percentage points.
+
+**Bands.** Each method's estimates are run 500 times in `ModelSEIRCONN` / `ModelSIRCONN` from
+its estimated starting state (with parameters drawn from its uncertainty: the BiLSTM's R0
+range, the ABC posteriors; DE and Nelder-Mead give one estimate, so their bands show only the
+randomness of the epidemic). Each day's simulated count is the number of people who became
+infectious that day (E to I for SEIR, S to I for SIR). On each day $t$ this gives a 95% band
+from $l_t$ (2.5% of the runs below) to $u_t$ (2.5% above) and a median $m_t$. The band is
+compared with the value $y_t$: the true daily new infections and the true number currently
+infectious on simulated data, the observed daily counts on real data, over the $T$ days of the
+window, and over the 14 days after the window (*prediction*).
+
+**Coverage** is the share of days inside the band (higher is better; about 95% is ideal):
+
+$$\text{coverage} = \frac{100}{T}\sum_{t=1}^{T} \mathbf{1}\left(l_t \le y_t \le u_t\right) \ \%.$$
+
+**Interval score** (Gneiting and Raftery, 2007). Coverage alone can be won by a very wide band.
+The interval score rewards narrow bands and punishes days outside the band by how far outside
+they are:
+
+$$\text{IS} = \frac{1}{T}\sum_{t=1}^{T}\left[(u_t - l_t) + \frac{2}{\alpha}\,(l_t - y_t)\,\mathbf{1}(y_t < l_t) + \frac{2}{\alpha}\,(y_t - u_t)\,\mathbf{1}(y_t > u_t)\right], \qquad \alpha = 0.05,\ \tfrac{2}{\alpha} = 40.$$
+
+In words: on each day, the **width of the band**, plus, if the value is outside the band,
+**40 times the distance to the band**; then the average over the days. It is in the units of
+the counts (daily cases), and **lower is better**. Example with a band from 10 to 30:
+
+| Value on the day | Inside? | Interval score for the day |
+|---|---|---|
+| 25 | yes | 30 - 10 = 20 |
+| 35 | no, 5 above | 20 + 40 x 5 = 220 |
+| 8 | no, 2 below | 20 + 40 x 2 = 100 |
+
+A band from 0 to 100 that always holds the value scores 100 every day, so a band five times
+narrower that holds the value scores better, but each missed day costs 40 times the miss. The
+factor 40 comes from the 95% level: missing by a little is cheap, missing by a lot is not, and
+a method that states a 95% band but misses often is punished. The interval score depends on
+the size of the counts, so it is compared between methods on the same data, not between datasets.
+
+**Error of the median** is the average distance between the median curve and the values,
+$\frac{1}{T}\sum_t |m_t - y_t|$, in daily counts.
+
+# Simulated data (no noise): the BiLSTM
+
+## Errors by window length
+
+Windows starting at the beginning of an epidemic. *Baseline*: the best possible guess for
+ptran and crate when R0 is known exactly (ptran from R0 and the average of 1/crate; crate =
+the middle of its range). *R0 MAE, any position*: the same, averaged over windows from the
+beginning, middle and end. *Coverage*: share of days on which the true count is inside the
+95% band of 100 simulations from the model's estimates.
+
+```{r sim-tables, results="asis"}
+nice <- function(M) {
+  d <- sim_tab[sim_tab$model == M, ]
+  d <- d[order(d$length), ]
+  data.frame(`Window (days)` = d$length, `Test windows` = d$windows, `R0 MAE` = d$R0_MAE,
+             `ptran MAE` = d$ptran_MAE, `ptran MAE, baseline` = d$ptran_baseline_MAE,
+             `crate MAE` = d$crate_MAE, `crate MAE, baseline` = d$crate_baseline_MAE,
+             `R0 MAE, any position` = d$R0_MAE_all_positions, `True R0 in 95% range (%)` = d$R0_in_range,
+             `Coverage: new infections (%)` = d$cov_new, `Coverage: currently infected (%)` = d$cov_infected,
+             check.names = FALSE)
+}
+cat(tab(nice("SEIR"), digits = 3, caption = tn("SEIR on noise-free simulated data")), sep = "\n")
+cat(tab(nice("SIR"), digits = 3, caption = tn("SIR on noise-free simulated data")), sep = "\n")
+```
+
+A window is used only if the test epidemic is still going for that many days, so there are
+fewer long windows, especially for SIR (about 70% of the SIR test epidemics end within 90
+days). The results for 270 and 365 days rest on few epidemics.
+
+```{r sim-fig, fig.width=12, fig.height=4, fig.cap=fc("Mean absolute error by window length (windows starting at the beginning of an epidemic). Dashed: the baseline for ptran and crate.")}
+op <- par(mfrow = c(1, 3), mar = c(4.5, 4.5, 3, 1))
+for (p in c("R0", "ptran", "crate")) {
+  col <- paste0(p, "_MAE"); base <- paste0(p, "_baseline_MAE")
+  yl <- range(c(0, sim_tab[[col]], if (p != "R0") sim_tab[[base]]))
+  plot(NA, xlim = range(LENGTHS), ylim = yl, xlab = "window length (days)", ylab = paste(p, "MAE"), main = p)
+  for (M in names(INFO)) {
+    d <- sim_tab[sim_tab$model == M, ]; d <- d[order(d$length), ]
+    lines(d$length, d[[col]], type = "b", pch = 16, lwd = 2, col = COLS[[M]])
+    if (p != "R0") lines(d$length, d[[base]], lty = 2, lwd = 1.5, col = COLS[[M]])
+  }
+  if (p == "R0") legend("topright", bty = "n", lwd = 2, pch = 16, col = COLS, legend = names(COLS))
+}
+par(op)
+```
+
+```{r sim-scatter, fig.width=12, fig.height=7.5, fig.cap=fc("Estimated vs true R0 for windows of 30, 90 and 180 days from the beginning of an epidemic. The line is perfect agreement.")}
+op <- par(mfrow = c(2, 3), mar = c(4.5, 4.5, 3, 1))
+for (M in names(INFO)) for (L in c(30, 90, 180)) {
+  d <- sim_all[sim_all$model == M & sim_all$length == L & sim_all$position == "beginning", ]
+  plot(d$R0_true, d$R0, pch = 16, cex = 0.5, col = adjustcolor(COLS[[M]], 0.5), xlim = c(0.7, 5.1), ylim = c(0.7, 5.1),
+       xlab = "true R0", ylab = "estimated R0", main = sprintf("%s, %d days (MAE %.2f, %d windows)", M, L,
+                                                             mean(abs(d$R0 - d$R0_true)), nrow(d)))
+  abline(0, 1, lty = 2)
+}
+par(op)
+```
+
+## Recovering the epidemic through time
+
+Coverage on each day of the window (share of windows whose true daily new infections are
+inside the 95% band on that day), for each window length:
+
+```{r sim-coverage-figs, out.width="100%", fig.cap=c(fc("Coverage of daily new infections through time, SEIR. Dashed line: 95%."), fc("The same for SIR."))}
+fig(FOLDERS[["SEIR"]], "figures", "coverage-by-day-plot-1.png")
+fig(FOLDERS[["SIR"]], "figures", "coverage-by-day-plot-1.png")
+```
+
+## Making the BiLSTM better: three versions
+
+Three versions of each model were trained and tested on the same 1,000 test epidemics:
+
+| Version | What it is |
+|---|---|
+| Current | settings tuned earlier for an older SEIR model; 300,000 training epidemics; 100 epochs at a constant learning rate |
+| Tuned | settings from a new search for this model (40 trials of 20 epochs; score: validation error of R0 and the starting state); otherwise as Current |
+| Big (used in this report) | the tuned settings, 1,000,000 training epidemics, and a learning rate that falls smoothly over 50 epochs |
+
+```{r versions, results="asis"}
+VERSIONS <- c(Current = "clean", Tuned = "clean_tuned", Big = "clean_big")
+ver <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(names(VERSIONS), function(v) {
+  d <- file.path(R, paste0(tolower(M), "_", VERSIONS[[v]]))
+  r0 <- read.csv(file.path(d, "R0_MAE_by_length_and_position.csv"))
+  b <- function(L) r0$R0_abs_error[r0$length == L & r0$position == "beginning"]
+  rr <- read.csv(file.path(d, "R0_range_check.csv"), check.names = FALSE)
+  cv <- read.csv(file.path(d, "coverage_by_length_and_position.csv"))
+  ao <- read.csv(file.path(d, "all_outputs.csv"))
+  data.frame(Model = M, Version = v, `30 days` = b(30), `61 days` = b(61), `90 days` = b(90), `180 days` = b(180),
+             `All windows` = mean(r0$R0_abs_error), `True R0 in 95% range (%)` = rr[rr[[1]] == "all", 2],
+             `Coverage: new infections (%)` = mean(cv$new_infections),
+             `Starting state error` = mean(ao$MAE[grepl("^log share", ao$output)]), check.names = FALSE)
+}))))
+cat(tab(blank_repeats(ver, "Model"), digits = 3, caption = tn(paste("R0 MAE of the three versions: windows from the beginning of an",
+  "epidemic (30-180 days) and all 21 window lengths and positions; the 95% R0 range; coverage of daily new",
+  "infections; and the starting-state error (mean absolute error of the log shares at the window start)"))), sep = "\n")
+```
+
+The **tuned** settings alone did not help: their advantage after 20 epochs on 100,000
+epidemics did not carry over to full training. The **big** version is a little better than
+the current one: R0 errors fall by about 3-12% for windows from the beginning of an epidemic
+up to 120 days, and the starting state is estimated about 5% better. Windows from the **end**
+of an epidemic did not improve with any change. On the earlier real datasets the big version
+was not better overall:
+
+```{r versions-real, results="asis"}
+rv <- lapply(c(Current = "clean_real_data", Big = "clean_real_data_big"), function(f) {
+  x <- read.csv(file.path(R, f, "results_by_window.csv")); x[x$method == "BiLSTM", ]
+})
+rt <- do.call(rbind, lapply(names(INFO), function(M) {
+  ds <- unique(rv$Current$dataset)
+  cv <- sapply(rv, function(x) vapply(ds, function(dn) mean(x$coverage[x$model == M & x$dataset == dn]), 0))
+  rbind(data.frame(Model = M, Dataset = ds, cv, check.names = FALSE),
+        data.frame(Model = M, Dataset = "All datasets", t(colMeans(sapply(rv, function(x) x$coverage[x$model == M]))),
+                   check.names = FALSE))
+}))
+names(rt)[3:4] <- c("Current version: coverage (%)", "Big version: coverage (%)")
+cat(tab(blank_repeats(rt, "Model"), digits = 0, caption = tn("BiLSTM coverage of the observed daily counts on the earlier real datasets (windows of 30-180 days ending a week after the peak): current vs big version")), sep = "\n")
+```
+
+# Simulated data: the BiLSTM against standard methods
+
+The test where the truth is known: 9 windows for each model, window length (30, 61, 120 and
+180 days) and position (beginning, middle, end), 108 windows per model, from the test
+epidemics of the noise-free models.
+
+## Summary
+
+```{r sim-summary, results="asis"}
+show <- function(cols, digits, caption) {
+  x <- sim_summary[, c("Model", "Method", cols)]
+  cat(tab(blank_repeats(x, "Model"), digits = digits, caption = tn(caption)), sep = "\n")
+}
+show(c("Windows (failed)", "R0 MAE", "R0 MAE: beginning", "R0 MAE: middle", "R0 MAE: end", "True R0 in 95% range (%)",
+       "Starting state error (% points)", "Seconds per window", "Model runs per window"), 2,
+     "Parameter recovery and cost. BiLSTM seconds: one network pass for all windows of a model, divided by the number of windows.")
+show(c("Coverage: new infections (%)", "Coverage: currently infected (%)", "Coverage: next 14 days (%)",
+       "Interval score: new infections", "Interval score: currently infected", "Interval score: next 14 days"), 1,
+     "Trajectories and prediction: coverage (higher is better) and interval score (lower is better) of the true daily new infections in the window, of the true number currently infectious (which no method sees), and of the daily new infections in the 14 days after the window.")
+```
+
+## R0 by window length and position
+
+```{r sim-cells, results="asis"}
+for (M in names(INFO)) {
+  a <- aggregate(error ~ position + length + method, sbr_ok[sbr_ok$model == M, ], mean)
+  w <- reshape(a, idvar = c("position", "length"), timevar = "method", direction = "wide")
+  names(w) <- sub("^error\\.", "", names(w))
+  w <- w[order(match(w$position, POSITIONS), w$length), c("position", "length", intersect(METHODS, names(w)))]
+  names(w)[1:2] <- c("Position", "Window (days)")
+  cat(tab(blank_repeats(w, "Position"), digits = 3, caption = tn(sprintf("%s: R0 mean absolute error, simulated windows (9 windows each)", M))), sep = "\n")
+}
+```
+
+```{r sim-cell-fig, fig.width=13, fig.height=8, fig.cap=fc("R0 mean absolute error by window length, for windows from the beginning, middle and end of an epidemic.")}
+op <- par(mfrow = c(2, 3), mar = c(4.5, 4.5, 3, 1))
+for (M in names(INFO)) for (pos in POSITIONS) {
+  a <- aggregate(error ~ length + method, sbr_ok[sbr_ok$model == M & sbr_ok$position == pos, ], mean)
+  plot(NA, xlim = range(a$length), ylim = c(0, max(a$error)), xlab = "window length (days)", ylab = "R0 MAE", main = paste(M, "-", pos))
+  for (m in METHODS) {
+    x <- a[a$method == m, ]; x <- x[order(x$length), ]
+    lines(x$length, x$error, type = "b", pch = 16, lwd = if (m == "BiLSTM") 3 else 1.5, col = METHOD_COLS[[m]])
+  }
+  if (M == "SEIR" && pos == "beginning") legend("topright", bty = "n", lwd = 2, pch = 16, col = METHOD_COLS, legend = METHODS)
+}
+par(op)
+```
+
+```{r sim-method-scatter, fig.width=14, fig.height=6.5, fig.cap=fc("Estimated vs true R0 for every simulated window (circles: beginning, triangles: middle, squares: end). The line is perfect agreement.")}
+op <- par(mfrow = c(2, length(METHODS)), mar = c(4, 4, 2.5, 0.5))
+for (M in names(INFO)) for (m in METHODS) {
+  d <- sbr_ok[sbr_ok$model == M & sbr_ok$method == m, ]
+  plot(d$R0_true, d$R0, pch = c(beginning = 16, middle = 17, end = 15)[d$position], cex = 0.8,
+       col = adjustcolor(METHOD_COLS[[m]], 0.7), xlim = c(0.7, 5.1), ylim = c(0.7, 5.1),
+       xlab = "true R0", ylab = "estimated R0", main = sprintf("%s, %s (MAE %.2f)", M, m, mean(d$error)))
+  abline(0, 1, lty = 2)
+}
+par(op)
+```
+
+## Trajectories and prediction by position
+
+```{r sim-traj, results="asis"}
+for (M in names(INFO)) {
+  d <- sbr_ok[sbr_ok$model == M, ]
+  out <- do.call(rbind, lapply(POSITIONS, function(p) do.call(rbind, lapply(METHODS, function(m) {
+    x <- d[d$position == p & d$method == m, ]
+    data.frame(Position = p, Method = m, `Coverage: new infections` = mean(x$cov_new),
+               `Coverage: currently infected` = mean(x$cov_infected), `Coverage: next 14 days` = mean(x$cov_future, na.rm = TRUE),
+               `Interval score: new infections` = mean(x$IS_new), `Interval score: currently infected` = mean(x$IS_infected),
+               `Interval score: next 14 days` = mean(x$IS_future, na.rm = TRUE), check.names = FALSE)
+  }))))
+  cat(tab(blank_repeats(out, "Position"), digits = 1, caption = tn(sprintf("%s: coverage (%%) and interval score by window position, simulated windows", M))), sep = "\n")
+}
+```
+
+## How sure can we be? (paired comparison)
+
+For every window, each baseline's R0 error minus the BiLSTM's on the **same** window (positive:
+the BiLSTM is more accurate), with a 95% bootstrap interval over windows.
+
+```{r sim-paired, results="asis"}
+set.seed(3)
+pair <- merge(sbr_ok[sbr_ok$method != "BiLSTM", c("id", "model", "position", "method", "error")],
+              sbr_ok[sbr_ok$method == "BiLSTM", c("id", "error")], by = "id", suffixes = c("", "_bilstm"))
+pt <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(BASELINES, function(m) {
+  do.call(rbind, lapply(c("all", POSITIONS), function(pos) {
+    p <- pair[pair$model == M & pair$method == m & (pos == "all" | pair$position == pos), ]
+    if (nrow(p) < 2) return(NULL)
+    dlt <- p$error - p$error_bilstm
+    ci <- quantile(replicate(2000, mean(sample(dlt, replace = TRUE))), c(0.025, 0.975), names = FALSE)
+    data.frame(Model = M, Method = m, Windows = pos, n = nrow(p), `Mean difference` = mean(dlt),
+               `95% interval` = sprintf("%.3f to %.3f", ci[1], ci[2]),
+               `BiLSTM more accurate (% of windows)` = 100 * mean(p$error_bilstm < p$error), check.names = FALSE)
+  }))
+}))))
+cat(tab(blank_repeats(pt, "Model"), digits = 3, caption = tn("Paired difference in R0 error, simulated windows")), sep = "\n")
+```
+
+# Real data: the BiLSTM against standard methods
+
+## The data and the windows
+
+- **US states:** daily COVID-19 cases (Johns Hopkins University) in the 10 states that reported
+  cases every day, with no negative corrections, in all three waves (fall 2020, Delta 2021,
+  Omicron 2021-22), scaled to cases per 10,000 people, `n = 10,000`. (States that skipped
+  weekends have zeros on about 30% of the days, which a noise-free model reads as no new
+  infections.)
+- **Utah and Baltimore:** Utah COVID-19 cases (the last year of the Utah data, 2024-25, and the
+  summer 2023 wave), Utah influenza hospital admissions (2022-23 and 2023-24 seasons) and
+  Baltimore influenza cases in 1918.
+- **Windows:** 30, 60 and 90 days at the **beginning**, the **middle** (centred on the peak)
+  and the **end** of each wave (windows longer than a wave are skipped). Known values:
+  COVID-19 `recov` = 1/7, `incub` = 5 days; influenza `recov` = 0.25, `incub` = 2 days.
+
+```{r real-data-table, results="asis"}
+w1 <- real[real$model == "SEIR" & real$method == "BiLSTM", ]
+dt <- aggregate(id ~ group + wave, w1, length)
+dt <- dt[order(dt$group != "Utah and Baltimore", match(dt$wave, names(rwaves))), ]
+names(dt) <- c("Data group", "Wave", "Windows")
+cat(tab(blank_repeats(dt, "Data group"), digits = 0, caption = tn("The waves and the number of windows in each (per model)")), sep = "\n")
+```
+
+```{r real-data-plot, fig.width=13, fig.height=19, fig.cap=fc("Daily counts in each wave (blue; US states: cases per 10,000 people). Grey bars: the 60-day windows at the beginning, middle and end.")}
+op <- par(mfrow = c(ceiling(length(rwaves) / 3), 3), mar = c(2, 4, 2, 0.5))
+for (v in rwaves) {
+  plot(v$x, v$y, type = "l", col = "blue", xlab = "", ylab = "daily count", main = v$name, cex.main = 0.9)
+  usr <- par("usr")
+  for (j in seq_along(POSITIONS)) {
+    w <- Filter(function(z) z$wave == v$name && z$length == 60 && z$position == POSITIONS[j], rwin)
+    if (!length(w)) next
+    w <- w[[1]]; yy <- usr[4] - j * (usr[4] - usr[3]) * 0.05
+    segments(w$x[1], yy, w$x[w$length], yy, lwd = 3, col = "grey40")
+  }
+}
+par(op)
+```
+
+## How to read the tables
+
+- **Overall**: one row per model, data group and method, averaged over **all** windows of the
+  group (every wave, window length and position): `r sum(w1$group == "US states")` windows for the
+  US states and `r sum(w1$group != "US states")` for Utah and Baltimore.
+- **By window length and position**: the same, split by window length and by where the window
+  sits in the wave (beginning, middle around the peak, end).
+- **By wave**: one row per wave (for example "New York fall 2020"), averaged over its windows
+  (3 lengths x 3 positions = 9 windows, fewer for short waves). "Utah COVID-19 2024-25" is the
+  last year of the Utah data rather than a single wave.
+- Real data have no true values: all measures compare the bands with the **observed** daily
+  counts (Section 2.3). The interval score is in daily counts, so it is compared between
+  methods on the same data, not between datasets.
+
+## Overall
+
+```{r real-overall, results="asis"}
+x <- real_summary[, c("Model", "Data", "Method", "Windows (failed)", "Coverage (%)", "Interval score", "Band width",
+                      "Error of the median", "Coverage: next 14 days (%)", "Interval score: next 14 days", "Seconds per window")]
+cat(tab(blank_repeats(x, "Model"), digits = 1, caption = tn("Real data: coverage and interval score of the observed daily counts in the window and in the 14 days after it, mean band width, error of the median, and time")), sep = "\n")
+```
+
+## By window length and position
+
+```{r real-cells, results="asis"}
+cell_table <- function(M, g, what) {
+  a <- aggregate(as.formula(paste(what, "~ position + length + method")), real_ok[real_ok$model == M & real_ok$group == g, ], mean)
+  w <- reshape(a, idvar = c("position", "length"), timevar = "method", direction = "wide")
+  names(w) <- sub(paste0("^", what, "\\."), "", names(w))
+  w <- w[order(match(w$position, POSITIONS), w$length), c("position", "length", intersect(METHODS, names(w)))]
+  names(w)[1:2] <- c("Position", "Window (days)")
+  blank_repeats(w, "Position")
+}
+for (g in c("US states", "Utah and Baltimore")) for (M in names(INFO)) {
+  cat(tab(cell_table(M, g, "coverage"), digits = 0, caption = tn(sprintf("%s, %s: coverage (%%) of the observed daily counts", M, g))), sep = "\n")
+  cat(tab(cell_table(M, g, "interval_score"), digits = 1, caption = tn(sprintf("%s, %s: interval score", M, g))), sep = "\n")
+}
+```
+
+```{r real-cell-fig, fig.width=13, fig.height=8, fig.cap=fc("US states: coverage by window length, for windows at the beginning, middle and end of the waves. Dashed: 95%.")}
+op <- par(mfrow = c(2, 3), mar = c(4.5, 4.5, 3, 1))
+for (M in names(INFO)) for (pos in POSITIONS) {
+  a <- aggregate(coverage ~ length + method, real_ok[real_ok$model == M & real_ok$group == "US states" & real_ok$position == pos, ], mean)
+  plot(NA, xlim = range(a$length), ylim = c(0, 100), xlab = "window length (days)", ylab = "coverage %", main = paste(M, "-", pos))
+  abline(h = 95, lty = 2)
+  for (m in METHODS) {
+    x <- a[a$method == m, ]; x <- x[order(x$length), ]
+    lines(x$length, x$coverage, type = "b", pch = 16, lwd = if (m == "BiLSTM") 3 else 1.5, col = METHOD_COLS[[m]])
+  }
+  if (M == "SEIR" && pos == "beginning") legend("bottomleft", bty = "n", lwd = 2, pch = 16, col = METHOD_COLS, legend = METHODS)
+}
+par(op)
+```
+
+## Prediction: the 14 days after the window
+
+```{r real-future, results="asis"}
+for (M in names(INFO)) {
+  d <- real_ok[real_ok$model == M & !is.na(real_ok$cov_future), ]
+  a <- aggregate(cov_future ~ group + position + method, d, mean)
+  w <- reshape(a, idvar = c("group", "position"), timevar = "method", direction = "wide")
+  names(w) <- sub("^cov_future\\.", "", names(w))
+  w <- w[order(w$group, match(w$position, POSITIONS)), c("group", "position", intersect(METHODS, names(w)))]
+  names(w)[1:2] <- c("Data", "Position")
+  cat(tab(blank_repeats(w, "Data"), digits = 0, caption = tn(sprintf("%s: coverage (%%) of the observed counts in the 14 days after the window (where the data go on)", M))), sep = "\n")
+}
+```
+
+## Utah COVID-19
+
+```{r real-utah, results="asis"}
+U <- c("Utah COVID-19 2024-25", "Utah COVID-19 summer 2023")
+for (M in names(INFO)) {
+  d <- real_ok[real_ok$model == M & real_ok$wave %in% U, ]
+  out <- do.call(rbind, lapply(U, function(u) do.call(rbind, lapply(c(POSITIONS, "all"), function(p) {
+    x <- d[d$wave == u & (p == "all" | d$position == p), ]
+    data.frame(Data = u, Position = p, t(vapply(METHODS, function(m) {
+      y <- x[x$method == m, ]; if (nrow(y)) sprintf("%.0f%% | %.0f", mean(y$coverage), mean(y$interval_score)) else "failed"
+    }, "")), check.names = FALSE)
+  }))))
+  cat(tab(blank_repeats(out, "Data"), caption = tn(sprintf("%s, Utah COVID-19: coverage | interval score by window position (mean over the window lengths)", M))), sep = "\n")
+}
+```
+
+## By wave
+
+```{r real-waves, results="asis"}
+for (M in names(INFO)) {
+  a <- aggregate(coverage ~ wave + method, real_ok[real_ok$model == M, ], mean)
+  w <- reshape(a, idvar = "wave", timevar = "method", direction = "wide")
+  names(w) <- sub("^coverage\\.", "", names(w))
+  w <- w[match(names(rwaves), w$wave), c("wave", intersect(METHODS, names(w)))]
+  names(w)[1] <- "Wave"
+  cat(tab(w, digits = 0, caption = tn(sprintf("%s: coverage (%%) by wave (mean over its windows)", M))), sep = "\n")
+}
+```
+
+## R0 estimates
+
+The 60-day windows around the peak of the Utah and Baltimore data. The BiLSTM's ptran and crate
+are shown for completeness: as on simulated data, only R0 carries information.
+
+```{r real-r0, results="asis"}
+bil <- readRDS(file.path(REAL, "bilstm_fits.rds"))
+for (M in names(INFO)) {
+  d <- real[real$model == M & real$group == "Utah and Baltimore" & real$length == 60 & real$position == "middle", ]
+  out <- do.call(rbind, lapply(unique(d$wave), function(u) {
+    x <- d[d$wave == u, ]; b <- x[x$method == "BiLSTM", ]; f <- bil[[paste(M, b$id)]]
+    ptran <- f$draws[[1]]$ptran; recov <- f$draws[[1]]$recov
+    cell <- function(m) { y <- x[x$method == m, ]
+      if (!nrow(y) || isTRUE(y$failed)) "failed" else if (is.na(y$R0_low)) sprintf("%.2f", y$R0) else
+        sprintf("%.2f (%.2f-%.2f)", y$R0, y$R0_low, y$R0_high) }
+    data.frame(Data = u, `BiLSTM R0 (95% range)` = cell("BiLSTM"), `BiLSTM ptran` = sprintf("%.3f", ptran),
+               `BiLSTM crate` = sprintf("%.1f", b$R0 * recov / ptran),
+               t(vapply(BASELINES, function(m) cell(m), "")), check.names = FALSE)
+  }))
+  cat(tab(out, caption = tn(sprintf("%s: R0 estimates (95%% range where the method gives one)", M))), sep = "\n")
+}
+```
+
+## Examples
+
+The 60-day windows (rows: waves; columns: beginning, middle, end). Blue: the observed counts;
+green: the BiLSTM's 95% band and median; red dashed: ABC-MCMC's band; gold dotted: DE's band.
+Panel titles: coverage of BiLSTM | ABC-MCMC | DE.
+
+```{r real-examples-def}
+example_groups <- list(`Utah COVID-19` = c("Utah COVID-19 2024-25", "Utah COVID-19 summer 2023"),
+                       Influenza = c("Utah flu 2022-23", "Utah flu 2023-24", "Baltimore flu 1918"),
+                       `New York` = grep("^New York ", names(rwaves), value = TRUE),
+                       Texas = grep("^Texas ", names(rwaves), value = TRUE),
+                       `North Dakota` = grep("^North Dakota ", names(rwaves), value = TRUE))
+plot_examples <- function(M, waves_shown) {
+  op <- par(mfrow = c(length(waves_shown), 3), mar = c(2.5, 4, 3, 0.5))
+  for (wv in waves_shown) for (pos in POSITIONS) {
+    w <- Filter(function(z) z$wave == wv && z$length == 60 && z$position == pos, rwin)
+    if (!length(w)) { plot.new(); next }
+    w <- w[[1]]; i <- seq_len(w$length)
+    f <- lapply(setNames(c("BiLSTM", "ABC-MCMC", "DE"), c("BiLSTM", "ABC-MCMC", "DE")), function(m) rfit(M, w$id, m))
+    top <- max(c(w$y, f$BiLSTM$band$upper[i], pmin(f$`ABC-MCMC`$band$upper[i], 2.5 * max(w$y))))
+    plot(w$x, w$y, type = "n", ylim = c(0, top), xlab = "", ylab = "daily count", cex.main = 0.85,
+         main = sprintf("%s, %s\n%.0f%% | %.0f%% | %.0f%%", wv, pos, f$BiLSTM$window[["coverage"]],
+                        f$`ABC-MCMC`$window[["coverage"]], f$DE$window[["coverage"]]))
+    b <- f$BiLSTM$band[i, ]
+    polygon(c(w$x, rev(w$x)), c(b$upper, rev(b$lower)), col = adjustcolor("forestgreen", 0.3), border = NA)
+    lines(w$x, b$median, col = "forestgreen", lwd = 2)
+    lines(w$x, f$`ABC-MCMC`$band$upper[i], col = "firebrick", lty = 2); lines(w$x, f$`ABC-MCMC`$band$lower[i], col = "firebrick", lty = 2)
+    lines(w$x, f$DE$band$upper[i], col = "goldenrod", lty = 3, lwd = 1.5); lines(w$x, f$DE$band$lower[i], col = "goldenrod", lty = 3, lwd = 1.5)
+    lines(w$x, w$y, col = "blue", lwd = 1.3)
+  }
+  par(op)
+}
+```
+
+```{r ex-seir-utah, fig.width=14, fig.height=7, fig.cap=fc("SEIR on Utah COVID-19. ABC-MCMC's high coverage here comes partly from very wide bands.")}
+plot_examples("SEIR", example_groups[["Utah COVID-19"]])
+```
+
+```{r ex-sir-utah, fig.width=14, fig.height=7, fig.cap=fc("SIR on Utah COVID-19.")}
+plot_examples("SIR", example_groups[["Utah COVID-19"]])
+```
+
+```{r ex-seir-flu, fig.width=14, fig.height=10, fig.cap=fc("SEIR on the influenza data.")}
+plot_examples("SEIR", example_groups[["Influenza"]])
+```
+
+```{r ex-sir-flu, fig.width=14, fig.height=10, fig.cap=fc("SIR on the influenza data.")}
+plot_examples("SIR", example_groups[["Influenza"]])
+```
+
+```{r ex-seir-ny, fig.width=14, fig.height=10, fig.cap=fc("SEIR on New York.")}
+plot_examples("SEIR", example_groups[["New York"]])
+```
+
+```{r ex-sir-ny, fig.width=14, fig.height=10, fig.cap=fc("SIR on New York.")}
+plot_examples("SIR", example_groups[["New York"]])
+```
+
+```{r ex-seir-tx, fig.width=14, fig.height=10, fig.cap=fc("SEIR on Texas.")}
+plot_examples("SEIR", example_groups[["Texas"]])
+```
+
+```{r ex-seir-nd, fig.width=14, fig.height=10, fig.cap=fc("SEIR on North Dakota.")}
+plot_examples("SEIR", example_groups[["North Dakota"]])
+```
+
+# Predicting cases with the renewal equation
+
+The bands above come from running the agent-based model 500 times from each method's
+estimates. A faster way to turn the BiLSTM's estimates into a predicted curve is the
+**renewal equation**: the number of people who become infectious on day $t$ is R0 times the
+share still susceptible times the people infected before, weighted by how long ago,
+
+$$C_t = R_0 \, \frac{S_{t-1}}{n} \sum_{k \ge 1} g_k \, C_{t-k},$$
+
+where $g_k$ is the model's **generation interval**, the chance that an infection happens $k$
+days after the infector was infected (SIR: the infectious time, mean $1/\text{recov}$ days; SEIR:
+the incubation time, mean `incub` days, plus the infectious time). It gives the **average** curve
+of the model, with no randomness. Only R0 is needed (ptran and crate enter only through
+R0 = ptran x crate / recov). Because both waiting times in the model are geometric, the sum can
+be carried day by day with the numbers exposed, infectious and susceptible (`renewal_curve()` in
+`methods_common.R`); the people already exposed or infectious on the first day of the window
+start it. Bands: one curve for each of the BiLSTM's parameter draws (its R0 range), and on each
+day a Poisson count around the curve.
+
+The renewal equation needs the state on the first day of the window (the **initial cases**).
+Two ways are compared:
+
+- **Renewal A**: the BiLSTM's own estimate of the starting state;
+- **Renewal B**: the initial cases worked out **by the renewal equation**: with R0 fixed at the
+  BiLSTM's estimate, the shares exposed, infectious and recovered on the first day that make
+  the renewal curve closest to the observed counts (least squares; repeated for 30 values from
+  the BiLSTM's R0 range to get a band).
+
+```{r renewal-check, results="asis"}
+source("methods_common.R")
+chk <- do.call(rbind, lapply(c("SEIR", "SIR"), function(M) {
+  info <- model_info(M)
+  base <- list(n = 8000, recov = 0.15, incub = 4, ptran = if (M == "SEIR") 0.03 else 0.1, crate = if (M == "SEIR") 10 else 3)
+  do.call(rbind, lapply(list(c(0.002, 0.001, 0), c(0.02, 0.05, 0.3)), function(s) {
+    p <- c(base, list(exposed_share = if (M == "SEIR") s[1] else 0, infected_share = s[2], recovered_share = s[3]))
+    abm <- rowMeans(vapply(1:200, function(k) run_model(info, p, 90, k)$new, numeric(90)))
+    rn <- renewal_curve(info, p, 90)$new
+    data.frame(Model = M, `Start: infectious, recovered (%)` = sprintf("%.1f, %.0f", 100 * s[2], 100 * s[3]),
+               `Total, model (mean of 200 runs)` = sum(abm), `Total, renewal` = sum(rn),
+               `Peak day, model` = which.max(abm), `Peak day, renewal` = which.max(rn),
+               `Mean daily difference` = mean(abs(abm - rn)), `Peak size, model` = max(abm), check.names = FALSE)
+  }))
+}))
+cat(tab(blank_repeats(chk, "Model"), digits = 1, caption = tn("The renewal equation against the agent-based model (R0 = 2, n = 8,000, 90 days)")), sep = "\n")
+```
+
+```{r renewal-compute}
+CORES <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
+n_b <- 30   # R0 values from the BiLSTM's range for renewal B
+renewal_scores <- function(info, w_y, known, draws, R0_hat, days, truth_infected = NULL, future = numeric(0), true_state = NULL) {
+  L <- length(w_y); i_win <- seq_len(L); i_fut <- L + seq_along(future)
+  t0 <- proc.time()[["elapsed"]]
+  bA <- renewal_band(info, draws, days)
+  tA <- proc.time()[["elapsed"]] - t0
+  t0 <- proc.time()[["elapsed"]]
+  R0s <- stats::quantile(vapply(draws, function(p) p$ptran * p$crate / p$recov, 0), seq(0.02, 0.98, length.out = n_b), names = FALSE)
+  drawsB <- lapply(R0s, function(r) renewal_initial_state(info, w_y, r, known))
+  bB <- renewal_band(info, drawsB, days)
+  tB <- proc.time()[["elapsed"]] - t0
+  pB <- renewal_initial_state(info, w_y, R0_hat, known)
+  one <- function(b, label, secs, state) {
+    s_new <- score_band(b$new, w_y, i_win)
+    s_fut <- if (length(future)) score_band(b$new, future, i_fut) else c(coverage = NA, interval_score = NA)
+    s_inf <- if (!is.null(truth_infected)) score_band(b$infected, truth_infected, i_win) else c(coverage = NA, interval_score = NA)
+    data.frame(approach = label, cov_new = s_new[["coverage"]], IS_new = s_new[["interval_score"]],
+               cov_infected = s_inf[["coverage"]], IS_infected = s_inf[["interval_score"]],
+               cov_future = s_fut[["coverage"]], IS_future = s_fut[["interval_score"]], seconds = secs,
+               state_error = if (is.null(true_state)) NA else 100 * mean(abs(unlist(state[names(true_state)]) - true_state)))
+  }
+  rbind(one(bA, "Renewal A (BiLSTM state)", tA, draws[[1]]), one(bB, "Renewal B (initial cases by renewal)", tB, pB))
+}
+sim_file <- file.path(OUT, "renewal_simulated.csv")
+if (!file.exists(sim_file)) {
+  sw <- readRDS(file.path(SIM, "windows.rds")); sbil <- readRDS(file.path(SIM, "bilstm_fits.rds"))
+  out <- parallel::mclapply(names(sw$windows), function(id) {
+    set.seed(match(id, names(sw$windows)))
+    w <- sw$windows[[id]]; tr <- sw$truth[[id]]; f <- sbil[[id]]; info <- model_info(w$model)
+    st <- f$state[info$states]   # the BiLSTM's own state estimate (renewal A)
+    draws <- f$draws
+    d <- renewal_scores(info, w$y, w$known, draws, f$R0, w$length + length(tr$future), tr$infected, tr$future, w$state)
+    d$state_error[1] <- 100 * mean(abs(st - w$state))
+    cbind(model = w$model, id = id, position = w$position, length = w$length, d)
+  }, mc.cores = CORES)
+  write.csv(do.call(rbind, out), sim_file, row.names = FALSE)
+}
+ren_sim <- read.csv(sim_file)
+real_file <- file.path(OUT, "renewal_real.csv")
+if (!file.exists(real_file)) {
+  rbil <- readRDS(file.path(REAL, "bilstm_fits.rds"))
+  jobs <- expand.grid(M = names(INFO), id = names(rwin), stringsAsFactors = FALSE)
+  out <- parallel::mclapply(seq_len(nrow(jobs)), function(k) {
+    set.seed(k)
+    M <- jobs$M[k]; w <- rwin[[jobs$id[k]]]; f <- rbil[[paste(M, w$id)]]; info <- model_info(M)
+    d <- renewal_scores(info, w$y, w$known[info$known], f$draws, f$R0, w$length + length(w$future), NULL, w$future)
+    cbind(model = M, id = w$id, group = w$group, wave = w$wave, position = w$position, length = w$length, d)
+  }, mc.cores = CORES)
+  write.csv(do.call(rbind, out), real_file, row.names = FALSE)
+}
+ren_real <- read.csv(real_file)
+# Time of the 500 agent-based runs for a band, measured on a few windows for comparison.
+abm_time <- local({
+  sw <- readRDS(file.path(SIM, "windows.rds")); sbil <- readRDS(file.path(SIM, "bilstm_fits.rds"))
+  ids <- names(sw$windows)[seq(1, length(sw$windows), length.out = 6)]
+  vapply(ids, function(id) { w <- sw$windows[[id]]
+    system.time(band_of(model_info(w$model), sbil[[id]]$draws, w$length + 14))[["elapsed"]] }, 0)
+})
+```
+
+## Simulated windows
+
+The BiLSTM's estimates turned into curves in three ways: running the agent-based model 500
+times (as in the rest of the report), renewal A and renewal B.
+
+```{r renewal-sim, results="asis"}
+abm <- sbr_ok[sbr_ok$method == "BiLSTM", ]
+row_of <- function(d, label, M) data.frame(Model = M, Approach = label,
+  `Starting state error (% points)` = mean(d$state_error), `Coverage: new infections` = mean(d$cov_new),
+  `Interval score: new infections` = mean(d$IS_new), `Coverage: currently infected` = mean(d$cov_infected),
+  `Interval score: currently infected` = mean(d$IS_infected), `Coverage: next 14 days` = mean(d$cov_future, na.rm = TRUE),
+  `Interval score: next 14 days` = mean(d$IS_future, na.rm = TRUE), check.names = FALSE)
+rs_tab <- do.call(rbind, lapply(names(INFO), function(M) rbind(
+  row_of(abm[abm$model == M, ], "Agent-based model, 500 runs", M),
+  do.call(rbind, lapply(unique(ren_sim$approach), function(a) row_of(ren_sim[ren_sim$model == M & ren_sim$approach == a, ], a, M))))))
+cat(tab(blank_repeats(rs_tab, "Model"), digits = 1, caption = tn("Simulated windows: the BiLSTM's estimates turned into curves by the agent-based model or by the renewal equation (starting state error: the starting state used)")), sep = "\n")
+pos_tab <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(POSITIONS, function(p) {
+  a <- abm[abm$model == M & abm$position == p, ]; r <- ren_sim[ren_sim$model == M & ren_sim$position == p, ]
+  data.frame(Model = M, Position = p,
+             `Coverage, model 500 runs` = mean(a$cov_new),
+             `Coverage, renewal A` = mean(r$cov_new[r$approach == unique(ren_sim$approach)[1]]),
+             `Coverage, renewal B` = mean(r$cov_new[r$approach == unique(ren_sim$approach)[2]]),
+             `State error, BiLSTM (A)` = mean(r$state_error[r$approach == unique(ren_sim$approach)[1]]),
+             `State error, renewal (B)` = mean(r$state_error[r$approach == unique(ren_sim$approach)[2]]), check.names = FALSE)
+}))))
+cat(tab(blank_repeats(pos_tab, "Model"), digits = 1, caption = tn("Simulated windows by position: coverage of the true daily new infections, and the error of the starting state (percentage points)")), sep = "\n")
+```
+
+## Real data
+
+```{r renewal-real, results="asis"}
+ra <- real_ok[real_ok$method %in% c("BiLSTM", "ABC-MCMC"), ]
+row_r <- function(d, label, M, g) data.frame(Model = M, Data = g, Approach = label, `Coverage (%)` = mean(d$coverage),
+  `Interval score` = mean(d$interval_score), `Coverage: next 14 days` = mean(d$cov_future, na.rm = TRUE),
+  `Interval score: next 14 days` = mean(d[[if ("is_future" %in% names(d)) "is_future" else "IS_future"]], na.rm = TRUE), check.names = FALSE)
+groups <- list(`US states` = function(d) d$group == "US states", `Utah and Baltimore` = function(d) d$group == "Utah and Baltimore",
+               `Utah COVID-19 only` = function(d) grepl("Utah COVID", d$wave))
+rr_tab <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(names(groups), function(g) {
+  sel <- groups[[g]]
+  a <- ra[ra$model == M & sel(ra), ]
+  r <- ren_real[ren_real$model == M & sel(ren_real), ]
+  r$coverage <- r$cov_new; r$interval_score <- r$IS_new
+  rbind(row_r(a[a$method == "BiLSTM", ], "BiLSTM, model 500 runs", M, g),
+        do.call(rbind, lapply(unique(r$approach), function(x) row_r(r[r$approach == x, ], paste("BiLSTM,", x), M, g))),
+        row_r(a[a$method == "ABC-MCMC", ], "ABC-MCMC, model 500 runs", M, g))
+}))))
+rr_tab$Data[duplicated(paste(rr_tab$Model, rr_tab$Data))] <- ""
+rr_tab <- blank_repeats(rr_tab, "Model")
+cat(tab(rr_tab, digits = 1, caption = tn("Real data: coverage and interval score of the observed daily counts in the window and in the 14 days after it")), sep = "\n")
+```
+
+```{r renewal-examples, fig.width=14, fig.height=7, fig.cap=fc("SEIR on Utah COVID-19, 60-day windows. Blue: observed; green: BiLSTM, model 500 runs; dark blue dashed: renewal A; orange dotted: renewal B. Titles: coverage of model runs | renewal A | renewal B.")}
+rbil <- readRDS(file.path(REAL, "bilstm_fits.rds"))
+op <- par(mfrow = c(2, 3), mar = c(2.5, 4, 3, 0.5))
+set.seed(5)
+for (wv in c("Utah COVID-19 2024-25", "Utah COVID-19 summer 2023")) for (pos in POSITIONS) {
+  w <- Filter(function(z) z$wave == wv && z$length == 60 && z$position == pos, rwin)[[1]]
+  info <- model_info("SEIR"); f <- rbil[[paste("SEIR", w$id)]]; i <- seq_len(w$length)
+  bA <- renewal_band(info, f$draws, w$length)$new
+  R0s <- stats::quantile(vapply(f$draws, function(p) p$ptran * p$crate / p$recov, 0), seq(0.02, 0.98, length.out = n_b), names = FALSE)
+  bB <- renewal_band(info, lapply(R0s, function(r) renewal_initial_state(info, w$y, r, w$known[info$known])), w$length)$new
+  bM <- rfit("SEIR", w$id, "BiLSTM")$band[i, ]
+  cv <- c(mean(w$y >= bM$lower & w$y <= bM$upper), mean(w$y >= bA$lower & w$y <= bA$upper), mean(w$y >= bB$lower & w$y <= bB$upper))
+  top <- max(c(w$y, bM$upper, bA$upper, bB$upper))
+  plot(w$x, w$y, type = "n", ylim = c(0, top), xlab = "", ylab = "daily count", cex.main = 0.85,
+       main = sprintf("%s, %s\n%.0f%% | %.0f%% | %.0f%%", wv, pos, 100 * cv[1], 100 * cv[2], 100 * cv[3]))
+  polygon(c(w$x, rev(w$x)), c(bM$upper, rev(bM$lower)), col = adjustcolor("forestgreen", 0.25), border = NA)
+  lines(w$x, bA$upper, col = "navy", lty = 2); lines(w$x, bA$lower, col = "navy", lty = 2); lines(w$x, bA$median, col = "navy", lwd = 1.5)
+  lines(w$x, bB$upper, col = "darkorange", lty = 3, lwd = 1.5); lines(w$x, bB$lower, col = "darkorange", lty = 3, lwd = 1.5)
+  lines(w$x, bB$median, col = "darkorange", lwd = 1.5)
+  lines(w$x, w$y, col = "blue", lwd = 1.3)
+}
+par(op)
+```
+
+## Time
+
+```{r renewal-time, results="asis"}
+cat(tab(data.frame(
+  `Turning the estimates into a band` = c("Agent-based model, 500 runs", "Renewal A", "Renewal B (30 fits of the initial cases)"),
+  `Seconds per window` = c(mean(abm_time), mean(c(ren_sim$seconds[grepl("^Renewal A", ren_sim$approach)], ren_real$seconds[grepl("^Renewal A", ren_real$approach)])),
+                           mean(c(ren_sim$seconds[grepl("^Renewal B", ren_sim$approach)], ren_real$seconds[grepl("^Renewal B", ren_real$approach)]))),
+  check.names = FALSE), digits = 2, caption = tn("Time to turn the BiLSTM's estimates into a band (one CPU core; the agent-based time is measured on 6 simulated windows with 14 extra days)")), sep = "\n")
+```
+
+# Computational cost
+
+The BiLSTM has a **one-time cost** (simulating its training epidemics and training the
+networks) and then costs almost nothing per window. The other methods cost the same for every
+window, because each window needs its own thousands of model runs.
+
+## Time per window
+
+Each baseline ran on one CPU core per window. The BiLSTM's time is one network pass over all
+windows of a model on the CPU, divided by the number of windows (a single window on its own
+takes about 0.05-0.1 seconds, mostly loading).
+
+```{r cost-window, results="asis"}
+per <- function(d, M, m, col) mean(d[[col]][d$model == M & d$method == m], na.rm = TRUE)
+cw <- data.frame(Method = METHODS,
+  `Simulated, SEIR: seconds` = sapply(METHODS, function(m) per(sbr_ok, "SEIR", m, "seconds")),
+  `Simulated, SIR: seconds` = sapply(METHODS, function(m) per(sbr_ok, "SIR", m, "seconds")),
+  `Real data, SEIR: seconds` = sapply(METHODS, function(m) per(real_ok, "SEIR", m, "seconds")),
+  `Real data, SIR: seconds` = sapply(METHODS, function(m) per(real_ok, "SIR", m, "seconds")),
+  `Simulated, SEIR: model runs` = sapply(METHODS, function(m) per(sbr_ok, "SEIR", m, "model_runs")),
+  `Simulated, SIR: model runs` = sapply(METHODS, function(m) per(sbr_ok, "SIR", m, "model_runs")),
+  check.names = FALSE)
+cat(tab(cw, digits = 3, caption = tn("Mean seconds and model runs per window")), sep = "\n")
+```
+
+## The BiLSTM's one-time cost
+
+```{r cost-once, results="asis"}
+tc <- read.csv(file.path(OUT, "bilstm_training_cost.csv"))
+once <- do.call(rbind, lapply(names(INFO), function(M) {
+  d <- tc[tc$model == M, ]
+  data.frame(Model = M, `Training epidemics` = format(d$bank_simulations[1], big.mark = ","),
+             `Simulating them: hours on 32 cores` = d$bank_wall_hours[1],
+             `Simulating them: CPU-hours` = d$bank_wall_hours[1] * d$bank_cores[1],
+             `Training: hours per network` = sprintf("%.1f-%.1f", min(d$training_hours), max(d$training_hours)),
+             `Training: GPU-hours for 5 networks` = sum(d$training_hours),
+             `GPUs used` = paste(unique(d$gpu), collapse = ", "), check.names = FALSE)
+}))
+cat(tab(once, digits = 1, caption = tn("One-time cost of the BiLSTM (from the training logs)")), sep = "\n")
+```
+
+Training time depends mostly on the GPU: a network took about 4-5 hours on a recent GPU (RTX
+3090, V100) and up to 20 hours on the older GPUs (GTX Titan X) that were free at the time; a
+model with fewer networks, or one network, costs proportionally less.
+
+## Total for this report
+
+```{r cost-total, results="asis"}
+tot <- data.frame(Method = METHODS,
+  `Windows` = sapply(METHODS, function(m) sum(sbr_ok$method == m) + sum(real_ok$method == m)),
+  `CPU-hours for all windows` = sapply(METHODS, function(m) (sum(sbr_ok$seconds[sbr_ok$method == m]) +
+                                                              sum(real_ok$seconds[real_ok$method == m])) / 3600),
+  check.names = FALSE)
+cat(tab(tot, digits = 2, caption = tn("Compute used for all simulated and real windows of this report (SEIR and SIR)")), sep = "\n")
+sim_cpu <- sum(tapply(tc$bank_wall_hours * tc$bank_cores, tc$model, `[`, 1))
+per_win <- function(m) mean(c(sbr_ok$seconds[sbr_ok$method == m], real_ok$seconds[real_ok$method == m])) / 3600
+```
+
+Simulating the training data of both models took `r round(sim_cpu)` CPU-hours, the same as
+about `r format(round(sim_cpu / per_win("DE")), big.mark = ",")` windows with DE,
+`r format(round(sim_cpu / per_win("ABC-SMC")), big.mark = ",")` with ABC-SMC or
+`r format(round(sim_cpu / per_win("ABC-MCMC")), big.mark = ",")` with ABC-MCMC, plus the GPU
+training. After that, every new window costs a fraction of a second, so the BiLSTM pays off
+when many windows or datasets are calibrated (or when an answer is needed at once), and the
+same trained model can be shared and used by others without any of this cost.
+
+# Conclusions
+
+- On **noise-free simulated data**, both models estimate **R0** accurately from any part of an
+  epidemic, and longer windows give better estimates. Short windows are harder for SEIR than
+  for SIR, probably because the incubation period hides part of the early growth.
+- **ptran and crate** are not identifiable from case curves: only R0 = ptran x crate / recov
+  is. To estimate them separately, one of them (for example the contact rate from a contact
+  survey) must be given.
+- The models **recover the whole epidemic** in simulation, including the number currently
+  infected.
+- **Against standard calibration methods** with default settings (ABC-MCMC, ABC-SMC, DE,
+  Nelder-Mead), on simulated windows where the truth is known, the BiLSTM recovers R0, the
+  starting state and the hidden number currently infected best, and is thousands of times
+  faster. The baselines come close only near the beginning of an epidemic; DE matches the
+  observed curve about as closely. ABC-SMC finishes only with more model runs than its default
+  limit allows.
+- **Ease of use:** the BiLSTM needs only the daily counts and the known values. Every baseline
+  needs ranges for R0 and for the starting state, its own settings, and seconds to minutes of
+  model runs for every window.
+- **Improving the BiLSTM:** more training epidemics and a falling learning rate helped a
+  little; tuning alone did not. Windows from the end of an epidemic did not improve with any
+  change.
+- On **real data**, the noise-free BiLSTM covers COVID-19 waves of daily-reporting US states
+  about as well as ABC-MCMC and ABC-SMC, and better than DE and Nelder-Mead; on the Utah and
+  Baltimore data, and most of all on Utah COVID-19 cases, ABC-MCMC, which fits each curve
+  directly, is clearly best: weekday patterns, reporting spikes and repeated waves are not in
+  noise-free training data.
+- **Next steps for real data:** cleaner real data that suit a noise-free model (daily hospital
+  admissions), and training with a reporting model (a reported share, a weekly pattern and
+  extra noise), which earlier models (SEIR v5 and v6) used with 93-98% coverage on influenza
+  seasons and COVID-19 waves of single states.
+
+# Using the package: a guide
+
+Everything in this report can be done with the R package **epiworldRcalibrate**. This section
+shows how, step by step. The code below runs as part of this report (the slow steps are saved
+after the first run). A longer tutorial, with installation details and troubleshooting, is
+`TUTORIAL.Rmd` in the package folder; the help pages (`?window_calibrator`, ...) describe every
+function and setting.
+
+```{r guide-setup, include=FALSE}
+GUIDE_CACHE <- file.path(normalizePath(OUT), "guide_cache", "")
+CORES <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4"))
+# methods_common.R (sourced for the renewal section) has its own score_band(); the guide uses the package's.
+if (exists("score_band", envir = globalenv(), inherits = FALSE)) rm(score_band, envir = globalenv())
+```
+
+## Installing
+
+```{r guide-install, echo=TRUE, eval=FALSE}
+install.packages(c("remotes", "DEoptim"))
+remotes::install_github("UofUEpiBio/epiworldRcalibrate")   # or remotes::install_local("path/to/epiworldRcalibrate")
+library(epiworldRcalibrate)
+```
+
+The BiLSTM runs in Python (PyTorch) through `reticulate`, which sets up the Python packages
+it needs the first time (or set `RETICULATE_PYTHON` to a Python with `torch` before loading
+the package). The trained SEIR and SIR models come with the package.
+
+## Data shipped with the package
+
+| Dataset | What it is |
+|---|---|
+| `covid_us_states` | daily COVID-19 cases in the 50 states and DC, 2020-2023 (Johns Hopkins University), with populations |
+| `covid_utah` | daily COVID-19 cases in Utah, 2020-2025 (Utah DHHS) |
+| `admissions_utah` | daily influenza and COVID-19 hospital admissions in Utah, 2020-2024 (HHS) |
+| `flu_baltimore_1918` | daily influenza cases in Baltimore, 1918 |
+| `real_data_waves` | the 35 waves of this report, with the population size and known values used for each |
+
+`wave_data()` gives the daily counts of one wave and `real_data_windows()` cuts windows from
+the beginning, middle and end of the waves; with its defaults it gives the 315 real-data
+windows of this report.
+
+```{r guide-data, echo=TRUE}
+real_data_waves[c(1:3, 31:35), c("wave", "dataset", "start", "end", "n", "recov", "incub")]
+w <- real_data_windows("New York Omicron 2021-22", lengths = 60, positions = "middle")[[1]]
+str(w[c("cases", "future", "n", "recov", "incub", "wave", "position")])
+```
+
+## Calibrating a window with the BiLSTM
+
+`calibrate(daily counts, method, known values)`. The result has R0 with its 95% range, ptran
+and crate, and the state on the first day of the window:
+
+```{r guide-bilstm, echo=TRUE}
+bilstm <- window_calibrator("SEIR")        # window_calibrator("SIR") for the SIR model (no incub)
+fit <- calibrate(w$cases, bilstm, n = w$n, recov = w$recov, incub = w$incub)
+fit
+calibration_estimate(fit)                  # the estimates as a named vector
+```
+
+## Calibrating with ABC-MCMC, ABC-SMC, DE or Nelder-Mead
+
+`window_baselines()` gives the four standard methods with the settings of this report (Section
+"The methods compared"). They are used with `calibrate()` like the BiLSTM; each takes seconds
+to minutes, so here they run in parallel:
+
+```{r guide-baselines, echo=TRUE, cache=TRUE, cache.path=GUIDE_CACHE}
+baselines <- window_baselines("SEIR")      # a list: ABC-MCMC, ABC-SMC, DE, NelderMead
+fits <- parallel::mclapply(baselines, function(b) calibrate(w$cases, b, n = w$n, recov = w$recov, incub = w$incub),
+                           mc.cores = min(4, CORES))
+fits <- c(list(BiLSTM = fit), fits)
+```
+
+```{r guide-fits-table, echo=TRUE}
+t(sapply(fits, function(f) c(f$estimate[c("R0", "ptran", "crate")], R0_low = f$intervals["R0", 1],
+                             R0_high = f$intervals["R0", 2], seconds = f$diagnostics$seconds,
+                             model_runs = f$diagnostics$model_runs)))
+```
+
+The BiLSTM's time includes loading Python and the networks, which happens once per session;
+after that it takes a fraction of a second per window (Section "Computational cost"). The
+standard methods search R0 with the contact rate fixed at the middle of its range (10 for
+SEIR), so their crate is always 10. Settings are changed by method name, for example
+`window_baselines("SEIR", settings = list(DE = list(itermax = 400)))`; `?window_baselines`
+lists them all.
+
+## Predicting and scoring
+
+`predict_cases()` turns any fit into a 95% band of the daily new infections, in the window and
+`ahead` days after it, by 500 runs of the epiworldR model from the estimated state
+(`method = "renewal"` uses the renewal equation instead, about 200 times faster).
+`plot_bands()` shows the bands of several methods with their coverage and interval score:
+
+```{r guide-bands, echo=TRUE, cache=TRUE, cache.path=GUIDE_CACHE}
+bands <- lapply(fits, predict_cases, ahead = 14)
+```
+
+```{r guide-bands-plot, echo=TRUE, fig.width=12, fig.height=7, fig.cap=fc("plot_bands(): the 95% bands of each method on a 60-day window around the peak of the Omicron wave in New York (cases per 10,000 people), with the 14 days after it (open points).")}
+scores <- plot_bands(bands, future = w$future)
+```
+
+```{r guide-scores, echo=TRUE}
+scores                                      # the coverage and interval score shown in the panels
+score_band(bands$BiLSTM)                    # one band: coverage, width, error of the median, interval score
+interval_score(y = 35, lower = 10, upper = 30)   # one day: the width 20 plus 40 x the miss of 5
+```
+
+```{r guide-window-context}
+mid60 <- real_ok[real_ok$model == "SEIR" & real_ok$group == "US states" & real_ok$length == 60 &
+                 real_ok$position == "middle", ]
+mid_cov <- tapply(mid60$coverage, mid60$method, mean)
+```
+
+This window, around the peak of the wave, is a hard one: the BiLSTM expects the epidemic to keep
+growing, and every method misses the sharp fall after the peak. It was picked to show the code,
+not as a typical case: over all `r nrow(mid60) / length(unique(mid60$method))` 60-day windows from
+the middle of US-state waves, the BiLSTM covered `r pct(mid_cov[["BiLSTM"]])` of the days,
+ABC-MCMC `r pct(mid_cov[["ABC-MCMC"]])`, ABC-SMC `r pct(mid_cov[["ABC-SMC"]])`, DE
+`r pct(mid_cov[["DE"]])` and Nelder-Mead `r pct(mid_cov[["NelderMead"]])` (Section "Real data").
+The code here gives the same results as that comparison for this window (for example the
+BiLSTM's R0 of `r f2(fit$estimate[["R0"]])`).
+
+## Estimating ptran and crate
+
+With `unknowns = "ptran_crate"`, the standard methods search ptran and crate instead of R0, and
+the ABC methods give a 95% range for each. On a simulated window with known values, the
+accepted values lie along the curve of constant R0 = ptran x crate / recov: the data fix R0, not
+ptran and crate.
+
+```{r guide-ptran-crate, echo=TRUE, cache=TRUE, cache.path=GUIDE_CACHE}
+# A simulated SEIR epidemic with known values, and 60 days from its middle.
+true <- list(n = 8000, recov = 1 / 7, incub = 5, R0 = 2.5, crate = 10)
+true$ptran <- true$R0 * true$recov / true$crate
+m <- epiworldR::ModelSEIRCONN("example", n = true$n, prevalence = 0.002, contact_rate = true$crate,
+                              incubation_days = true$incub, transmission_rate = true$ptran, recovery_rate = true$recov)
+epiworldR::verbose_off(m)
+epiworldR::run(m, ndays = 150, seed = 42)
+tr <- epiworldR::get_hist_transition_matrix(m)
+tr <- tr[tr$state_from == "Exposed" & tr$state_to == "Infected", ]
+sim_window <- tr$counts[match(41:100, tr$date)]
+sim_window[is.na(sim_window)] <- 0
+
+free <- window_baselines("SEIR", methods = c("ABC-MCMC", "ABC-SMC"), unknowns = "ptran_crate")
+fits_free <- parallel::mclapply(free, function(b) calibrate(sim_window, b, n = 8000, recov = 1 / 7, incub = 5),
+                                mc.cores = min(2, CORES))
+fits_free$BiLSTM <- calibrate(sim_window, bilstm, n = 8000, recov = 1 / 7, incub = 5)
+```
+
+```{r guide-ptran-crate-plot, echo=TRUE, fig.width=13, fig.height=4.2, fig.cap=fc("plot_ptran_crate(): accepted values of ptran and crate (points) lie along the curve of constant R0 (dashed: the estimated R0; orange: the true values and their R0). The BiLSTM picks a typical ptran and the matching crate.")}
+lapply(fits_free, function(f) signif(f$intervals, 3))   # 95% ranges of R0, ptran and crate
+plot_ptran_crate(fits_free[c("BiLSTM", "ABC-MCMC", "ABC-SMC")], truth = c(ptran = true$ptran, crate = true$crate))
+```
+
+## Comparing methods on many windows
+
+`compare_methods()` runs every method on every window and scores each one; it is how the
+comparisons of this report can be repeated. A window is a list with `cases`, the known values,
+and optionally `future` (the counts after it), the truth (`R0`, `ptran`, `crate`, `state`) and
+labels such as `position`. `plot_comparison()` and `plot_estimates()` show the results.
+
+```{r guide-compare, echo=TRUE, eval=FALSE}
+windows <- real_data_windows()                           # the 315 real-data windows of this report
+results <- compare_methods(windows, "SEIR", cores = 32)  # BiLSTM + the four standard methods
+plot_comparison(results)                                 # errors, coverage, interval score, time
+plot_estimates(results, "R0")                            # R0 and 95% ranges, window by window
+```
+
+```{r guide-as-compare}
+# The comparisons of this report (Sections 4 and 5), in the format of compare_methods().
+sim_results <- data.frame(model = sbr$model, window = sbr$id, position = sbr$position, method = sbr$method,
+                          failed = sbr$failed, days = sbr$length, R0 = sbr$R0, R0_low = sbr$R0_low,
+                          R0_high = sbr$R0_high, R0_true = sbr$R0_true, R0_error = abs(sbr$R0 - sbr$R0_true),
+                          state_error = sbr$state_error, coverage = sbr$cov_new, interval_score = sbr$IS_new,
+                          coverage_ahead = sbr$cov_future, interval_score_ahead = sbr$IS_future,
+                          seconds = sbr$seconds, model_runs = sbr$model_runs)
+real_results <- data.frame(model = real$model, window = real$id, group = real$group, wave = real$wave,
+                           position = real$position, method = real$method, failed = real$failed, days = real$length,
+                           R0 = real$R0, R0_low = real$R0_low, R0_high = real$R0_high, coverage = real$coverage,
+                           interval_score = real$interval_score, coverage_ahead = real$cov_future,
+                           interval_score_ahead = real$is_future, seconds = real$seconds, model_runs = real$model_runs)
+sim_results$method <- factor(sim_results$method, METHODS); sim_results <- sim_results[order(sim_results$method), ]
+real_results$method <- factor(real_results$method, METHODS); real_results <- real_results[order(real_results$method), ]
+sim_results$method <- as.character(sim_results$method); real_results$method <- as.character(real_results$method)
+```
+
+The figures below are made by these plot functions from the comparisons of this report (same
+methods and settings), turned into the format of `compare_methods()` (`sim_results`: the 216
+simulated windows; `real_results`: the 630 real-data windows). Small points: windows; large
+points: the mean (blue: the BiLSTM); orange line: 95% coverage.
+
+```{r guide-plot-sim-seir, echo=TRUE, fig.width=13, fig.height=7, fig.cap=fc("plot_comparison() on the 108 simulated SEIR windows: R0 error, starting-state error, coverage and interval score of the true daily new infections in the window, coverage of the 14 days after it, and seconds per window.")}
+plot_comparison(sim_results[sim_results$model == "SEIR", ])
+```
+
+```{r guide-plot-sim-sir, echo=TRUE, fig.width=13, fig.height=7, fig.cap=fc("The same for the 108 simulated SIR windows.")}
+plot_comparison(sim_results[sim_results$model == "SIR", ])
+```
+
+```{r guide-plot-estimates, echo=TRUE, fig.width=13, fig.height=3.8, fig.cap=fc("plot_estimates(): R0 and its 95% range by method for three simulated SEIR windows of 61 days (beginning, middle and end of an epidemic); orange: the true R0. DE and Nelder-Mead give no range.")}
+d <- sim_results[sim_results$model == "SEIR" & sim_results$days == 61, ]
+plot_estimates(d, "R0", windows = tapply(d$window, d$position, `[`, 1)[c("beginning", "middle", "end")])
+```
+
+```{r guide-plot-real-us, echo=TRUE, fig.width=13, fig.height=3.8, fig.cap=fc("plot_comparison() on the 270 real-data SEIR windows from US states: coverage and interval score of the observed counts in the window, coverage of the 14 days after it, and seconds per window.")}
+measures <- c("coverage", "interval_score", "coverage_ahead", "seconds")
+plot_comparison(real_results[real_results$model == "SEIR" & real_results$group == "US states", ], measures, ncol = 4)
+```
+
+```{r guide-plot-real-utah, echo=TRUE, fig.width=13, fig.height=3.8, fig.cap=fc("The same for the 45 SEIR windows from Utah and Baltimore.")}
+plot_comparison(real_results[real_results$model == "SEIR" & real_results$group == "Utah and Baltimore", ], measures,
+                ncol = 4)
+```
+
+For the SIR model, use `model == "SIR"`.
+
+## Making your own BiLSTM
+
+For other ranges of the parameters, simulate training epidemics, tune the network settings
+(optional) and train; then use the new model like the shipped one:
+
+```{r guide-train, echo=TRUE, eval=FALSE}
+data <- simulate_window_data("SEIR", n_sims = 1e6, output_dir = "my_seir_data", priors = list(R0 = c(0.8, 3)),
+                             cores = 32)
+best <- tune_window_calibrator(data, output_dir = "my_seir_tuning", n_trials = 40)
+train_window_calibrator(data, output_dir = "my_seir_model", hyperparameters = best, seeds = 1:5)
+my_bilstm <- window_calibrator("SEIR", model_dir = "my_seir_model")
+```
+
+The shipped models took about 2 hours on 32 cores to simulate (SEIR) and about 4 hours per
+network on a recent GPU to train (Section "Computational cost").
+
+## All functions and data
+
+| Function | What it does |
+|---|---|
+| `window_calibrator(model)` | the trained BiLSTM for SEIR or SIR windows (or your own with `model_dir`) |
+| `window_baselines(model, methods, settings, unknowns)` | ABC-MCMC, ABC-SMC, DE and Nelder-Mead, set up as in this report; `unknowns = "ptran_crate"` searches ptran and crate |
+| `calibrate(cases, method, n, recov, incub)` | fit a window with any of them |
+| `calibration_estimate(fit)` | the estimates as a named vector |
+| `predict_cases(fit, ahead, method)` | 95% bands by model runs or the renewal equation |
+| `coverage()`, `interval_score()`, `score_band()` | how well a band matches the data |
+| `compare_methods(windows, model, calibrators, cores)` | all methods on many windows, with errors, coverage, interval scores and time |
+| `plot_bands()`, `plot_comparison()`, `plot_estimates()`, `plot_ptran_crate()` | plots to compare methods |
+| `wave_data()`, `real_data_windows()` | the counts of a real wave; windows of real data |
+| `covid_us_states`, `covid_utah`, `admissions_utah`, `flu_baltimore_1918`, `real_data_waves` | real data |
+| `simulate_window_data()`, `tune_window_calibrator()`, `train_window_calibrator()` | make your own BiLSTM |
+
+# How these results were made
+
+```{r where, results="asis"}
+cat(tab(data.frame(
+  Step = c("Noise-free BiLSTMs (training, test and calibration windows)", "Hyperparameter search",
+           "BiLSTM vs standard methods on simulated windows", "BiLSTM vs standard methods on real data",
+           "Shared code of the methods and scores", "The package functions used in the guide", "This report"),
+  Code = c("Clean_any_length.Rmd", "inst/python/tune_bilstm.py", "Compare_methods_simulated.Rmd", "Real_data.Rmd",
+           "methods_common.R", "R/04_windows.R, R/05_real_data.R, R/06_plots.R (package)", "Report_SEIR_SIR.Rmd"),
+  Results = c("results/seir_clean_big/, results/sir_clean_big/ (and _clean, _clean_tuned)",
+              "results/{seir,sir}_clean_tuning/", paste0("results/", params$sim_folder, "/"),
+              paste0("results/", params$real_folder, "/"), "", "results/report/guide_cache/ (the slow guide steps)",
+              "results/report/"),
+  check.names = FALSE), caption = "Every table and figure in this report comes from these saved results."), sep = "\n")
+```

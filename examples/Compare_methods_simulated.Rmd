@@ -1,0 +1,321 @@
+---
+title: "BiLSTM vs ABC-MCMC, ABC-SMC, DE and Nelder-Mead on noise-free simulated windows"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  out_dir: "results/simulated_baselines"
+  model_dirs: "SEIR=results/seir_clean_big;SIR=results/sir_clean_big"
+  seeds: "122,1,2,3,4"
+  lengths: "30,61,120,180"
+  per_cell: 9
+  horizon: 14
+  n_reps: 500
+  cores: 1
+  stop_after: ""
+  device: "cpu"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What is compared
+
+The BiLSTM (trained once, then one pass per window) against three **standard, simple**
+calibration methods with **default settings**, as someone with basic knowledge of these
+methods would set them up. All methods get the same windows of **daily new infections**
+(noise-free: every new infection counted), the same known values (`n`, `recov`, and `incub`
+for SEIR), the same unknowns and the same ranges, and are scored in the same way.
+
+| Method | Library | Settings (all defaults unless stated) | Model runs per window |
+|---|---|---|---|
+| BiLSTM | trained network (this package) | average of 5 trained networks; R0 range from 500 similar calibration windows | none (one network pass) |
+| ABC-MCMC | this package (`make_calibrator("ABC-MCMC")`) | default: 3,000 random-walk steps (1,500 burn-in), proposal sd 8% of each range, Gaussian kernel with tolerance 0.30 x the root mean square of the observed counts | 3,000 |
+| ABC-SMC | this package (`make_calibrator("ABC-SMC")`) | default: 200 particles, 6 generations, each tolerance the median distance of the previous generation; only its limits raised to 30,000 model runs and 20,000 attempts per generation (the defaults, 8,000 and 5,000, stopped it on many windows); a window where it still runs out is recorded as failed | up to 30,000 |
+| DE | `DEoptim` | default: population 10 x number of unknowns, 200 generations, F = 0.8, CR = 0.5 | 6,000 (SIR) to 8,000 (SEIR) |
+| Nelder-Mead | `stats::optim` | default: start at the middle of the ranges, up to 500 iterations; values outside the ranges rejected | until it stops (usually 100-500) |
+
+**Unknowns and ranges (all methods).** R0 between 0.8 and 5, and the state on the first day of
+the window: the shares exposed (SEIR), infectious and recovered, searched on the log10 scale
+between 0.0001 and 0.4 (0.95 for recovered) because they span several orders of magnitude
+(the package's ABC-MCMC and ABC-SMC compare curves by root mean squared error, which ranks
+candidates in the same order).
+The contact rate is fixed at the middle of its training range (only R0 = ptran x crate / recov
+shapes an epidemic curve). **Fit:** the sum of squared differences between the observed daily
+counts and the model's daily new infections; DE and Nelder-Mead use one model run with a
+fixed seed per candidate, so a candidate always gets the same fit. The code is in
+`methods_common.R`.
+
+**What is measured.**
+
+- *Parameter recovery*: the error of R0 and of the shares in each state at the window start,
+  and how often the true R0 is inside the method's 95% range (BiLSTM and ABC give one).
+- *Trajectory reconstruction*: each method's estimates are run `r params$n_reps` times; the
+  share of window days on which the true daily new infections, and the true number currently
+  infectious (which no method sees), are inside the 95% band, and the error of the median.
+- *Prediction*: the same for the `r params$horizon` days after the window.
+- *Computational cost*: seconds and model runs per window.
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+source("methods_common.R")
+if (nzchar(params$condaenv)) reticulate::use_condaenv(params$condaenv, required = TRUE)
+reticulate::py_run_string(paste("import warnings", "from sklearn.exceptions import InconsistentVersionWarning",
+                                "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)", sep = "\n"))
+```
+
+```{r settings}
+OUT_DIR <- params$out_dir
+CORES   <- as.integer(params$cores)
+LENGTHS <- as.integer(strsplit(params$lengths, ",")[[1]])
+SEEDS   <- as.integer(strsplit(params$seeds, ",")[[1]])
+H       <- as.integer(params$horizon)
+N_REPS  <- as.integer(params$n_reps)
+PER_CELL <- as.integer(params$per_cell)
+POSITIONS <- c("beginning", "middle", "end")
+METHODS <- c("BiLSTM", BASELINES)
+specs <- strsplit(strsplit(params$model_dirs, ";")[[1]], "=")
+MODEL_DIRS <- setNames(vapply(specs, `[`, "", 2), vapply(specs, `[`, "", 1))
+INFO <- lapply(setNames(names(MODEL_DIRS), names(MODEL_DIRS)), model_info)
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+run_dir <- file.path(OUT_DIR, "method_runs"); dir.create(run_dir, showWarnings = FALSE)
+fit_dir <- file.path(OUT_DIR, "fits");        dir.create(fit_dir, showWarnings = FALSE)
+tab <- function(x, digits = 2, ...) knitr::kable(x, format = "html", digits = digits, row.names = FALSE,
+                                                table.attr = "class='table table-condensed' style='width:auto'", ...)
+informative_days <- function(curve, k = 7) {
+  r <- rle(as.numeric(curve) == 0); hit <- which(r$values & r$lengths >= k)[1]
+  if (is.na(hit)) length(curve) else sum(r$lengths[seq_len(hit)]) - r$lengths[hit]
+}
+win_start <- function(pos, L, a) switch(pos, beginning = 1, middle = floor((a - L) / 2) + 1, end = a - L + 1)
+```
+
+# The windows
+
+The test epidemics of the noise-free models (never used in training). For each model, window
+length and position, `r PER_CELL` epidemics are drawn at random among those still going for
+that many days (before the first week without new infections); the window starts on day 1
+(beginning), in the middle, or ends on the last day (end).
+
+```{r windows}
+windows <- list(); truth <- list()
+for (M in names(MODEL_DIRS)) {
+  test <- readRDS(file.path(MODEL_DIRS[[M]], "test_bank.rds"))
+  active <- apply(test$cases, 1, informative_days)
+  set.seed(if (M == "SEIR") 11 else 12)
+  for (L in LENGTHS) for (pos in POSITIONS) {
+    pool <- which(active >= L)
+    for (i in pool[sample.int(length(pool), min(PER_CELL, length(pool)))]) {
+      s  <- win_start(pos, L, active[i])
+      id <- sprintf("%s_%03d", M, sum(vapply(windows, function(w) w$model == M, logical(1))) + 1)
+      after <- s + L - 1 + seq_len(H); after <- after[after <= ncol(test$cases)]
+      windows[[id]] <- list(id = id, model = M, length = L, position = pos, y = as.numeric(test$cases[i, s:(s + L - 1)]),
+                            known = as.list(test$theta[i, INFO[[M]]$known]), R0 = test$theta$R0[i],
+                            state = vapply(INFO[[M]]$states, function(st) test$states[[st]][i, s], 0))
+      truth[[id]] <- list(infected = test$states$infected_share[i, s:(s + L - 1)] * test$theta$n[i],
+                          future = as.numeric(test$cases[i, after]))
+    }
+  }
+}
+saveRDS(list(windows = windows, truth = truth), file.path(OUT_DIR, "windows.rds"))
+wtab <- do.call(rbind, lapply(windows, function(w) data.frame(model = w$model, length = w$length, position = w$position)))
+knitr::kable(as.data.frame.matrix(table(paste(wtab$model, wtab$length), wtab$position))[, POSITIONS],
+             caption = "Number of windows by model and window length (rows) and position (columns)")
+```
+
+```{r baselines}
+unit_file <- function(id, m) file.path(run_dir, sprintf("%s_%s.rds", id, m))
+units <- expand.grid(id = names(windows), method = BASELINES, stringsAsFactors = FALSE)
+units$days <- vapply(units$id, function(i) windows[[i]]$length, 0)
+units <- units[order(match(units$method, c("DE", "ABC-SMC", "ABC-MCMC", "NelderMead")), -units$days), ]
+units <- units[!file.exists(unit_file(units$id, units$method)), ]
+if (nrow(units)) {
+  done <- parallel::mclapply(seq_len(nrow(units)), function(k) try({
+    w <- windows[[units$id[k]]]
+    saveRDS(fit_baseline(units$method[k], w$y, INFO[[w$model]], w$known), unit_file(w$id, units$method[k]))
+  }), mc.cores = CORES, mc.preschedule = FALSE)
+  bad <- vapply(done, inherits, logical(1), what = "try-error")
+  if (any(bad)) stop("Failed: ", paste(units$id[bad], units$method[bad], collapse = "; "))
+}
+cat("Saved baseline fits:", length(list.files(run_dir)), "of", length(windows) * length(BASELINES), "\n")
+```
+
+```{r stop-after-methods, include=FALSE}
+if (identical(params$stop_after, "methods")) knitr::knit_exit()
+```
+
+```{r bilstm}
+bil_file <- file.path(OUT_DIR, "bilstm_fits.rds")
+if (!file.exists(bil_file)) {
+  set.seed(1)
+  bil <- list()
+  for (M in names(MODEL_DIRS)) {
+    ws <- windows[vapply(windows, function(w) w$model == M, logical(1))]
+    f  <- make_bilstm(INFO[[M]], MODEL_DIRS[[M]], SEEDS, device = params$device)
+    out <- f(lapply(ws, `[[`, "y"), do.call(rbind, lapply(ws, function(w) as.data.frame(w$known))))
+    bil[names(ws)] <- out
+  }
+  saveRDS(bil, bil_file)
+}
+bil <- readRDS(bil_file)
+```
+
+```{r bands}
+fit_file <- function(id, m) file.path(fit_dir, sprintf("%s_%s.rds", id, m))
+jobs <- expand.grid(id = names(windows), method = METHODS, stringsAsFactors = FALSE)
+todo <- which(!file.exists(fit_file(jobs$id, jobs$method)))
+if (length(todo)) {
+  done <- parallel::mclapply(todo, function(k) try({
+    set.seed(k)
+    w <- windows[[jobs$id[k]]]; m <- jobs$method[k]; info <- INFO[[w$model]]
+    f <- if (m == "BiLSTM") bil[[w$id]] else readRDS(unit_file(w$id, m))
+    if (isTRUE(f$failed)) { saveRDS(list(failed = TRUE), fit_file(w$id, m)); return(NULL) }
+    tr <- truth[[w$id]]; nf <- length(tr$future)
+    b <- band_of(info, f$draws, w$length + nf, n = N_REPS)
+    saveRDS(list(new = score_band(b$new, w$y, seq_len(w$length)),
+                 infected = score_band(b$infected, tr$infected, seq_len(w$length)),
+                 future = if (nf) score_band(b$new, tr$future, w$length + seq_len(nf)) else c(coverage = NA, width = NA, MAE = NA)),
+            fit_file(w$id, m))
+  }), mc.cores = CORES, mc.preschedule = FALSE)
+  bad <- vapply(done, inherits, logical(1), what = "try-error")
+  if (any(bad)) stop("Failed bands: ", sum(bad))
+}
+res <- do.call(rbind, lapply(seq_len(nrow(jobs)), function(k) {
+  w <- windows[[jobs$id[k]]]; m <- jobs$method[k]
+  f <- if (m == "BiLSTM") bil[[w$id]] else readRDS(unit_file(w$id, m))
+  s <- readRDS(fit_file(w$id, m))
+  if (isTRUE(f$failed)) return(data.frame(model = w$model, id = w$id, length = w$length, position = w$position, method = m,
+    R0_true = w$R0, R0 = NA, R0_low = NA, R0_high = NA, state_error = NA, cov_new = NA, MAE_new = NA, IS_new = NA,
+    cov_infected = NA, MAE_infected = NA, IS_infected = NA, cov_future = NA, MAE_future = NA, IS_future = NA,
+    seconds = f$seconds, model_runs = NA, failed = TRUE))
+  data.frame(model = w$model, id = w$id, length = w$length, position = w$position, method = m,
+             R0_true = w$R0, R0 = f$R0, R0_low = f$R0_low, R0_high = f$R0_high,
+             state_error = 100 * mean(abs(f$state[names(w$state)] - w$state)),
+             cov_new = s$new[["coverage"]], MAE_new = s$new[["MAE"]], IS_new = s$new[["interval_score"]],
+             cov_infected = s$infected[["coverage"]], MAE_infected = s$infected[["MAE"]],
+             IS_infected = s$infected[["interval_score"]], cov_future = s$future[["coverage"]],
+             MAE_future = s$future[["MAE"]], IS_future = if ("interval_score" %in% names(s$future)) s$future[["interval_score"]] else NA,
+             seconds = f$seconds, model_runs = f$model_runs, failed = FALSE)
+}))
+res$error <- abs(res$R0 - res$R0_true)
+res$inside <- ifelse(is.na(res$R0_low), NA, res$R0_true >= res$R0_low & res$R0_true <= res$R0_high)
+write.csv(res, file.path(OUT_DIR, "results_by_window.csv"), row.names = FALSE)
+all_res <- res
+res <- res[!res$failed, ]   # the tables below use the windows where a method worked
+```
+
+# Results
+
+## Summary
+
+```{r summary, results="asis"}
+summ <- do.call(rbind, lapply(names(MODEL_DIRS), function(M) do.call(rbind, lapply(METHODS, function(m) {
+  d <- res[res$model == M & res$method == m, ]
+  data.frame(Model = M, Method = m, `Windows (failed)` = sprintf("%d (%d)", nrow(d), sum(all_res$failed[all_res$model == M & all_res$method == m])),
+             `R0 MAE` = mean(d$error),
+             `R0 MAE: beginning` = mean(d$error[d$position == "beginning"]),
+             `R0 MAE: middle` = mean(d$error[d$position == "middle"]), `R0 MAE: end` = mean(d$error[d$position == "end"]),
+             `True R0 in 95% range (%)` = if (all(is.na(d$inside))) NA else 100 * mean(d$inside, na.rm = TRUE),
+             `Starting state error (% points)` = mean(d$state_error),
+             `Coverage: new infections (%)` = mean(d$cov_new), `Coverage: currently infected (%)` = mean(d$cov_infected),
+             `Coverage: next 14 days (%)` = mean(d$cov_future, na.rm = TRUE),
+             `Interval score: new infections` = mean(d$IS_new), `Interval score: currently infected` = mean(d$IS_infected),
+             `Interval score: next 14 days` = mean(d$IS_future, na.rm = TRUE),
+             `Seconds per window` = mean(d$seconds), `Model runs per window` = mean(d$model_runs), check.names = FALSE)
+}))))
+write.csv(summ, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+summ$Model[duplicated(summ$Model)] <- ""
+cat(tab(summ, caption = sprintf("Mean over the windows where each method worked (%d per model; ABC-SMC fails when it runs out of model runs). Starting state error: mean absolute error of the shares in each state on the first day of the window, in percentage points. Coverage: share of days inside the 95%% band of %d runs (higher is better). Interval score: band width plus 40 times how far each true value falls outside the band (lower is better; wide bands do not win it). BiLSTM seconds: one network pass for all windows of a model, divided by the number of windows.", length(windows) / length(MODEL_DIRS), N_REPS)), sep = "\n")
+```
+
+## R0 by window length and position
+
+```{r by-cell, results="asis"}
+for (M in names(MODEL_DIRS)) {
+  a <- aggregate(error ~ position + length + method, res[res$model == M, ], mean)
+  w <- reshape(a, idvar = c("position", "length"), timevar = "method", direction = "wide")
+  names(w) <- sub("^error\\.", "", names(w))
+  w <- w[order(match(w$position, POSITIONS), w$length), c("position", "length", intersect(METHODS, names(w)))]
+  names(w)[1:2] <- c("Position", "Window (days)")
+  w$Position[duplicated(w$Position)] <- ""
+  cat(tab(w, digits = 3, caption = sprintf("%s: R0 mean absolute error (%d windows each; ABC-SMC: the windows where it worked)", M, PER_CELL)), sep = "\n")
+}
+```
+
+```{r cell-fig, fig.width=13, fig.height=8, fig.cap="R0 mean absolute error by window length, for windows from the beginning, middle and end of an epidemic."}
+op <- par(mfrow = c(2, 3), mar = c(4.5, 4.5, 3, 1))
+for (M in names(MODEL_DIRS)) for (pos in POSITIONS) {
+  a <- aggregate(error ~ length + method, res[res$model == M & res$position == pos, ], mean)
+  plot(NA, xlim = range(LENGTHS), ylim = c(0, max(a$error)), xlab = "window length (days)", ylab = "R0 MAE", main = paste(M, "-", pos))
+  for (m in METHODS) {
+    x <- a[a$method == m, ]; x <- x[order(x$length), ]
+    lines(x$length, x$error, type = "b", pch = 16, lwd = if (m == "BiLSTM") 3 else 1.5, col = METHOD_COLS[[m]])
+  }
+  if (M == names(MODEL_DIRS)[1] && pos == "beginning") legend("topright", bty = "n", lwd = 2, pch = 16, col = METHOD_COLS[METHODS], legend = METHODS)
+}
+par(op)
+```
+
+```{r scatter, fig.width=13, fig.height=6.5, fig.cap="Estimated vs true R0 for every window (circles: beginning, triangles: middle, squares: end). The line is perfect agreement."}
+op <- par(mfrow = c(2, length(METHODS)), mar = c(4, 4, 2.5, 0.5))
+for (M in names(MODEL_DIRS)) for (m in METHODS) {
+  d <- res[res$model == M & res$method == m, ]
+  plot(d$R0_true, d$R0, pch = c(beginning = 16, middle = 17, end = 15)[d$position], cex = 0.8,
+       col = adjustcolor(METHOD_COLS[[m]], 0.7), xlim = c(0.7, 5.1), ylim = c(0.7, 5.1),
+       xlab = "true R0", ylab = "estimated R0", main = sprintf("%s, %s (MAE %.2f)", M, m, mean(d$error)))
+  abline(0, 1, lty = 2)
+}
+par(op)
+```
+
+## Trajectories and prediction by position
+
+Coverage (%) of the true daily new infections in the window, of the true number currently
+infectious in the window, and of the true daily new infections in the `r H` days after the
+window.
+
+```{r traj, results="asis"}
+for (M in names(MODEL_DIRS)) {
+  d <- res[res$model == M, ]
+  out <- do.call(rbind, lapply(POSITIONS, function(p) do.call(rbind, lapply(METHODS, function(m) {
+    x <- d[d$position == p & d$method == m, ]
+    data.frame(Position = p, Method = m, `New infections` = mean(x$cov_new), `Currently infected` = mean(x$cov_infected),
+               `Next 14 days` = mean(x$cov_future, na.rm = TRUE), `Error of the median: new infections` = mean(x$MAE_new),
+               `Error of the median: next 14 days` = mean(x$MAE_future, na.rm = TRUE), check.names = FALSE)
+  }))))
+  out$Position[duplicated(out$Position)] <- ""
+  cat(tab(out, digits = 1, caption = sprintf("%s: coverage (%%) and error of the median band (daily counts)", M)), sep = "\n")
+}
+```
+
+## How sure can we be? (paired comparison)
+
+For every window, each baseline's R0 error minus the BiLSTM's on the **same** window
+(positive: the BiLSTM is more accurate), with a 95% bootstrap interval over windows.
+
+```{r paired, results="asis"}
+set.seed(3)
+pair <- merge(res[res$method != "BiLSTM", c("id", "model", "position", "method", "error")],
+              res[res$method == "BiLSTM", c("id", "error")], by = "id", suffixes = c("", "_bilstm"))
+pt <- do.call(rbind, lapply(names(MODEL_DIRS), function(M) do.call(rbind, lapply(BASELINES, function(m) {
+  do.call(rbind, lapply(c("all", POSITIONS), function(pos) {
+    p <- pair[pair$model == M & pair$method == m & (pos == "all" | pair$position == pos), ]
+    if (nrow(p) < 2) return(NULL)
+    dlt <- p$error - p$error_bilstm
+    ci <- quantile(replicate(2000, mean(sample(dlt, replace = TRUE))), c(0.025, 0.975), names = FALSE)
+    data.frame(Model = M, Method = m, Windows = pos, n = nrow(p), `Mean difference` = mean(dlt),
+               `95% interval` = sprintf("%.3f to %.3f", ci[1], ci[2]),
+               `BiLSTM more accurate (% of windows)` = 100 * mean(p$error_bilstm < p$error), check.names = FALSE)
+  }))
+}))))
+write.csv(pt, file.path(OUT_DIR, "paired_differences.csv"), row.names = FALSE)
+pt$Model[duplicated(pt$Model)] <- ""
+cat(tab(pt, digits = 3), sep = "\n")
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+```

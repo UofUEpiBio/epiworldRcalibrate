@@ -1,0 +1,768 @@
+---
+title: "SEIR BiLSTM `r params$model_name`: reported cases, wider ranges and a range for R0"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  n_sims: 300000
+  n_days: 61
+  epochs: 100
+  n_test: 1000
+  n_calib: 100000
+  n_reps: 300
+  k_neighbors: 500
+  min_cases: 20
+  out_dir: "results/seir_bilstm_v4"
+  model_name: "v4"
+  fresh_noise: false
+  hidden_size: 0
+  retrain: false
+  seeds: 122
+  ensemble: false
+  stop_after: ""
+  sim_cores: 1
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+  hyperparameters: "results/seir_tuning/best_params.json"
+  grad_clip: 1
+  v2_models: "results/seir_bilstm_v2/model_seed_122,results/seir_bilstm_v2/model_seed_1,results/seir_bilstm_v2/model_seed_2,results/seir_bilstm_v2/model_seed_3,results/seir_bilstm_v2/model_seed_4"
+  v2_test_dir: "results/seir_bilstm_v2/test_bank"
+  real_data_dir: "results/seir_real_data_test/data"
+  utah_incub: 5
+  flu_incub: 2
+  flu_incub_v2: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+SEIR v2 (`SEIR_BiLSTM.Rmd`) estimates R0 very well on simulated epidemics, but real
+data differ from its training curves. v4 keeps v2's structure (61 days; known `n`,
+`recov`, `incub`; tuned settings; average of several seeds) and changes the training
+data and outputs:
+
+| | SEIR v2 | SEIR v4 and v5 |
+|---|---|---|
+| Training curves | every new case, smooth | **reported cases**: a share of the cases, weekday swings and extra day-to-day noise |
+| Share initially exposed | 1% to 40% | **0.1% to 40%** (log scale) |
+| Incubation days | 3 to 21 | **1 to 21** (flu is about 2) |
+| R0 | 1 to 5 | **0.8 to 5** (declining epidemics too) |
+| Network input | cases / 10,000 | **log(1 + cases) / log(1 + 10,000)**, so small counts are readable |
+| Outputs | ptran, crate, R0, preval | ptran, R0, preval, **reported share, noise, weekday swing**; **no crate** |
+| Result | one value per parameter | one value **plus a range for R0** and fit bands that include it |
+
+Why these changes:
+
+- **Reported cases.** Real data count only some infections (flu data here are hospital
+  admissions), have weekday patterns and reporting spikes. The noise ranges come from the
+  real datasets: weekday swings of 15-25% and extra noise (overdispersion) up to about 0.2.
+- **No crate output.** Only R0 = ptran x crate / recov can be read from a curve; crate
+  was about 90% of v2's training loss and its value was replaced anyway. `crate` is still
+  returned, computed from R0, ptran and recov as before.
+- **Prior immunity is left out on purpose**: a population with 30% immune behaves like a
+  smaller population with a lower R0, so it cannot be told apart from R0 in the data.
+- **A range for R0.** The network gives one value. A separate calibration bank of
+  `r format(params$n_calib, big.mark = ",")` simulated epidemics shows how far the true
+  values fall from the network's estimate for similar curves (the
+  `r params$k_neighbors` most similar estimates); those errors give the range, and
+  simulated curves drawn from it give fit bands that include the uncertainty in R0.
+  This is checked on new simulated epidemics: a 95% range should hold the true R0 about
+  95% of the time.
+- **New noise every epoch** (`fresh_noise: true`, used for v5). v4 trained on one fixed
+  noisy copy of each curve and started to learn that noise by heart after about 25
+  epochs. With `fresh_noise` the training bank holds the true daily cases, and the
+  trainer draws new reported cases (same reporting model) for every batch, so the network
+  never sees the same noise twice. The test and calibration curves are the same as v4's.
+
+This run: **SEIR `r params$model_name`**`r if (isTRUE(params$fresh_noise)) ", new noise every epoch" else ""``r if (params$hidden_size > 0) paste0(", ", params$hidden_size, " hidden units") else ""`.
+
+To run it (from the `examples/` folder):
+
+```r
+rmarkdown::render("SEIR_v4_BiLSTM.Rmd", output_dir = "results/seir_bilstm_v4")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+N_SIMS    <- params$n_sims
+N_DAYS    <- params$n_days
+EPOCHS    <- params$epochs
+N_TEST    <- params$n_test
+N_CALIB   <- params$n_calib
+N_REPS    <- params$n_reps
+K_NB      <- params$k_neighbors
+MIN_CASES <- params$min_cases
+RETRAIN   <- isTRUE(params$retrain)
+OUT_DIR   <- params$out_dir
+SIM_CORES <- as.integer(params$sim_cores)
+SEEDS     <- as.integer(params$seeds)
+ENSEMBLE  <- isTRUE(params$ensemble) && length(SEEDS) > 1
+MODEL       <- paste("SEIR", params$model_name)
+FRESH_NOISE <- isTRUE(params$fresh_noise)
+BAND_ONE    <- paste0(params$model_name, ", one estimate")
+BAND_RANGE  <- paste0(params$model_name, ", with range")
+
+BANK_SEED  <- 122
+TEST_SEED  <- 2025   # different seeds: no test or calibration curve is seen in training
+CALIB_SEED <- 7
+
+KNOWN   <- c("n", "recov", "incub")
+TARGETS <- c("ptran", "R0", "log_preval", "log_report_rate", "log_overdispersion", "weekday_sd")
+OUTPUT_ACTIVATION   <- c("sigmoid", "softplus", "sigmoid", "sigmoid", "sigmoid", "sigmoid")
+INCIDENCE_MAX       <- 10000
+INCIDENCE_TRANSFORM <- "log1p"
+
+PRIORS <- list(
+  n = c(5000, 10000), recov = c(0.071, 0.25), crate = c(5, 15), incub = c(1, 21),
+  R0 = c(0.8, 5), preval = c(0.001, 0.4),
+  report_rate = c(0.05, 1), overdispersion = c(0.001, 0.3), weekday_sd = c(0, 0.35)
+)
+# What v2 was trained on (100 to 2,000 initially exposed out of 5,000 to 10,000).
+in_v2_range <- function(theta) theta$incub >= 3 & theta$R0 >= 1 & theta$preval >= 0.01
+
+# Tuned v2 settings. The physics penalty needs a crate output, so it is off.
+hp <- jsonlite::read_json(params$hyperparameters)
+LEARNING_RATE  <- hp$learning_rate
+BATCH_SIZE     <- as.integer(hp$batch_size)
+HIDDEN_SIZE    <- as.integer(hp$hidden_size)
+NUM_LAYERS     <- as.integer(hp$num_layers)
+DROPOUT        <- hp$dropout
+PHYSICS_WEIGHT <- 0
+GRAD_CLIP      <- params$grad_clip
+if (params$hidden_size > 0) HIDDEN_SIZE <- as.integer(params$hidden_size)
+
+V2_DIRS <- trimws(strsplit(params$v2_models, ",")[[1]])
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+prior_text <- vapply(names(PRIORS), function(p) paste(signif(PRIORS[[p]], 3), collapse = " to "), "")
+settings <- data.frame(
+  setting = c("training simulations", "days per curve", "epochs", "test curves",
+              "calibration curves (for the R0 range)", "most similar curves used for the range",
+              "fit simulations per band", "curves kept if reported cases at least",
+              paste("range of", names(PRIORS)),
+              "learning rate", "batch size", "hidden units", "BiLSTM layers", "dropout",
+              "gradient clipping", "network input", "new reporting noise every batch",
+              "network seeds", "output folder"),
+  value = c(N_SIMS, N_DAYS, EPOCHS, N_TEST, N_CALIB, K_NB, N_REPS, MIN_CASES, prior_text,
+            signif(LEARNING_RATE, 3), BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, round(DROPOUT, 3),
+            GRAD_CLIP, sprintf("log(1 + cases) / log(1 + %d)", INCIDENCE_MAX),
+            if (FRESH_NOISE) "yes" else "no", paste(SEEDS, collapse = ", "), normalizePath(OUT_DIR))
+)
+write.csv(settings, file.path(OUT_DIR, "settings.csv"), row.names = FALSE)
+knitr::kable(settings)
+```
+
+`preval`, `report_rate` and `overdispersion` are drawn on the log scale and estimated on
+the log scale (`log_` targets; the calibrator returns them on the normal scale).
+
+# Step 1: simulate the banks
+
+Three banks from the same simulator with different seeds: training, test and calibration.
+Epidemics with fewer than `r MIN_CASES` reported cases in `r N_DAYS` days (nothing to
+learn from, and never what one would calibrate) are dropped; 15% extra are simulated to
+make up for them. With `sim_cores` above 1 a bank is simulated in that many chunks at
+once; chunk `k` uses seed `seed + k - 1`. With `fresh_noise` the training bank holds the
+true daily cases (the reporting parameters are drawn and saved, but applied by the
+trainer), and a curve is kept when its expected number of reported cases is at least
+`r MIN_CASES`.
+
+```{r banks}
+simulate_bank <- function(n_keep, seed, true_cases = FALSE) {
+  n_draw <- ceiling(1.15 * n_keep)
+  sim_chunk <- function(size, s) {
+    base <- seir_simulator(ndays = N_DAYS, priors = PRIORS)
+    sim  <- if (!true_cases) base else new_simulator(base$sample_parameters, function(parameters, seed) {
+      parameters$report_rate <- NULL   # true cases; the trainer draws the reported ones
+      base$run(parameters, seed)
+    }, type = "SEIR")
+    simulate_training_data(sim, n_sims = size, seed = s)
+  }
+  if (SIM_CORES > 1) {
+    sizes  <- diff(round(seq(0, n_draw, length.out = SIM_CORES + 1)))
+    chunks <- parallel::mclapply(seq_along(sizes), function(k) sim_chunk(sizes[k], seed + k - 1),
+                                 mc.cores = SIM_CORES)
+    failed <- vapply(chunks, inherits, logical(1), what = "try-error")
+    if (any(failed)) stop("Simulation chunk(s) failed: ", paste(which(failed), collapse = ", "))
+    theta <- do.call(rbind, lapply(chunks, `[[`, "theta"))
+    obs   <- do.call(rbind, lapply(chunks, `[[`, "observations"))
+  } else {
+    b <- sim_chunk(n_draw, seed)
+    theta <- b$theta
+    obs   <- b$observations
+  }
+  reported <- if (true_cases) theta$report_rate * rowSums(obs) else rowSums(obs)
+  keep <- which(reported >= MIN_CASES)
+  if (length(keep) < n_keep) stop("Only ", length(keep), " curves with enough cases; simulate more.")
+  keep <- keep[seq_len(n_keep)]
+  theta <- theta[keep, ]
+  for (v in c("preval", "report_rate", "overdispersion")) theta[[paste0("log_", v)]] <- log(theta[[v]])
+  rownames(theta) <- NULL
+  bank <- new_training_data(theta, obs[keep, ], type = "SEIR",
+                            source = "epiworldR ModelSEIRCONN with reporting")
+  attr(bank, "dropped_share") <- mean(reported < MIN_CASES)
+  bank
+}
+
+bank_files <- function(dir) file.path(dir, c("seir_theta.csv", "seir_observations.csv"))
+
+load_or_simulate <- function(name, n_keep, seed, true_cases = FALSE) {
+  dir   <- file.path(OUT_DIR, name)
+  files <- bank_files(dir)
+  if (all(file.exists(files)) && nrow(data.table::fread(files[1], select = 1L)) == n_keep) {
+    return(list(bank = read_training_data(files[1], files[2], type = "SEIR"), fresh = FALSE))
+  }
+  t <- system.time(bank <- simulate_bank(n_keep, seed, true_cases))
+  save_training_data(bank, name = "seir", output_dir = dir)
+  writeLines(as.character(c(round(t[["elapsed"]]), attr(bank, "dropped_share"))),
+             file.path(dir, "simulation_seconds_and_dropped_share.txt"))
+  list(bank = bank, fresh = TRUE)
+}
+
+x <- load_or_simulate("training_bank", N_SIMS, BANK_SEED, true_cases = FRESH_NOISE)
+train_bank <- x$bank
+fresh_bank <- x$fresh
+test_bank  <- load_or_simulate("test_bank", N_TEST, TEST_SEED)$bank
+calib_bank <- load_or_simulate("calibration_bank", N_CALIB, CALIB_SEED)$bank
+theta_file <- bank_files(file.path(OUT_DIR, "training_bank"))[1]
+obs_file   <- bank_files(file.path(OUT_DIR, "training_bank"))[2]
+
+info <- readLines(file.path(OUT_DIR, "training_bank", "simulation_seconds_and_dropped_share.txt"))
+cat("Training bank:", format(nrow(train_bank$theta), big.mark = ","), "curves | simulated in",
+    round(as.numeric(info[1]) / 60, 1), "minutes |", sprintf("%.1f%%", 100 * as.numeric(info[2])),
+    "dropped for too few cases\n")
+summary(train_bank$theta[, c(KNOWN, "R0", "preval", "report_rate", "overdispersion", "weekday_sd")])
+```
+
+```{r example-curves, fig.width=11, fig.height=5}
+set.seed(1)
+op <- par(mfrow = c(2, 4), mar = c(4, 4, 3, 1))
+for (i in sample(nrow(test_bank$theta), 8)) {
+  th <- test_bank$theta[i, ]
+  plot(test_bank$observations[i, ], type = "h", col = "blue", xlab = "day", ylab = "reported cases",
+       main = sprintf("R0 %.1f, %.0f%% reported\nnoise %.2f, weekday %.2f", th$R0, 100 * th$report_rate,
+                      th$overdispersion, th$weekday_sd), cex.main = 0.9)
+}
+par(op)
+```
+
+```{r stop-after-bank, include=FALSE}
+if (identical(params$stop_after, "bank")) knitr::knit_exit()
+```
+
+# Step 2: train and save the model
+
+One model per seed, each in its own folder. A model is retrained when `retrain: true`,
+when the training bank was just simulated, or when the saved model used other settings.
+
+```{r train}
+model_dirs <- file.path(OUT_DIR, paste0("model_seed_", SEEDS))
+
+model_matches <- function(dir, seed) {
+  config_file <- file.path(dir, "model_config.json")
+  if (!file.exists(file.path(dir, "model.pt")) || !file.exists(config_file)) return(FALSE)
+  cfg <- jsonlite::read_json(config_file)
+  cfg$epochs == EPOCHS && cfg$seed == seed &&
+    identical(unlist(cfg$known_names), KNOWN) &&
+    identical(unlist(cfg$target_names), TARGETS) &&
+    cfg$batch_size == BATCH_SIZE && cfg$hidden_size == HIDDEN_SIZE &&
+    cfg$num_layers == NUM_LAYERS && isTRUE(all.equal(cfg$dropout, DROPOUT)) &&
+    isTRUE(all.equal(cfg$learning_rate, LEARNING_RATE)) &&
+    isTRUE(all.equal(cfg$incidence_max, INCIDENCE_MAX)) &&
+    identical(cfg$incidence_transform, INCIDENCE_TRANSFORM) &&
+    identical(isTRUE(cfg$observation_noise), FRESH_NOISE) &&
+    isTRUE(all.equal(cfg$grad_clip, GRAD_CLIP)) &&
+    identical(unlist(cfg$output_activations), OUTPUT_ACTIVATION)
+}
+
+for (i in seq_along(SEEDS)) {
+  if (RETRAIN || fresh_bank || !model_matches(model_dirs[i], SEEDS[i])) {
+    t <- system.time(train_bilstm_calibrator(
+      name = "seir", known_names = KNOWN, target_names = TARGETS, type = "SEIR",
+      parameter_file = theta_file, observation_file = obs_file, output_dir = model_dirs[i],
+      epochs = EPOCHS, batch_size = BATCH_SIZE, learning_rate = LEARNING_RATE, seed = SEEDS[i],
+      hidden_size = HIDDEN_SIZE, num_layers = NUM_LAYERS, dropout = DROPOUT,
+      physics_weight = PHYSICS_WEIGHT, incidence_max = INCIDENCE_MAX,
+      incidence_transform = INCIDENCE_TRANSFORM, output_activation = OUTPUT_ACTIVATION,
+      grad_clip = GRAD_CLIP, device = params$device, observation_noise = FRESH_NOISE
+    ))
+    writeLines(as.character(round(t[["elapsed"]])), file.path(model_dirs[i], "training_seconds.txt"))
+  }
+}
+
+train_info <- do.call(rbind, lapply(seq_along(SEEDS), function(i) {
+  cfg <- jsonlite::read_json(file.path(model_dirs[i], "model_config.json"))
+  data.frame(seed = SEEDS[i], best_epoch = cfg$best_epoch, trained_on = cfg$device,
+             minutes = round(as.numeric(readLines(file.path(model_dirs[i], "training_seconds.txt"))) / 60, 1))
+}))
+knitr::kable(train_info, row.names = FALSE)
+```
+
+```{r stop-after-training, include=FALSE}
+if (identical(params$stop_after, "training")) knitr::knit_exit()
+```
+
+Validation loss by target (0-1 scale) for each seed. A seed whose loss stays flat
+would be a failed run.
+
+```{r history, fig.width=11, fig.height=4}
+op <- par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+for (what in c("validation_loss", "validation_mse_R0", "validation_mse_log_report_rate")) {
+  h <- lapply(model_dirs, function(d) read.csv(file.path(d, "training_history.csv")))
+  plot(NA, xlim = c(1, EPOCHS), ylim = range(unlist(lapply(h, `[[`, what))), log = "y",
+       xlab = "epoch", ylab = what, main = what)
+  for (k in seq_along(h)) lines(h[[k]]$epoch, h[[k]][[what]], col = k, lwd = 1.5)
+  legend("topright", bty = "n", lwd = 1.5, col = seq_along(h), legend = paste("seed", SEEDS))
+}
+par(op)
+```
+
+# Step 3: new simulated epidemics
+
+Estimates for many curves at once (the same numbers as `calibrate()`, checked below).
+With several seeds the main model is their average; `crate` is computed from the averaged
+R0 and ptran, as in v2.
+
+```{r predict-helpers}
+predict_models <- function(dirs, curves, known) {
+  curves <- as.matrix(curves)
+  known  <- as.data.frame(known)[, KNOWN, drop = FALSE]
+  ests <- lapply(dirs, function(d) bilstm_predict_many(d, curves, known, device = params$device))
+  avg  <- Reduce(`+`, ests) / length(ests)
+  avg$crate <- avg$R0 * known$recov / avg$ptran
+  avg
+}
+MODEL_DIRS <- if (ENSEMBLE) model_dirs else model_dirs[1]
+MODEL_LABEL <- if (ENSEMBLE) sprintf("%s (average of %d seeds)", MODEL, length(SEEDS)) else MODEL
+V2_LABEL <- sprintf("SEIR v2 (average of %d seeds)", length(V2_DIRS))
+
+# The fast path gives the same numbers as calibrate().
+cal_model <- bilstm_calibrator(model_dirs[1], known_names = KNOWN, type = "SEIR", device = params$device)
+one  <- t(vapply(1:3, function(i) calibrate(test_bank$observations[i, ], cal_model, n = test_bank$theta$n[i],
+              recov = test_bank$theta$recov[i], incub = test_bank$theta$incub[i])[c("ptran", "R0", "preval", "crate")],
+              numeric(4)))
+many <- predict_models(model_dirs[1], test_bank$observations[1:3, ], test_bank$theta[1:3, ])
+stopifnot(isTRUE(all.equal(unname(as.matrix(many[, c("ptran", "R0", "preval", "crate")])), unname(one),
+                           tolerance = 1e-5)))
+```
+
+```{r test-predict}
+v2_test <- read_training_data(file.path(params$v2_test_dir, "seir_theta.csv"),
+                              file.path(params$v2_test_dir, "seir_observations.csv"), type = "SEIR")
+est <- list(
+  noisy = list(v2 = predict_models(V2_DIRS, test_bank$observations, test_bank$theta),
+               model = predict_models(MODEL_DIRS, test_bank$observations, test_bank$theta)),
+  clean = list(v2 = predict_models(V2_DIRS, v2_test$observations, v2_test$theta),
+               model = predict_models(MODEL_DIRS, v2_test$observations, v2_test$theta))
+)
+r0_score <- function(e, t) c(R0_MAE = mean(abs(e - t)), R0_R2 = 1 - sum((e - t)^2) / sum((t - mean(t))^2))
+inside <- in_v2_range(test_bank$theta)
+rows <- list(
+  list("New test bank (reported cases), all curves", "noisy", rep(TRUE, N_TEST)),
+  list("New test bank, inside v2's training range", "noisy", inside),
+  list("New test bank, outside v2's training range", "noisy", !inside),
+  list("v2's test bank (every case, smooth)", "clean", rep(TRUE, nrow(v2_test$theta)))
+)
+test_tab <- do.call(rbind, lapply(rows, function(r) {
+  truth <- if (r[[2]] == "noisy") test_bank$theta$R0 else v2_test$theta$R0
+  s2 <- r0_score(est[[r[[2]]]]$v2$R0[r[[3]]], truth[r[[3]]])
+  s4 <- r0_score(est[[r[[2]]]]$model$R0[r[[3]]], truth[r[[3]]])
+  data.frame(test_curves = r[[1]], n = sum(r[[3]]),
+             v2_R0_MAE = s2[["R0_MAE"]], model_R0_MAE = s4[["R0_MAE"]],
+             v2_R0_R2 = s2[["R0_R2"]], model_R0_R2 = s4[["R0_R2"]])
+}))
+write.csv(test_tab, file.path(OUT_DIR, "test_R0_v2_vs_model.csv"), row.names = FALSE)
+knitr::kable(test_tab, digits = 3, row.names = FALSE)
+```
+
+```{r test-scatter, fig.width=11, fig.height=4}
+lim <- range(c(test_bank$theta$R0, est$noisy$v2$R0, est$noisy$model$R0))
+op <- par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+plot(test_bank$theta$R0, est$noisy$v2$R0, pch = 16, cex = 0.5, col = adjustcolor("darkorange", 0.6),
+     xlim = lim, ylim = lim, xlab = "true R0", ylab = "estimated R0", main = "SEIR v2, reported cases")
+abline(0, 1, lty = 2)
+plot(test_bank$theta$R0, est$noisy$model$R0, pch = 16, cex = 0.5, col = adjustcolor("purple", 0.6),
+     xlim = lim, ylim = lim, xlab = "true R0", ylab = "estimated R0", main = paste(MODEL, "reported cases"))
+abline(0, 1, lty = 2)
+plot(v2_test$theta$R0, est$clean$model$R0, pch = 16, cex = 0.5, col = adjustcolor("purple", 0.6),
+     xlab = "true R0", ylab = "estimated R0", main = paste(MODEL, "on v2's test bank"))
+abline(0, 1, lty = 2)
+par(op)
+```
+
+The other outputs on the new test bank (`R2` on the scale the network learns: log
+for preval, reported share and noise):
+
+```{r test-other-targets}
+truth <- test_bank$theta
+e4 <- est$noisy$model
+other <- data.frame(
+  output = c("R0", "ptran", "log preval", "log reported share", "log noise (overdispersion)", "weekday swing"),
+  truth  = I(list(truth$R0, truth$ptran, log(truth$preval), log(truth$report_rate),
+                  log(truth$overdispersion), truth$weekday_sd)),
+  est    = I(list(e4$R0, e4$ptran, log(e4$preval), log(e4$report_rate), log(e4$overdispersion), e4$weekday_sd))
+)
+other_tab <- data.frame(
+  output = other$output,
+  MAE = mapply(function(t, e) mean(abs(e - t)), other$truth, other$est),
+  R2  = mapply(function(t, e) 1 - sum((e - t)^2) / sum((t - mean(t))^2), other$truth, other$est)
+)
+write.csv(other_tab, file.path(OUT_DIR, "test_all_outputs.csv"), row.names = FALSE)
+knitr::kable(other_tab, digits = 3, row.names = FALSE)
+```
+
+# Step 4: a range for R0
+
+For each curve: its estimates, together with the known `recov` and `incub`, are
+compared with the estimates for the `r format(N_CALIB, big.mark = ",")` calibration
+curves; for the `r K_NB` most similar ones, the differences between true and estimated
+values are added to the curve's estimate. That gives the R0 range and, for the fit
+bands, `r N_REPS` parameter draws.
+
+```{r calibration}
+calib_est <- predict_models(MODEL_DIRS, calib_bank$observations, calib_bank$theta)
+features <- function(e, known) cbind(R0 = e$R0, lp = log(e$preval), lr = log(e$report_rate),
+                                     lo = log(e$overdispersion), recov = known$recov, incub = known$incub)
+F_cal  <- features(calib_est, calib_bank$theta)
+F_mean <- colMeans(F_cal)
+F_sd   <- apply(F_cal, 2, sd)
+F_cal_t <- t(scale(F_cal, F_mean, F_sd))
+th <- calib_bank$theta
+resid_cal <- data.frame(
+  R0 = th$R0 - calib_est$R0, lp = log(th$preval) - log(calib_est$preval),
+  lr = log(th$report_rate) - log(calib_est$report_rate),
+  lo = log(th$overdispersion) - log(calib_est$overdispersion), wsd = th$weekday_sd - calib_est$weekday_sd
+)
+
+neighbours <- function(e, known) {
+  f <- (features(e, known)[1, ] - F_mean) / F_sd
+  d <- colSums((F_cal_t - f)^2)
+  which(d <= sort(d, partial = K_NB)[K_NB])[seq_len(K_NB)]
+}
+r0_range <- function(e, nb, probs) e$R0 + quantile(resid_cal$R0[nb], probs, names = FALSE)
+
+# Parameter draws for one curve: its estimate plus the errors of similar curves.
+draw_parameters <- function(e, known, nb, n_draws) {
+  j <- sample(nb, n_draws, replace = TRUE)
+  R0 <- pmax(0.05, e$R0 + resid_cal$R0[j])
+  data.frame(
+    n = known$n, recov = known$recov, incub = known$incub,
+    preval = pmin(0.9, exp(log(e$preval) + resid_cal$lp[j])),
+    ptran = e$ptran, crate = R0 * known$recov / e$ptran,
+    report_rate = pmin(1, exp(log(e$report_rate) + resid_cal$lr[j])),
+    overdispersion = exp(log(e$overdispersion) + resid_cal$lo[j]),
+    weekday_sd = pmax(0, e$weekday_sd + resid_cal$wsd[j])
+  )
+}
+
+ranges <- t(vapply(seq_len(N_TEST), function(i) {
+  e  <- est$noisy$model[i, ]
+  nb <- neighbours(e, test_bank$theta[i, ])
+  r0_range(e, nb, c(0.025, 0.975, 0.25, 0.75))
+}, numeric(4)))
+t0 <- test_bank$theta$R0
+range_tab <- do.call(rbind, lapply(list(list("all test curves", rep(TRUE, N_TEST)),
+                                         list("inside v2's training range", inside),
+                                         list("outside v2's training range", !inside)), function(r) {
+  s <- r[[2]]
+  data.frame(test_curves = r[[1]], n = sum(s),
+             in_95_range_pct = 100 * mean(t0[s] >= ranges[s, 1] & t0[s] <= ranges[s, 2]),
+             in_50_range_pct = 100 * mean(t0[s] >= ranges[s, 3] & t0[s] <= ranges[s, 4]),
+             mean_width_95 = mean(ranges[s, 2] - ranges[s, 1]))
+}))
+write.csv(range_tab, file.path(OUT_DIR, "R0_range_check.csv"), row.names = FALSE)
+knitr::kable(range_tab, digits = 2, row.names = FALSE,
+             caption = "Share of test curves whose true R0 is inside the range (should be about 95% and 50%)")
+```
+
+```{r range-plot, fig.width=10, fig.height=4.5}
+s <- order(t0)[round(seq(1, N_TEST, length.out = 80))]
+plot(seq_along(s), t0[s], pch = 16, col = "blue", ylim = range(ranges[s, 1:2]), xlab = "test curve (by true R0)",
+     ylab = "R0", main = "95% range (grey) and estimate (purple) for 80 test curves; true R0 in blue")
+segments(seq_along(s), ranges[s, 1], seq_along(s), ranges[s, 2], col = "grey50", lwd = 2)
+points(seq_along(s), est$noisy$model$R0[s], pch = 3, col = "purple")
+```
+
+# Step 5: real data
+
+The same datasets as `Test_SEIR_real_data.Rmd` and the Utah windows of
+`Compare_SEIR_v2_v3_windows.Rmd`:
+
+- **Utah COVID-19 2024-25**: 61-day windows starting every 14 days over the last 365 days
+  (beginning, middle and end included); `n = 5000`, `recov = 1/7`, `incub = `r params$utah_incub``.
+- **Utah flu 2022-23 and 2023-24** (daily hospital admissions), **Baltimore flu 1918**
+  and **Utah COVID-19 summer 2023**: the 61 days ending a week after the peak.
+  Flu: `recov = 0.25`, `incub = `r params$flu_incub`` for `r params$model_name`; v2 cannot go below 3 days, so
+  it gets `incub = `r params$flu_incub_v2``.
+
+Three fit bands per window, from `r N_REPS` simulations each:
+
+1. **v2**: v2's estimate, every case counted (as in the earlier reports);
+2. **`r BAND_ONE`**: the model's estimate with its reporting model;
+3. **`r BAND_RANGE`**: parameter draws from the model's range, with its reporting model.
+
+For Utah windows followed by at least 14 days of data, the same simulations run 14 days
+further, and those days, which the models did not see, are scored too (a forecast).
+
+```{r real-data}
+DD <- params$real_data_dir
+covid <- read.csv(file.path(DD, "utah_covid_all_days.csv"))
+covid$Date <- as.Date(covid$Date)
+hhs <- read.csv(file.path(DD, "utah_hhs_hospital_admissions.csv"))
+hhs$date <- as.Date(substr(hhs$date, 1, 10)) - 1   # reported the day after admission
+e1918 <- new.env()
+load(file.path(DD, "Flu1918.rda"), envir = e1918)
+
+windows <- list()
+add_window <- function(dataset, label, x, cases, future, n, disease) {
+  windows[[length(windows) + 1]] <<- list(
+    dataset = dataset, label = label, x = x, cases = cases, future = future, n = n,
+    recov = if (disease == "flu") 0.25 else 1 / 7,
+    incub_model = if (disease == "flu") params$flu_incub else params$utah_incub,
+    incub_v2 = if (disease == "flu") params$flu_incub_v2 else params$utah_incub
+  )
+}
+
+utah <- tail(covid, 365)
+main_starts <- c(beginning = 1, middle = floor((365 - N_DAYS) / 2) + 1, end = 365 - N_DAYS + 1)
+for (s in sort(unique(c(seq(1, 365 - N_DAYS + 1, by = 14), main_starts)))) {
+  idx <- s:(s + N_DAYS - 1)
+  fut <- if (s + N_DAYS + 13 <= 365) (s + N_DAYS):(s + N_DAYS + 13) else integer(0)
+  lab <- if (s %in% main_starts) names(main_starts)[match(s, main_starts)] else ""
+  add_window("Utah COVID-19 2024-25", lab, utah$Date[c(idx, fut)], utah$Daily.Cases[idx],
+             utah$Daily.Cases[fut], 5000, "COVID-19")
+}
+
+peak_window <- function(dataset, x, cases, n, disease) {
+  ma  <- as.numeric(stats::filter(cases, rep(1 / 7, 7), sides = 2))
+  end <- min(length(cases), which.max(ma) + 7)
+  start <- max(1, end - N_DAYS + 1)   # an early peak: the first 61 days
+  idx <- start:(start + N_DAYS - 1)
+  add_window(dataset, "61 days to a week after the peak", x[idx], cases[idx], numeric(0), n, disease)
+}
+season <- function(d, y, from, to) list(x = d[d >= as.Date(from) & d <= as.Date(to)],
+                                        y = y[d >= as.Date(from) & d <= as.Date(to)])
+f1 <- season(hhs$date, hhs$previous_day_admission_influenza_confirmed, "2022-09-01", "2023-05-31")
+f2 <- season(hhs$date, hhs$previous_day_admission_influenza_confirmed, "2023-09-01", "2024-04-26")
+c3 <- season(covid$Date, covid$Daily.Cases, "2023-06-01", "2023-10-15")
+peak_window("Utah flu 2022-23", f1$x, f1$y, 5000, "flu")
+peak_window("Utah flu 2023-24", f2$x, f2$y, 5000, "flu")
+peak_window("Baltimore flu 1918", seq_along(e1918$Flu1918$incidence), e1918$Flu1918$incidence, 10000, "flu")
+peak_window("Utah COVID-19 summer 2023", c3$x, c3$y, 10000, "COVID-19")
+cat(length(windows), "windows\n")
+```
+
+```{r real-fit}
+band <- function(par_rows, ndays) {
+  sim  <- seir_simulator(ndays = ndays)
+  runs <- vapply(seq_len(nrow(par_rows)), function(i)
+    simulate_from_parameters(sim, as.list(par_rows[i, ]), seed = i), numeric(ndays))
+  data.frame(median = apply(runs, 1, median),
+             lower = apply(runs, 1, quantile, 0.025), upper = apply(runs, 1, quantile, 0.975))
+}
+# Interval score of the 95% band: its width plus 40 times the distance of each
+# observed day outside it (lower is better; a wide band is not rewarded).
+score <- function(b, y, days) {
+  if (!length(days)) return(c(coverage = NA, MAE = NA, width = NA, interval_score = NA))
+  lo <- b$lower[days]; hi <- b$upper[days]
+  c(coverage = 100 * mean(y >= lo & y <= hi), MAE = mean(abs(b$median[days] - y)),
+    width = mean(hi - lo),
+    interval_score = mean((hi - lo) + 40 * pmax(lo - y, 0) + 40 * pmax(y - hi, 0)))
+}
+
+set.seed(2026)
+fits <- lapply(windows, function(w) {
+  k2 <- data.frame(n = w$n, recov = w$recov, incub = w$incub_v2)
+  k4 <- data.frame(n = w$n, recov = w$recov, incub = w$incub_model)
+  e2 <- predict_models(V2_DIRS, matrix(w$cases, 1), k2)
+  e4 <- predict_models(MODEL_DIRS, matrix(w$cases, 1), k4)
+  nb <- neighbours(e4, k4)
+  ndays <- N_DAYS + length(w$future)
+  one <- function(k, e, noise) {
+    p <- data.frame(n = k$n, recov = k$recov, incub = k$incub, preval = e$preval, ptran = e$ptran, crate = e$crate)
+    if (noise) p <- cbind(p, e[, c("report_rate", "overdispersion", "weekday_sd")])
+    p[rep(1, N_REPS), ]
+  }
+  bands <- setNames(list(
+    band(one(k2, e2, FALSE), ndays),
+    band(one(k4, e4, TRUE), ndays),
+    band(draw_parameters(e4, k4, nb, N_REPS), ndays)
+  ), c("v2", BAND_ONE, BAND_RANGE))
+  fit_days <- seq_len(N_DAYS)
+  fut_days <- N_DAYS + seq_along(w$future)
+  metrics <- do.call(rbind, lapply(names(bands), function(m) {
+    f <- score(bands[[m]], w$cases, fit_days)
+    g <- score(bands[[m]], w$future, fut_days)
+    data.frame(band = m, coverage_pct = f[["coverage"]], MAE = f[["MAE"]], band_width = f[["width"]],
+               interval_score = f[["interval_score"]],
+               forecast_coverage_pct = g[["coverage"]], forecast_MAE = g[["MAE"]],
+               forecast_interval_score = g[["interval_score"]])
+  }))
+  list(w = w, e2 = e2, e4 = e4, r0_95 = r0_range(e4, nb, c(0.025, 0.975)), bands = bands, metrics = metrics)
+})
+
+real_tab <- do.call(rbind, lapply(fits, function(f) {
+  data.frame(dataset = f$w$dataset, window = f$w$label,
+             first_day = format(f$w$x[1]), R0_v2 = f$e2$R0, R0_model = f$e4$R0,
+             R0_model_low = f$r0_95[1], R0_model_high = f$r0_95[2],
+             reported_share_model = f$e4$report_rate, f$metrics)
+}))
+write.csv(real_tab, file.path(OUT_DIR, "real_data_fits.csv"), row.names = FALSE)
+```
+
+## Main windows
+
+```{r real-plots, fig.width=13, fig.height=4.2, results="asis"}
+BAND_COLS <- setNames(c("darkorange", "purple", "forestgreen"), c("v2", BAND_ONE, BAND_RANGE))
+main <- which(vapply(fits, function(f) nzchar(f$w$label), logical(1)))
+for (k in main) {
+  f <- fits[[k]]
+  cat("\n\n### ", f$w$dataset, ": ", f$w$label, "\n\n", sep = "")
+  y_all <- c(f$w$cases, f$w$future)
+  ylim  <- range(c(y_all, unlist(lapply(f$bands, function(b) c(b$lower, b$upper)))))
+  op <- par(mfrow = c(1, 3), mar = c(4, 4, 3.5, 1))
+  for (m in names(f$bands)) {
+    b <- f$bands[[m]]
+    r <- f$metrics[f$metrics$band == m, ]
+    x <- f$w$x
+    r0 <- if (m == "v2") f$e2$R0 else f$e4$R0
+    ttl <- sprintf("%s: R0 %.2f%s\nfit %.0f%%%s", m, r0,
+                   if (m == BAND_RANGE) sprintf(" (%.2f-%.2f)", f$r0_95[1], f$r0_95[2]) else "",
+                   r$coverage_pct,
+                   if (is.na(r$forecast_coverage_pct)) "" else sprintf(" | next 14 days %.0f%%", r$forecast_coverage_pct))
+    plot(x, b$median, type = "n", ylim = ylim, xlab = "", ylab = "daily count", main = ttl, cex.main = 0.95)
+    if (length(f$w$future)) {
+      rect(x[N_DAYS + 1], ylim[1], x[length(x)], ylim[2], col = adjustcolor("grey", 0.25), border = NA)
+    }
+    polygon(c(x, rev(x)), c(b$upper, rev(b$lower)), col = adjustcolor(BAND_COLS[[m]], 0.3), border = NA)
+    lines(x, b$median, col = BAND_COLS[[m]], lwd = 2)
+    lines(x, y_all, col = "blue", lwd = 1.5)
+    points(x, y_all, col = "blue", pch = 16, cex = 0.4)
+  }
+  par(op)
+  cat("\n\n")
+}
+```
+
+Grey: the 14 days after the window, not seen by the models. Coverage alone rewards wide
+bands, so the tables also give the band width and the **interval score** (the band width
+plus 40 times how far each observed day falls outside the band; lower is better).
+
+```{r real-main-table}
+knitr::kable(real_tab[real_tab$window != "", c("dataset", "window", "first_day", "band", "R0_v2", "R0_model",
+                                                "R0_model_low", "R0_model_high", "coverage_pct", "band_width",
+                                                "interval_score", "forecast_coverage_pct")],
+             digits = 2, row.names = FALSE)
+```
+
+## All Utah COVID-19 windows
+
+```{r utah-summary}
+u <- real_tab[real_tab$dataset == "Utah COVID-19 2024-25", ]
+utah_summary <- do.call(rbind, lapply(names(BAND_COLS), function(m) {
+  r <- u[u$band == m, ]
+  data.frame(band = m, windows = nrow(r), mean_fit_coverage_pct = mean(r$coverage_pct),
+             mean_fit_band_width = mean(r$band_width), mean_fit_interval_score = mean(r$interval_score),
+             forecast_windows = sum(!is.na(r$forecast_coverage_pct)),
+             mean_forecast_coverage_pct = mean(r$forecast_coverage_pct, na.rm = TRUE),
+             mean_forecast_MAE = mean(r$forecast_MAE, na.rm = TRUE),
+             mean_forecast_interval_score = mean(r$forecast_interval_score, na.rm = TRUE))
+}))
+write.csv(utah_summary, file.path(OUT_DIR, "utah_windows_summary.csv"), row.names = FALSE)
+knitr::kable(utah_summary, digits = 2, row.names = FALSE)
+```
+
+```{r utah-rolling-plot, fig.width=10, fig.height=7}
+op <- par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+for (what in c("coverage_pct", "forecast_coverage_pct")) {
+  plot(range(as.Date(u$first_day)), c(0, 100), type = "n", xlab = "first day of the 61-day window",
+       ylab = "% of days inside the 95% band",
+       main = if (what == "coverage_pct") "The 61 fitted days" else "The next 14 days (forecast)")
+  for (m in names(BAND_COLS)) {
+    r <- u[u$band == m, ]
+    lines(as.Date(r$first_day), r[[what]], type = "b", pch = 16, lwd = 2, col = BAND_COLS[[m]])
+  }
+  legend("bottomleft", bty = "n", lwd = 2, pch = 16, col = BAND_COLS, legend = names(BAND_COLS))
+}
+par(op)
+```
+
+# Run-to-run variation
+
+```{r seeds}
+seed_tab <- do.call(rbind, lapply(seq_along(SEEDS), function(k) {
+  e <- predict_models(model_dirs[k], test_bank$observations, test_bank$theta)
+  data.frame(model = paste("seed", SEEDS[k]), R0_MAE_new_test_bank = mean(abs(e$R0 - test_bank$theta$R0)))
+}))
+if (ENSEMBLE) {
+  seed_tab <- rbind(seed_tab, data.frame(model = MODEL_LABEL,
+                                         R0_MAE_new_test_bank = mean(abs(est$noisy$model$R0 - test_bank$theta$R0))))
+}
+write.csv(seed_tab, file.path(OUT_DIR, "seed_variation.csv"), row.names = FALSE)
+knitr::kable(seed_tab, digits = 3, row.names = FALSE)
+```
+
+# Summary
+
+```{r summary}
+other_real <- real_tab[real_tab$dataset != "Utah COVID-19 2024-25", ]
+summary_tab <- rbind(
+  data.frame(measure = c("R0 MAE, new test bank (reported cases)", "R0 MAE, v2's test bank (every case)"),
+             v2 = test_tab$v2_R0_MAE[c(1, 4)], model = test_tab$model_R0_MAE[c(1, 4)], model_with_range = NA),
+  data.frame(measure = "True R0 inside the 95% range (%)", v2 = NA, model = NA,
+             model_with_range = range_tab$in_95_range_pct[1]),
+  do.call(rbind, lapply(list(
+    list("Utah COVID 2024-25, fit coverage (mean of windows, %)", "mean_fit_coverage_pct"),
+    list("Utah COVID 2024-25, fit interval score (lower is better)", "mean_fit_interval_score"),
+    list("Utah COVID 2024-25, next-14-day coverage (mean, %)", "mean_forecast_coverage_pct"),
+    list("Utah COVID 2024-25, next-14-day interval score (lower is better)", "mean_forecast_interval_score")),
+    function(r) {
+      v <- setNames(utah_summary[[r[[2]]]], utah_summary$band)
+      data.frame(measure = r[[1]], v2 = v[["v2"]], model = v[[BAND_ONE]], model_with_range = v[[BAND_RANGE]])
+    })),
+  do.call(rbind, lapply(unique(other_real$dataset), function(d) {
+    labels <- c(coverage_pct = "fit coverage (%)", interval_score = "fit interval score")
+    do.call(rbind, lapply(names(labels), function(col) {
+      s <- other_real$dataset == d
+      v <- setNames(other_real[[col]][s], other_real$band[s])
+      data.frame(measure = paste0(d, ", ", labels[[col]]),
+                 v2 = v[["v2"]], model = v[[BAND_ONE]], model_with_range = v[[BAND_RANGE]])
+    }))
+  }))
+)
+write.csv(summary_tab, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_tab, digits = 3, row.names = FALSE)
+```
+
+# Saved files
+
+```{r save}
+saveRDS(list(settings = settings, test = test_tab, other_outputs = other_tab, R0_range = range_tab,
+             real = real_tab, utah_summary = utah_summary, seeds = seed_tab, summary = summary_tab,
+             params = params),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+list.files(OUT_DIR)
+```

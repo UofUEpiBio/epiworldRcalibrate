@@ -1,0 +1,381 @@
+---
+title: "SEIR v2 vs variable-length v3 on 61-day windows"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  v2_models: "results/seir_bilstm_v2/model_seed_122,results/seir_bilstm_v2/model_seed_1,results/seir_bilstm_v2/model_seed_2,results/seir_bilstm_v2/model_seed_3,results/seir_bilstm_v2/model_seed_4"
+  v3_models: "results/seir_variable_length_v3/model_seed_122,results/seir_variable_length_v3/model_seed_1,results/seir_variable_length_v3/model_seed_2,results/seir_variable_length_v3/model_seed_3,results/seir_variable_length_v3/model_seed_4"
+  v3_run: "results/seir_variable_length_v3"
+  out_dir: "results/seir_v2_vs_v3_windows"
+  window: 61
+  step: 14
+  n_reps: 300
+  utah_incub: 5
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+Two SEIR BiLSTM models, both the average of 5 seeds, read the same 61-day windows:
+
+- **SEIR v2** (`SEIR_BiLSTM.Rmd`, `results/seir_bilstm_v2`): trained only on the first
+  61 days of simulated epidemics. Besides `ptran`, `crate` and `R0` it estimates the
+  share initially exposed (`preval`); everyone else starts susceptible.
+- **Variable-length v3** (`SEIR_variable_length_BiLSTM.Rmd`,
+  `results/seir_variable_length_v3`): trained on windows of 30 to 365 days from the
+  beginning, middle and end of 365-day epidemics. Besides `ptran`, `crate` and `R0` it
+  estimates the shares exposed, infectious and recovered on the first day of the window.
+
+Both get the same known values (`n`, `recov`, `incub`). The windows:
+
+1. **Utah COVID-19 data (last 365 days):** the first 61 days (beginning), the middle 61
+   days and the last 61 days (end), then every 61-day window starting every
+   `r params$step` days. There is no true R0 for real data, so each model's estimates
+   are run `r params$n_reps` times through the SEIR simulator, starting from the
+   model's own estimate of the starting state, and scored by how much of the observed
+   curve falls inside the 95% band.
+2. **Simulated epidemics (true R0 known):** the 61-day windows at the beginning, middle
+   and end of the test epidemics in the v3 report (the same windows, so the v3 numbers
+   match that report).
+
+To run it (from the `examples/` folder):
+
+```r
+rmarkdown::render("Compare_SEIR_v2_v3_windows.Rmd", output_dir = "results/seir_v2_vs_v3_windows")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+OUT_DIR <- params$out_dir
+WINDOW  <- params$window
+N_REPS  <- params$n_reps
+KNOWN   <- c("n", "recov", "incub")
+STATE_NAMES <- c("exposed_share", "infected_share", "recovered_share")
+POSITIONS   <- c("beginning", "middle", "end")
+UTAH_N <- 5000; UTAH_RECOV <- 1 / 7; UTAH_INCUB <- params$utah_incub
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+# Several seeds = average of their estimates, with crate recomputed from the
+# averaged ptran and R0 (as in both reports).
+make_model <- function(dirs) {
+  cls <- lapply(trimws(strsplit(dirs, ",")[[1]]), function(d)
+    bilstm_calibrator(d, known_names = KNOWN, type = "SEIR", device = params$device))
+  if (length(cls) == 1) return(cls[[1]])
+  structure(list(
+    pre_process  = function(x, ...) x,
+    run          = function(x, ...) rowMeans(sapply(cls, function(cl) calibrate(x, cl, ...))),
+    post_process = function(x, recov = NULL, ...) derive_crate(x, recov = recov),
+    type         = "SEIR"
+  ), class = "calibrator")
+}
+models <- list(`SEIR v2` = make_model(params$v2_models),
+               `Variable-length v3` = make_model(params$v3_models))
+MODEL_COLS <- c(`SEIR v2` = "darkorange", `Variable-length v3` = "purple")
+
+# Where a 61-day window starts inside `last` days.
+window_start <- function(position, last) {
+  switch(position, beginning = 1, middle = floor((last - WINDOW) / 2) + 1, end = last - WINDOW + 1)
+}
+
+cuda_ok <- reticulate::py_eval("__import__('torch').cuda.is_available()")
+device  <- if (params$device == "cpu" || !cuda_ok) "cpu" else "cuda"
+cat("BiLSTM predictions on:", device, "\n")
+```
+
+# Utah COVID-19 data
+
+```{r utah-data}
+utah <- read.csv(file.path(params$v3_run, "utah_covid_last365days.csv"))
+utah$Date <- as.Date(utah$Date)
+write.csv(utah, file.path(OUT_DIR, "utah_covid_last365days.csv"), row.names = FALSE)
+
+main_starts <- vapply(POSITIONS, window_start, numeric(1), last = nrow(utah))
+starts <- sort(unique(c(seq(1, nrow(utah) - WINDOW + 1, by = params$step), main_starts)))
+cat("Dates:", format(min(utah$Date)), "to", format(max(utah$Date)), "|",
+    length(starts), "windows of", WINDOW, "days\n")
+```
+
+```{r utah-plot-data, fig.width=10, fig.height=3.5}
+plot(utah$Date, utah$Daily.Cases, type = "l", lwd = 2, col = "blue", xlab = "",
+     ylab = "daily cases", main = "Utah, last 365 days: the three main 61-day windows")
+for (k in seq_along(POSITIONS)) {
+  s <- main_starts[k]
+  rect(utah$Date[s], par("usr")[3], utah$Date[s + WINDOW - 1], par("usr")[4],
+       col = adjustcolor("grey50", 0.2), border = NA)
+  text(utah$Date[s + WINDOW %/% 2], par("usr")[4], POSITIONS[k], pos = 1)
+}
+```
+
+## Fitting each window
+
+Each model's estimates are simulated `r N_REPS` times (seeds 1 to `r N_REPS`), with
+`n = 5000`, `recov = 1/7`, `incub = `r UTAH_INCUB``, as in both reports. The starting
+state is each model's own estimate:
+
+- **SEIR v2:** `preval` exposed, everyone else susceptible (a fresh epidemic);
+- **Variable-length v3:** the estimated shares exposed, infectious and recovered.
+
+Coverage is the share of observed days inside the 95% band; RMSE and MAE compare the
+median simulated curve with the observed cases.
+
+```{r utah-fit}
+sim <- seir_simulator(ndays = WINDOW)
+
+start_state <- function(est) {
+  if (all(STATE_NAMES %in% names(est))) {
+    list(preval = est[["exposed_share"]], start_infected = est[["infected_share"]],
+         start_recovered = est[["recovered_share"]])
+  } else {
+    list(preval = est[["preval"]])
+  }
+}
+
+band <- function(est) {
+  pars <- c(list(n = UTAH_N, recov = UTAH_RECOV, incub = UTAH_INCUB,
+                 ptran = est[["ptran"]], crate = est[["crate"]]), start_state(est))
+  runs <- vapply(seq_len(N_REPS), function(i) simulate_from_parameters(sim, pars, seed = i),
+                 numeric(WINDOW))
+  data.frame(day = seq_len(WINDOW), median = apply(runs, 1, median),
+             lower = apply(runs, 1, quantile, 0.025), upper = apply(runs, 1, quantile, 0.975))
+}
+
+fits <- list()
+rolling <- do.call(rbind, lapply(starts, function(s) {
+  y <- utah$Daily.Cases[s:(s + WINDOW - 1)]
+  do.call(rbind, lapply(names(models), function(m) {
+    est <- calibrate(y, models[[m]], n = UTAH_N, recov = UTAH_RECOV, incub = UTAH_INCUB)
+    b   <- band(est)
+    fits[[paste(m, s)]] <<- list(est = est, band = b, y = y)
+    data.frame(
+      model = m, window_start = s, first_date = utah$Date[s], last_date = utah$Date[s + WINDOW - 1],
+      position = if (s %in% main_starts) names(main_starts)[match(s, main_starts)] else "",
+      R0 = est[["R0"]], ptran = est[["ptran"]], crate = est[["crate"]],
+      preval = if ("preval" %in% names(est)) est[["preval"]] else NA,
+      exposed_share   = if ("exposed_share" %in% names(est)) est[["exposed_share"]] else NA,
+      infected_share  = if ("infected_share" %in% names(est)) est[["infected_share"]] else NA,
+      recovered_share = if ("recovered_share" %in% names(est)) est[["recovered_share"]] else NA,
+      coverage_pct = 100 * mean(y >= b$lower & y <= b$upper),
+      RMSE = sqrt(mean((b$median - y)^2)),
+      MAE  = mean(abs(b$median - y))
+    )
+  }))
+}))
+write.csv(rolling, file.path(OUT_DIR, "utah_all_windows.csv"), row.names = FALSE)
+```
+
+## Beginning, middle and end
+
+```{r utah-main-plot, fig.width=12, fig.height=7}
+op <- par(mfrow = c(length(models), length(POSITIONS)), mar = c(4, 4, 3.5, 1))
+for (m in names(models)) {
+  for (pos in POSITIONS) {
+    s  <- main_starts[[pos]]
+    f  <- fits[[paste(m, s)]]
+    dates <- utah$Date[s:(s + WINDOW - 1)]
+    # Same y-axis for both models in a window.
+    ylim <- range(unlist(lapply(names(models), function(mm) {
+      ff <- fits[[paste(mm, s)]]; c(ff$y, ff$band$lower, ff$band$upper)
+    })))
+    r <- rolling[rolling$model == m & rolling$window_start == s, ]
+    plot(dates, f$band$median, type = "n", ylim = ylim, xlab = "", ylab = "daily cases",
+         main = sprintf("%s, %s\nR0 %.2f | coverage %.0f%%", m, pos, r$R0, r$coverage_pct))
+    polygon(c(dates, rev(dates)), c(f$band$upper, rev(f$band$lower)),
+            col = adjustcolor(MODEL_COLS[[m]], alpha.f = 0.3), border = NA)
+    lines(dates, f$band$median, col = MODEL_COLS[[m]], lwd = 2)
+    lines(dates, f$y, col = "blue", lwd = 2)
+    points(dates, f$y, col = "blue", pch = 16, cex = 0.5)
+  }
+}
+par(op)
+```
+
+```{r utah-main-table}
+main_tab <- rolling[rolling$position != "", ]
+main_tab <- main_tab[order(match(main_tab$position, POSITIONS), main_tab$model), ]
+main_tab$dates <- paste(format(main_tab$first_date), "to", format(main_tab$last_date))
+write.csv(main_tab, file.path(OUT_DIR, "utah_beginning_middle_end.csv"), row.names = FALSE)
+knitr::kable(main_tab[, c("position", "dates", "model", "R0", "coverage_pct", "RMSE", "MAE")],
+             digits = 2, row.names = FALSE,
+             col.names = c("window", "dates", "model", "R0", "coverage %", "RMSE", "MAE"))
+```
+
+The starting state each model assumed (shares of the population):
+
+```{r utah-start-state}
+knitr::kable(main_tab[, c("position", "model", "preval", "exposed_share", "infected_share",
+                          "recovered_share", "ptran", "crate")],
+             digits = 4, row.names = FALSE)
+```
+
+## Every 61-day window
+
+All `r length(starts)` windows starting every `r params$step` days (the three main
+windows are marked with dashed lines):
+
+```{r utah-rolling-plot, fig.width=10, fig.height=7}
+op <- par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+for (what in c("R0", "coverage_pct")) {
+  plot(range(rolling$first_date), range(c(0, rolling[[what]])), type = "n",
+       xlab = "first day of the 61-day window", ylab = if (what == "R0") "estimated R0" else "coverage %",
+       main = if (what == "R0") "R0 estimate" else "Observed days inside the 95% band")
+  abline(v = utah$Date[main_starts], lty = 2, col = "grey50")
+  for (m in names(models)) {
+    r <- rolling[rolling$model == m, ]
+    lines(r$first_date, r[[what]], type = "b", pch = 16, lwd = 2, col = MODEL_COLS[[m]])
+  }
+  legend("bottomleft", bty = "n", lwd = 2, pch = 16, col = MODEL_COLS, legend = names(models))
+}
+par(op)
+```
+
+```{r utah-rolling-summary}
+wide <- reshape(rolling[, c("model", "window_start", "coverage_pct")], idvar = "window_start",
+                timevar = "model", direction = "wide")
+names(wide) <- sub("coverage_pct.", "", names(wide), fixed = TRUE)
+utah_summary <- do.call(rbind, lapply(names(models), function(m) {
+  r <- rolling[rolling$model == m, ]
+  other <- setdiff(names(models), m)
+  data.frame(model = m, windows = nrow(r),
+             mean_coverage_pct = mean(r$coverage_pct), median_coverage_pct = median(r$coverage_pct),
+             mean_RMSE = mean(r$RMSE),
+             windows_with_higher_coverage = sum(wide[[m]] > wide[[other]]),
+             R0_min = min(r$R0), R0_max = max(r$R0))
+}))
+write.csv(utah_summary, file.path(OUT_DIR, "utah_all_windows_summary.csv"), row.names = FALSE)
+knitr::kable(utah_summary, digits = 2, row.names = FALSE)
+```
+
+# Simulated epidemics (true R0 known)
+
+The 61-day windows from the v3 report: the first 61 days (beginning), the middle and
+the last 61 days of each test epidemic's informative days (before its first week
+without cases). SEIR v2 was only trained on the beginning.
+
+```{r sim-windows}
+test_dir  <- file.path(params$v3_run, "test_bank")
+test_bank <- read_training_data(file.path(test_dir, "seir_theta.csv"),
+                                file.path(test_dir, "seir_observations.csv"), type = "SEIR")
+grid <- read.csv(file.path(params$v3_run, "grid_estimates.csv"))
+win  <- unique(grid[grid$length == WINDOW, c("curve", "position", "window_start")])
+win  <- win[order(match(win$position, POSITIONS), win$curve), ]
+knitr::kable(as.data.frame(table(position = factor(win$position, POSITIONS)), responseName = "windows"))
+```
+
+```{r sim-estimates}
+sim_est <- do.call(rbind, lapply(names(models), function(m) {
+  t0 <- proc.time()[["elapsed"]]
+  r0 <- vapply(seq_len(nrow(win)), function(k) {
+    i <- win$curve[k]; s <- win$window_start[k]
+    calibrate(as.numeric(test_bank$observations[i, s:(s + WINDOW - 1)]), models[[m]],
+              n = test_bank$theta$n[i], recov = test_bank$theta$recov[i],
+              incub = test_bank$theta$incub[i])[["R0"]]
+  }, numeric(1))
+  data.frame(model = m, win, R0 = r0, R0_true = test_bank$theta$R0[win$curve],
+             seconds_per_window = (proc.time()[["elapsed"]] - t0) / nrow(win))
+}))
+sim_est$R0_abs_error <- abs(sim_est$R0 - sim_est$R0_true)
+write.csv(sim_est, file.path(OUT_DIR, "simulated_estimates.csv"), row.names = FALSE)
+
+sim_tab <- do.call(rbind, lapply(names(models), function(m) do.call(rbind, lapply(POSITIONS, function(pos) {
+  g <- sim_est[sim_est$model == m & sim_est$position == pos, ]
+  data.frame(model = m, position = pos, R0_MAE = mean(g$R0_abs_error),
+             R0_R2 = 1 - sum((g$R0 - g$R0_true)^2) / sum((g$R0_true - mean(g$R0_true))^2),
+             R0_bias = mean(g$R0 - g$R0_true))
+}))))
+write.csv(sim_tab, file.path(OUT_DIR, "simulated_R0_by_position.csv"), row.names = FALSE)
+knitr::kable(sim_tab, digits = 3, row.names = FALSE)
+```
+
+```{r sim-scatter, fig.width=12, fig.height=7}
+lim <- range(c(sim_est$R0, sim_est$R0_true))
+op <- par(mfrow = c(length(models), length(POSITIONS)), mar = c(4, 4, 3, 1))
+for (m in names(models)) {
+  for (pos in POSITIONS) {
+    g <- sim_est[sim_est$model == m & sim_est$position == pos, ]
+    plot(g$R0_true, g$R0, xlim = lim, ylim = lim, pch = 16, cex = 0.6,
+         col = adjustcolor(MODEL_COLS[[m]], 0.6), xlab = "true R0", ylab = "estimated R0",
+         main = sprintf("%s, %s (MAE %.3f)", m, pos, mean(g$R0_abs_error)))
+    abline(0, 1, lty = 2)
+  }
+}
+par(op)
+```
+
+```{r sim-time}
+knitr::kable(aggregate(seconds_per_window ~ model, sim_est, mean), digits = 4, row.names = FALSE,
+             caption = paste("Seconds per 61-day window (5-seed average), predictions on", device))
+```
+
+# Summary
+
+```{r summary}
+summary_tab <- rbind(
+  do.call(rbind, lapply(POSITIONS, function(pos) {
+    r <- main_tab[main_tab$position == pos, ]
+    data.frame(measure = paste("Utah", pos, "window: coverage %"),
+               `SEIR v2` = r$coverage_pct[r$model == "SEIR v2"],
+               `Variable-length v3` = r$coverage_pct[r$model == "Variable-length v3"], check.names = FALSE)
+  })),
+  data.frame(measure = sprintf("Utah, all %d windows: mean coverage %%", length(starts)),
+             `SEIR v2` = utah_summary$mean_coverage_pct[utah_summary$model == "SEIR v2"],
+             `Variable-length v3` = utah_summary$mean_coverage_pct[utah_summary$model == "Variable-length v3"],
+             check.names = FALSE),
+  do.call(rbind, lapply(POSITIONS, function(pos) {
+    r <- sim_tab[sim_tab$position == pos, ]
+    data.frame(measure = paste("Simulated", pos, "windows: R0 MAE"),
+               `SEIR v2` = r$R0_MAE[r$model == "SEIR v2"],
+               `Variable-length v3` = r$R0_MAE[r$model == "Variable-length v3"], check.names = FALSE)
+  }))
+)
+summary_tab$better <- ifelse(grepl("coverage", summary_tab$measure),
+  ifelse(summary_tab$`SEIR v2` > summary_tab$`Variable-length v3`, "SEIR v2",
+         ifelse(summary_tab$`SEIR v2` < summary_tab$`Variable-length v3`, "Variable-length v3", "tie")),
+  ifelse(summary_tab$`SEIR v2` < summary_tab$`Variable-length v3`, "SEIR v2", "Variable-length v3"))
+write.csv(summary_tab, file.path(OUT_DIR, "summary.csv"), row.names = FALSE)
+knitr::kable(summary_tab, digits = 3, row.names = FALSE)
+```
+
+Notes:
+
+- Coverage on Utah measures how well the simulated curves match the data, not whether
+  R0 is right; the simulated windows check R0 against the truth.
+- SEIR v2 always assumes a fresh epidemic (no one recovered at the window start); v3
+  estimates the recovered share, which only matters if earlier infections slowed the
+  epidemic down.
+
+# Saved files
+
+```{r save}
+saveRDS(list(rolling = rolling, main = main_tab, utah_summary = utah_summary,
+             simulated = sim_est, simulated_summary = sim_tab, summary = summary_tab,
+             params = params),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(capture.output(sessionInfo()), file.path(OUT_DIR, "session_info.txt"))
+list.files(OUT_DIR)
+```

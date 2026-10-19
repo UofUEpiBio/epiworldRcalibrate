@@ -1,0 +1,291 @@
+---
+title: "Can a newly trained BiLSTM match the pretrained SIR model?"
+author: "Sima Najafzadeh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+params:
+  n_sims: 20000
+  epochs: 100
+  n_test: 500
+  n_reps: 300
+  model_dir: "trained_models/sir_bilstm_20000"
+  retrain: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. What this document does
+
+This compares two SIR BiLSTM calibrators:
+
+- **Pretrained**: the original model shipped with the package (`pretrained_sir_calibrator()`),
+  trained on about 60,000 simulations.
+- **New**: a model trained here with the package's own trainer (`train_bilstm_calibrator()`),
+  using the same simulator, the same parameter ranges and the same network size.
+
+Both use the same post-processing: `ptran` and `R0` come from the network and
+`crate = R0 * recov / ptran`.
+
+The comparison has two parts:
+
+1. **Simulated test curves** with known parameters, so accuracy can be measured directly.
+2. **Real Utah COVID-19 data**: each model's estimates are used to reconstruct the epidemic
+   curve, which is then compared with the observed cases.
+
+Known differences between the two models, besides the new model's smaller training bank:
+
+- The pretrained model divides daily cases by 10,000 before they enter the network; the
+  package trainer divides by 100,000.
+- The pretrained model uses separate output activations for each parameter; the package
+  trainer uses one sigmoid for all scaled outputs.
+
+## 2. Settings
+
+```{r settings}
+library(epiworldRcalibrate)
+
+N_SIMS    <- params$n_sims   # training simulations for the new model
+EPOCHS    <- params$epochs
+N_TEST    <- params$n_test   # simulated test curves for the accuracy comparison
+N_REPS    <- params$n_reps   # simulations per model for the real-data reconstruction
+MODEL_DIR <- params$model_dir
+SEED      <- 122
+
+known_names  <- c("n", "recov")
+target_names <- c("ptran", "crate", "R0")
+
+data.frame(
+  setting = c("training simulations", "epochs", "test curves", "reconstruction runs", "model folder"),
+  value   = c(N_SIMS, EPOCHS, N_TEST, N_REPS, normalizePath(MODEL_DIR, mustWork = FALSE))
+)
+```
+
+## 3. Train and save the new model
+
+The model is saved in `MODEL_DIR`. If a trained model is already there, it is reused, so
+re-knitting this document does not retrain unless `retrain: true` is set.
+
+```{r train}
+if (isTRUE(params$retrain) || !file.exists(file.path(MODEL_DIR, "model.pt"))) {
+  train_bank <- generate_sir_training_data(n_sims = N_SIMS, ndays = 60, seed = SEED)
+
+  train_time <- system.time(
+    train_bilstm_calibrator(
+      name           = "sir",
+      known_names    = known_names,
+      target_names   = target_names,
+      type           = "SIR",
+      data           = train_bank,
+      output_dir     = MODEL_DIR,
+      epochs         = EPOCHS,
+      seed           = SEED,
+      physics_weight = 0.03
+    )
+  )
+  cat("Training took", round(train_time[["elapsed"]] / 60, 1), "minutes\n")
+} else {
+  cat("Using the saved model in", MODEL_DIR, "\n")
+}
+
+pretrained_cal <- pretrained_sir_calibrator()
+new_cal        <- bilstm_calibrator(MODEL_DIR, known_names, type = "SIR")
+```
+
+Validation results written by the trainer (20% of the training bank held out):
+
+```{r validation}
+knitr::kable(
+  read.csv(file.path(MODEL_DIR, "validation_metrics.csv")),
+  digits = 3, caption = "New model: validation metrics"
+)
+
+history <- read.csv(file.path(MODEL_DIR, "training_history.csv"))
+matplot(
+  history$epoch, history[, c("train_loss", "validation_loss")], type = "l", lty = 1, lwd = 2,
+  col = c("black", "red"), xlab = "epoch", ylab = "loss", main = "New model: training history"
+)
+legend("topright", bty = "n", lwd = 2, col = c("black", "red"), legend = c("train", "validation"))
+```
+
+## 4. Part A: simulated test curves
+
+Fresh curves, simulated with a different seed from the training bank, so neither model has
+seen them.
+
+```{r test-set}
+test_bank <- generate_sir_training_data(n_sims = N_TEST, ndays = 60, seed = 2025)
+
+estimate_all <- function(cal) {
+  out <- t(sapply(seq_len(N_TEST), function(i) {
+    calibrate(
+      as.numeric(test_bank$observations[i, ]), cal,
+      n = test_bank$theta$n[i], recov = test_bank$theta$recov[i]
+    )[target_names]
+  }))
+  as.data.frame(out)
+}
+
+pred_pretrained <- estimate_all(pretrained_cal)
+pred_new        <- estimate_all(new_cal)
+truth           <- test_bank$theta[, target_names]
+```
+
+```{r test-metrics}
+accuracy <- function(pred, model) {
+  do.call(rbind, lapply(target_names, function(p) {
+    err <- pred[[p]] - truth[[p]]
+    data.frame(
+      model     = model,
+      parameter = p,
+      MAE       = mean(abs(err)),
+      RMSE      = sqrt(mean(err^2)),
+      R2        = 1 - sum(err^2) / sum((truth[[p]] - mean(truth[[p]]))^2)
+    )
+  }))
+}
+
+test_metrics <- rbind(accuracy(pred_pretrained, "Pretrained"), accuracy(pred_new, "New"))
+test_metrics <- test_metrics[order(test_metrics$parameter, test_metrics$model), ]
+knitr::kable(test_metrics, digits = 3, row.names = FALSE,
+             caption = "Accuracy on simulated test curves (lower MAE/RMSE and higher R2 are better)")
+```
+
+```{r test-plots, fig.width=9, fig.height=6}
+op <- par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+for (m in c("Pretrained", "New")) {
+  pred <- if (m == "Pretrained") pred_pretrained else pred_new
+  for (p in target_names) {
+    plot(truth[[p]], pred[[p]], pch = 16, cex = 0.5, col = adjustcolor("black", 0.4),
+         xlab = paste("true", p), ylab = paste("estimated", p), main = paste(m, "-", p))
+    abline(0, 1, col = "red", lwd = 2)
+  }
+}
+par(op)
+```
+
+How close are the two models to each other on the same curves?
+
+```{r test-agreement}
+knitr::kable(
+  data.frame(
+    parameter        = target_names,
+    correlation      = sapply(target_names, function(p) cor(pred_pretrained[[p]], pred_new[[p]])),
+    mean_abs_diff    = sapply(target_names, function(p) mean(abs(pred_pretrained[[p]] - pred_new[[p]])))
+  ),
+  digits = 3, row.names = FALSE, caption = "Pretrained vs. new estimates on the same test curves"
+)
+```
+
+## 5. Part B: real Utah COVID-19 data
+
+The last 61 days of Utah daily cases.
+
+```{r utah-data}
+fetch_utah_covid_data <- function(n_days = 61) {
+  zip_url <- "https://coronavirus-dashboard.utah.gov/Utah_COVID19_data.zip"
+  tmp <- tempfile(fileext = ".zip")
+  download.file(zip_url, tmp, mode = "wb", quiet = TRUE)
+  target <- grep(
+    "Trends_Epidemic", unzip(tmp, list = TRUE)$Name,
+    ignore.case = TRUE, value = TRUE
+  )[1]
+  daily <- read.csv(unz(tmp, target))
+  unlink(tmp)
+  daily$Date <- as.Date(daily$Date)
+  daily <- daily[order(daily$Date), ]
+  tail(daily, n_days)
+}
+
+utah     <- fetch_utah_covid_data(61)
+observed <- utah$Daily.Cases
+cat("Dates:", format(min(utah$Date)), "to", format(max(utah$Date)), "\n")
+summary(observed)
+```
+
+Both models get the same known values. `n` and `recov` match the pretrained model's
+assumptions; `preval` is taken from the first observed day.
+
+```{r utah-estimates}
+known <- list(n = 5000, recov = 1 / 7, preval = observed[1] / 5000)
+
+est_pretrained <- calibrate(observed, pretrained_cal, n = known$n, recov = known$recov)
+est_new        <- calibrate(observed, new_cal,        n = known$n, recov = known$recov)
+
+knitr::kable(
+  rbind(Pretrained = est_pretrained[target_names], New = est_new[target_names]),
+  digits = 4, caption = "Estimates on the Utah data"
+)
+```
+
+### Reconstructing the epidemic curve
+
+For each model, simulate the SIR model `N_REPS` times with its estimates (different random
+seeds each time) and summarise the daily cases by the median and a 95% interval.
+
+```{r utah-reconstruct}
+sim <- sir_simulator(ndays = 60)
+
+reconstruct <- function(est) {
+  curves <- t(sapply(seq_len(N_REPS), function(i) {
+    sim$run(parameters = c(known, as.list(est[c("ptran", "crate")])), seed = i)
+  }))
+  list(
+    median = apply(curves, 2, median),
+    lower  = apply(curves, 2, quantile, probs = 0.025),
+    upper  = apply(curves, 2, quantile, probs = 0.975)
+  )
+}
+
+recon <- list(Pretrained = reconstruct(est_pretrained), New = reconstruct(est_new))
+```
+
+```{r utah-plot, fig.width=10, fig.height=4.5}
+day <- seq_along(observed)
+ylim <- range(c(observed, unlist(lapply(recon, function(r) c(r$lower, r$upper)))))
+
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+for (m in names(recon)) {
+  r <- recon[[m]]
+  plot(day, r$median, type = "n", ylim = ylim, xlab = "day", ylab = "daily cases",
+       main = paste(m, "model: observed vs. reconstructed"))
+  polygon(c(day, rev(day)), c(r$upper, rev(r$lower)),
+          col = adjustcolor("red", alpha.f = 0.3), border = NA)
+  lines(day, r$median, col = "red", lwd = 2)
+  lines(day, observed, col = "blue", lwd = 2)
+  points(day, observed, col = "blue", pch = 16, cex = 0.6)
+  legend("topright", bty = "n", lwd = 2, col = c("red", "blue"),
+         legend = c("median (95% interval)", "observed"))
+}
+par(op)
+```
+
+Coverage is the share of observed days inside the 95% interval (close to 95% is good). RMSE
+and MAE compare the median curve with the observed cases.
+
+```{r utah-metrics}
+fit_metrics <- do.call(rbind, lapply(names(recon), function(m) {
+  r <- recon[[m]]
+  data.frame(
+    model           = m,
+    coverage_pct    = mean(observed >= r$lower & observed <= r$upper) * 100,
+    RMSE            = sqrt(mean((r$median - observed)^2)),
+    MAE             = mean(abs(r$median - observed))
+  )
+}))
+knitr::kable(fit_metrics, digits = 2, row.names = FALSE,
+             caption = "Reconstruction of the Utah curve")
+```
+
+## 6. How to read the results
+
+- **Part A** answers "is the new model as accurate as the pretrained one?" Compare the MAE,
+  RMSE and R2 of the two models for each parameter.
+- **Part B** answers "does it give the same answer on real data?" Compare the two rows of
+  estimates, and whether the reconstructed curves fit the observed cases equally well.
+- If the new model is clearly worse, the likely causes are the smaller training bank
+  (`r format(N_SIMS, big.mark = ",")` vs. about 60,000 simulations) and the different
+  scaling of the daily cases (100,000 vs. 10,000).

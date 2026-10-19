@@ -1,0 +1,588 @@
+---
+title: "BiLSTM calibration of SIR and SEIR models: all results"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  results: "results"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+R <- params$results
+rd <- function(...) {
+  f <- file.path(R, ...)
+  if (file.exists(f)) read.csv(f, check.names = FALSE) else NULL
+}
+# Figures from the run folders (several at once; missing ones are skipped).
+fig <- function(...) {
+  f <- file.path(R, ...)
+  f <- f[file.exists(f)]
+  if (length(f)) knitr::include_graphics(normalizePath(f), rel_path = FALSE)
+}
+# HTML tables, so each caption stays with its own table.
+tab <- function(x, digits = 3, ...) {
+  knitr::kable(x, format = "html", digits = digits, row.names = FALSE,
+               table.attr = "class='table table-condensed' style='width:auto'", ...)
+}
+r0_row <- function(x, model = NULL) {
+  x <- x[x$parameter == "R0", ]
+  if (!is.null(model)) x <- x[x$model == model, ]
+  x
+}
+fmt <- function(x, d = 3) formatC(x, digits = d, format = "f")
+```
+
+This report collects the results of every run in `examples/results/` (each folder has its
+own detailed report). It reads the saved tables only, so it can be rebuilt at any time:
+
+```r
+rmarkdown::render("All_results.Rmd", output_dir = "results")
+```
+
+**How to read the numbers.** *R0 MAE* is the average absolute error of the R0 estimate on
+simulated epidemics with known parameters (lower is better). *Coverage* is the share of
+observed days inside a model's 95% band of simulated curves; the *interval score* adds the
+band width and a penalty for every observed day outside it (lower is better), so a band
+cannot score well just by being wide.
+
+# Summary
+
+```{r summary-numbers}
+sir_ref <- rd("reproduce_pretrained_sir_75k", "seed_variation.csv")
+v2_test <- rd("seir_bilstm_v2", "test_metrics.csv")
+rep_models <- c(`SEIR v4` = "seir_bilstm_v4", `SEIR v5` = "seir_bilstm_v5",
+                `SEIR v5 (128 hidden units)` = "seir_bilstm_v5_h128")
+rep_models <- rep_models[file.exists(file.path(R, rep_models, "test_R0_v2_vs_model.csv"))]
+rep_test <- lapply(rep_models, function(d) rd(d, "test_R0_v2_vs_model.csv"))
+best_rep <- names(rep_test)[which.min(vapply(rep_test, function(x) x$model_R0_MAE[1], 0))]
+meth <- rd("seir_v4_method_comparison", "summary.csv")
+acc  <- rd("seir_v4_method_comparison", "accuracy_simulated.csv")
+v5   <- rd("seir_bilstm_v5", "summary.csv")
+v4   <- rd("seir_bilstm_v4", "summary.csv")
+sm   <- rd("sir_method_comparison", "summary.csv")
+s2m  <- rd("seir_method_comparison_v2", "summary.csv")
+get  <- function(x, measure, col) x[[col]][x$measure == measure]
+mrow <- function(m, col) meth[[col]][meth$method == m]
+v5_sim  <- mrow("SEIR v5", "sim R0 MAE")
+nd0m <- rd("sir_no_day0_method_comparison", "summary.csv")
+f5   <- rd("seir_bilstm_v5", "real_data_fits.csv")
+f5   <- f5[f5$window != "", ]
+v2_real_cov <- mean(f5$coverage_pct[f5$band == "v2"])
+v5_real_cov <- mean(f5$coverage_pct[grepl("range", f5$band)])
+best_search <- meth$method[meth$method %in% c("ABC-MCMC", "ABC-SMC", "NelderMead", "DE")][
+  which.min(meth$`sim R0 MAE`[meth$method %in% c("ABC-MCMC", "ABC-SMC", "NelderMead", "DE")])]
+```
+
+All the work in one table:
+
+| Data | Model to use | Key result |
+|---|---|---|
+| SIR, 61 days | SIR BiLSTM (reproduced pretrained recipe, 60,000 curves) | R0 MAE `r fmt(sir_ref$R0_MAE[2])` vs `r fmt(sir_ref$R0_MAE[1])` for the original pretrained model; on the 100-curve comparison `r fmt(sm$R0_MAE[1])`, better than every search method (best: DE `r fmt(sm$R0_MAE[sm$method == "DE"])`), in `r fmt(sm$seconds_per_curve[1], 2)` s instead of minutes |
+| SEIR, every case counted (simulated) | SEIR v2 | R0 MAE `r fmt(s2m$R0_MAE[1])` vs DE `r fmt(s2m$R0_MAE[s2m$method == "DE"])`, Nelder-Mead `r fmt(s2m$R0_MAE[s2m$method == "Nelder-Mead"])`, ABC-SMC `r fmt(s2m$R0_MAE[s2m$method == "ABC-SMC"])` |
+| SIR, real data of any length (30-365 days, one wave) | SIR v6 | R0 MAE on reported-case windows from the beginning 0.21 (30 days), 0.12 (61 days), 0.06 (120+ days); on real data and the six states it fits as well as SEIR v6, with a lower R0 (no incubation period) |
+| SEIR, real data of any length (30-365 days, one wave) | SEIR v6 | reads any length and position; R0 MAE on reported-case windows falls from about 0.5 (30 days) to 0.06 (270-365 days); fits whole flu seasons and the waves of six US states |
+| **SEIR, real reported data** | **SEIR v5** | R0 MAE `r fmt(v5_sim)` on reported-case curves (best search method, `r best_search`: `r fmt(mrow(best_search, "sim R0 MAE"))`); true R0 inside its 95% range `r fmt(get(v5, "True R0 inside the 95% range (%)", "model_with_range"), 0)`% of the time; `r fmt(mrow("SEIR v5", "seconds per curve"), 2)` s per curve |
+
+Main points:
+
+1. **The BiLSTM is the most accurate method on simulated epidemics in almost every setting,
+   and thousands of times faster** than ABC-MCMC, ABC-SMC, Nelder-Mead and DE. The exception
+   is SIR without day 0, where Nelder-Mead and DE are slightly more accurate (R0 MAE
+   `r fmt(nd0m$R0_MAE[nd0m$method == "Nelder-Mead"])` and `r fmt(nd0m$R0_MAE[nd0m$method == "DE"])` vs
+   `r fmt(nd0m$R0_MAE[1])`) but take `r fmt(nd0m$seconds_per_curve[nd0m$method == "Nelder-Mead"], 0)` and
+   `r fmt(nd0m$seconds_per_curve[nd0m$method == "DE"], 0)` seconds per curve.
+2. **Real data are reported cases, not every infection.** The models trained on every case
+   (v2) break on reported-case curves (R0 MAE `r fmt(rep_test[[1]]$v2_R0_MAE[1], 2)`). Training on
+   reported cases with wider ranges (v4) and drawing new reporting noise every epoch (v5)
+   fixed this: on the 7 real windows (Utah COVID-19, Utah flu, Baltimore 1918) v5's 95% bands
+   hold `r fmt(v5_real_cov, 0)`% of the observed days on average, v2's `r fmt(v2_real_cov, 0)`%.
+3. **Recovering the curves:** on real data v5 and ABC-SMC are close (interval score
+   `r fmt(mrow("SEIR v5", "real interval score"), 0)` vs `r fmt(mrow("ABC-SMC", "real interval score"), 0)`, lower is better), ahead of
+   ABC-MCMC (`r fmt(mrow("ABC-MCMC", "real interval score"), 0)`), Nelder-Mead (`r fmt(mrow("NelderMead", "real interval score"), 0)`) and DE
+   (`r fmt(mrow("DE", "real interval score"), 0)`), but ABC-SMC needs `r fmt(mrow("ABC-SMC", "seconds per curve"), 0)` s per curve and ran out of
+   its simulation budget on `r acc$failed[acc$method == "ABC-SMC"]` of the 100 simulated curves.
+4. A bug in the package's Nelder-Mead (its first search step could be almost zero, so it
+   stopped at its starting point) was fixed on 2026-10-04 and all affected Nelder-Mead
+   results were re-run; earlier reports that showed Nelder-Mead failing on SEIR and
+   no-day-0 SIR were caused by it.
+
+# Noise-free simulated data, any window length (SEIR and SIR)
+
+Models trained and tested on noise-free simulated epidemics (every new infection counted),
+reading 30 to 365 days from the beginning, middle or end of an epidemic. Coverage: share of
+days on which the true count is inside the 95% band of 100 simulations started from the
+model's estimated state (`Clean_any_length.Rmd`; reports in `seir_clean/` and `sir_clean/`).
+
+```{r clean, results="asis"}
+for (m in c("seir", "sir")) {
+  s <- rd(paste0(m, "_clean"), "summary.csv")
+  if (is.null(s)) next
+  cat(tab(s, col.names = c("window length", "R0 MAE (beginning)", "R0 MAE (all positions)", "true R0 in 95% range (%)",
+                           "coverage %: new infections", "coverage %: currently infected"),
+          caption = paste(toupper(m), "on noise-free data")), sep = "\n")
+}
+```
+
+```{r clean-figs, out.width="100%"}
+fig("seir_clean", "figures", c("r0-plot-1.png", "coverage-by-day-plot-1.png", "coverage-by-day-plot-2.png"))
+fig("sir_clean", "figures", c("r0-plot-1.png", "coverage-by-day-plot-1.png", "coverage-by-day-plot-2.png"))
+```
+
+## On real data (30-180-day windows) vs the search methods
+
+The noise-free models on the real datasets, with ABC-MCMC, ABC-SMC, Nelder-Mead and DE
+estimating the same unknowns (R0 and the state on the window's first day)
+(`Clean_real_data.Rmd`; report in `clean_real_data/`). No true R0 here: coverage of the
+observed daily counts and the interval score (lower is better).
+
+```{r clean-real, results="asis", eval=file.exists(file.path(R, "clean_real_data", "summary.csv"))}
+cat(tab(rd("clean_real_data", "summary.csv"), digits = 2,
+        col.names = c("model", "method", "windows", "failed", "mean coverage %", "mean interval score",
+                      "lowest score in (windows)", "seconds per window")), sep = "\n")
+b <- rd("clean_real_data", "summary_by_length.csv")
+for (M in c("SEIR", "SIR")) {
+  w <- reshape(b[b$model == M, c("method", "length", "interval_score")], idvar = "method", timevar = "length", direction = "wide")
+  names(w) <- sub("interval_score.", "", names(w), fixed = TRUE)
+  cat(tab(w, digits = 0, caption = paste(M, ": mean interval score by window length (days)")), sep = "\n")
+}
+```
+
+# SIR models
+
+## Reproducing the original pretrained SIR BiLSTM
+
+Same settings as the pretrained model (incidence divided by 10,000; sigmoid/softplus
+outputs; learning rate 2.77e-4; 3 x 160 BiLSTM; dropout 0.5), trained on GPU. With 60,000
+training curves (75,000 simulations), R0 matches the pretrained model; the remaining
+difference is run-to-run variation (the pretrained model sits inside the spread of seeds).
+
+```{r sir-reproduce}
+s75 <- rd("reproduce_pretrained_sir_75k", "seed_variation.csv")
+s60 <- rd("reproduce_pretrained_sir", "seed_variation.csv")
+s60$model <- sub("New", "48,000 training curves", s60$model)
+s75$model <- sub("New", "60,000 training curves", s75$model)
+tab(rbind(s75[, c("model", "R0_MAE", "R0_R2", "utah_R0")],
+          s60[s60$model != "Pretrained", c("model", "R0_MAE", "R0_R2", "utah_R0")]),
+    col.names = c("model", "R0 MAE", "R0 R2", "Utah R0"))
+```
+
+```{r sir-reproduce-fig, out.width="85%"}
+fig("reproduce_pretrained_sir_75k", "figures", "test-scatter-1.png")
+```
+
+## Tuning, day 0, and a wider prior
+
+- **Tuning** (Optuna, 20-epoch trials) found faster settings, but they were unstable over
+  100 epochs (R0 MAE 0.055 to 0.117 depending on the seed).
+- **Day 0.** The SIR curves started with the number initially infected (a stock) followed
+  by new cases (a flow), which made the rebuilt Utah curve drop from 50 to about 10 on
+  day 1. Training without day 0 removed the drop, with the same accuracy.
+
+```{r sir-variants}
+sir_rows <- list(
+  list("Reference (60,000 curves, with day 0)", "reproduce_pretrained_sir_75k", "New"),
+  list("Without day 0", "sir_no_day0_75k", "No day 0"),
+  list("Without day 0, wider prior (R0 0.5-5)", "sir_no_day0_wide", "No day 0")
+)
+tab(do.call(rbind, lapply(sir_rows, function(r) {
+  tm <- rd(r[[2]], "test_metrics.csv"); u <- rd(r[[2]], "utah_fit_metrics.csv")
+  data.frame(model = r[[1]], R0_MAE = r0_row(tm)$MAE[nrow(r0_row(tm))], R0_R2 = r0_row(tm)$R2[nrow(r0_row(tm))],
+             utah_coverage_pct = u$coverage_pct[u$model == r[[3]]])
+})), col.names = c("model", "R0 MAE", "R0 R2", "Utah coverage %"))
+tuned <- rd("sir_bilstm_tuned", "seed_variation.csv")
+tab(tuned[, c("model", "R0_MAE", "R0_R2")], col.names = c("model", "R0 MAE", "R0 R2"),
+    caption = "Tuned SIR settings, three seeds")
+```
+
+With 5,000 people, no constant-parameter SIR curve can stay flat at about 30 cases a day
+for 60 days (that would infect 36% of the population), so every method reaches only about
+45-50% coverage on the Utah series.
+
+## SIR BiLSTM vs search-based methods
+
+100 simulated test curves; Utah COVID-19 (last 61 days). Nelder-Mead in the
+no-day-0 comparison was re-run after the 2026-10-04 bug fix (it used to stop at its start).
+
+```{r sir-methods}
+m1 <- rd("sir_method_comparison", "summary.csv")
+m2 <- rd("sir_no_day0_method_comparison", "summary.csv")
+cols <- c("method", "R0_MAE", "R0_R2", "seconds_per_curve", "utah_coverage_pct", "test_band_coverage_pct")
+nm <- c("method", "R0 MAE", "R0 R2", "seconds per curve", "Utah coverage %", "test band coverage %")
+tab(m1[, cols], col.names = nm, caption = "With day 0")
+tab(m2[, cols], col.names = nm, caption = "Without day 0")
+```
+
+## SIR curves of any length (30 to 365 days)
+
+Trained on random windows inside each epidemic's informative days (before its first week
+without cases). R0 MAE by window length and position:
+
+```{r sir-vl}
+vl <- rd("sir_variable_length_tuned", "R0_MAE_by_length_and_position.csv")
+vl <- vl[!grepl("before", vl$model), ]
+w  <- reshape(vl[, c("length", "position", "R0_abs_error")], idvar = "length", timevar = "position", direction = "wide")
+names(w) <- sub("R0_abs_error.", "", names(w), fixed = TRUE)
+tab(w[order(w$length), c("length", "beginning", "middle", "end")])
+tab(rd("sir_variable_length_tuned", "vs_61_day_model.csv"), caption = "First 61 days of the same test curves")
+```
+
+# SEIR models on complete counts
+
+Known: `n`, `recov`, `incub`; estimated: ptran, crate, R0 (and, from v2, the share
+initially exposed).
+
+```{r seir-models}
+seir_rows <- list(
+  list("SIR recipe, 75,000 simulations", "seir_bilstm_75k"),
+  list("Tuned settings (Optuna)", "seir_bilstm_tuned"),
+  list("SEIR v2: 300,000 simulations, share exposed estimated, 5-seed average", "seir_bilstm_v2")
+)
+tab(do.call(rbind, lapply(seir_rows, function(r) {
+  tm <- r0_row(rd(r[[2]], "test_metrics.csv")); u <- rd(r[[2]], "utah_fit_metrics.csv")
+  data.frame(model = r[[1]], R0_MAE = tm$MAE, R0_R2 = tm$R2, utah_coverage_pct = u$coverage_pct[u$model == "SEIR"])
+})), col.names = c("model", "R0 MAE (test)", "R0 R2", "Utah coverage %"))
+```
+
+```{r seir-v2-fig, out.width="85%"}
+fig("seir_bilstm_v2", "figures", "utah-plot-1.png")
+```
+
+## SEIR v2 vs search-based methods
+
+Same unknowns for every method (the search methods also estimate the share initially
+exposed); 100 simulated test curves. Nelder-Mead re-run after the 2026-10-04 bug fix.
+
+```{r seir-methods}
+tab(rd("seir_method_comparison_v2", "summary.csv")[, cols], col.names = nm)
+```
+
+## SEIR curves of any length (variable-length v3)
+
+v3 reads 30 to 365 days and also estimates the shares exposed, infectious and recovered on
+the first day of the window. R0 MAE by window length and position:
+
+```{r seir-vl}
+vl <- rd("seir_variable_length_v3", "R0_MAE_by_length_and_position.csv")
+vl <- vl[!grepl("before", vl$model), ]
+w  <- reshape(vl[, c("length", "position", "R0_abs_error")], idvar = "length", timevar = "position", direction = "wide")
+names(w) <- sub("R0_abs_error.", "", names(w), fixed = TRUE)
+tab(w[order(w$length), c("length", "beginning", "middle", "end")])
+tab(rd("seir_variable_length_v3", "vs_61_day_model.csv"), caption = "First 61 days of the same test curves")
+```
+
+## Real data with v2 and v3
+
+```{r seir-real}
+s <- rd("seir_v2_vs_v3_windows", "summary.csv")
+tab(s, digits = 2, caption = "Utah COVID-19 2024-25 61-day windows, and simulated windows from the beginning, middle and end of epidemics")
+tab(rd("seir_real_data_test", "summary.csv"), digits = 2,
+    caption = "Other real data, 61 days to a week after the peak: coverage % (first three columns) and R0")
+```
+
+v2 is better on Utah COVID-19 but poor on the flu data: its smallest starting share
+exposed (1%) is far too high for flu hospital admissions (0-17 a day).
+
+# SEIR on reported cases (v4 and v5)
+
+Real data count only some infections and have weekday swings and reporting spikes, which
+v2 never saw. v4 and v5 are trained on **reported cases**:
+
+| | v2 | v4 | v5 |
+|---|---|---|---|
+| Training curves | every case, smooth | reported share 5-100%, weekday swings, extra noise (ranges measured on the real data) | same as v4, but **new noise drawn every epoch** |
+| Ranges | share exposed 1-40%, incubation 3-21 days, R0 1-5 | share exposed 0.1-40%, incubation 1-21 days, R0 0.8-5 | same as v4 |
+| Network input | cases / 10,000 | log(1 + cases), scaled | same |
+| Outputs | ptran, crate, R0, share exposed | ptran, R0, share exposed, reported share, noise, weekday swing (crate computed from R0) | same |
+| R0 range | none | 95% range from a 100,000-curve calibration bank | same |
+
+v4 learned its fixed training noise by heart after about 25 epochs; v5 draws new reported
+cases from the true curves for every batch, so it never sees the same noise twice. A
+second v5 has a bigger network (128 hidden units instead of 64). All are averages of 5
+seeds and are tested on the same 1,000 simulated curves.
+
+## Simulated epidemics
+
+```{r rep-test}
+rt <- do.call(rbind, lapply(names(rep_models), function(m) {
+  x <- rep_test[[m]]
+  data.frame(model = m, reported_all = x$model_R0_MAE[1], reported_inside_v2_range = x$model_R0_MAE[2],
+             reported_outside_v2_range = x$model_R0_MAE[3], every_case_v2_test = x$model_R0_MAE[4])
+}))
+x <- rep_test[[1]]
+rt <- rbind(data.frame(model = "SEIR v2", reported_all = x$v2_R0_MAE[1], reported_inside_v2_range = x$v2_R0_MAE[2],
+                       reported_outside_v2_range = x$v2_R0_MAE[3], every_case_v2_test = x$v2_R0_MAE[4]), rt)
+tab(rt, col.names = c("model", "reported cases: all", "inside v2's ranges", "outside v2's ranges",
+                      "v2's test curves (every case)"), caption = "R0 MAE")
+
+outs <- lapply(names(rep_models), function(m) {
+  o <- rd(rep_models[[m]], "test_all_outputs.csv")
+  if (is.null(o)) o <- rd(rep_models[[m]], "test_all_outputs_v4.csv")
+  setNames(o$R2, o$output)
+})
+tab(data.frame(output = names(outs[[1]]), do.call(cbind, lapply(outs, unname)), check.names = FALSE) |>
+      setNames(c("output", names(rep_models))),
+    caption = "R2 of every output on the reported-case test curves (log scale for the share exposed, reported share and noise)")
+
+rr <- do.call(rbind, lapply(names(rep_models), function(m) {
+  x <- rd(rep_models[[m]], "R0_range_check.csv")[1, ]
+  data.frame(model = m, in_95 = x$in_95_range_pct, in_50 = x$in_50_range_pct, width = x$mean_width_95)
+}))
+tab(rr, digits = 2, col.names = c("model", "true R0 in 95% range (%)", "true R0 in 50% range (%)", "mean 95% width"))
+```
+
+```{r rep-test-fig, out.width="95%"}
+fig(rep_models[[best_rep]], "figures", "test-scatter-1.png")
+```
+
+## Real data
+
+For each window: v2's band (every case counted), and each reported-case model's band with
+its R0 range and reporting noise.
+
+```{r rep-real}
+fits <- lapply(names(rep_models), function(m) {
+  f <- rd(rep_models[[m]], "real_data_fits.csv")
+  f <- f[f$window != "" & grepl("range", f$band), ]
+  data.frame(window = paste(f$dataset, f$window, sep = ", "), model = m, R0 = f[[grep("^R0_(model|v4)$", names(f), value = TRUE)]],
+             coverage = f$coverage_pct, score = f$interval_score)
+})
+v2f <- rd(rep_models[[1]], "real_data_fits.csv")
+v2f <- v2f[v2f$window != "" & v2f$band == "v2", ]
+v2f <- data.frame(window = paste(v2f$dataset, v2f$window, sep = ", "), model = "SEIR v2", R0 = v2f$R0_v2,
+                  coverage = v2f$coverage_pct, score = v2f$interval_score)
+allf <- rbind(v2f, do.call(rbind, fits))
+wide <- function(col) {
+  w <- reshape(allf[, c("window", "model", col)], idvar = "window", timevar = "model", direction = "wide")
+  names(w) <- sub(paste0(col, "."), "", names(w), fixed = TRUE)
+  w
+}
+tab(wide("coverage"), digits = 1, caption = "Coverage % of the 95% band")
+tab(wide("score"), digits = 1, caption = "Interval score (lower is better)")
+tab(wide("R0"), digits = 2, caption = "R0 estimates")
+us <- lapply(names(rep_models), function(m) {
+  u <- rd(rep_models[[m]], "utah_windows_summary.csv")
+  data.frame(model = m, band = u$band, coverage = u$mean_fit_coverage_pct, score = u$mean_fit_interval_score)
+})
+us <- do.call(rbind, us)
+us <- rbind(us[us$band == "v2", ][1, ], us[us$band != "v2", ])
+us$model[us$band == "v2"] <- "SEIR v2"
+tab(us[, c("model", "band", "coverage", "score")], digits = 1,
+    caption = "Utah COVID-19 2024-25: mean over 24 windows of 61 days (one every 14 days)")
+```
+
+```{r rep-real-figs, out.width="100%"}
+fig(rep_models[[best_rep]], "figures", sprintf("real-plots-%d.png", 4:7))
+```
+
+# Reported cases: BiLSTM vs ABC-MCMC, ABC-SMC, Nelder-Mead and DE
+
+Every method gets the same known values (`n`, `recov`, `incub`) and the same unknowns and
+ranges (R0, share exposed, reported share, noise, weekday swing); the search methods use
+the package defaults and search the log-scale parameters on the log scale. 100 simulated
+test curves of reported cases, and the 7 real windows.
+
+```{r methods-summary}
+tab(meth, caption = "Summary (sim = simulated test curves; real = mean over the 7 real windows)")
+tab(rd("seir_v4_method_comparison", "accuracy_simulated.csv"),
+    caption = "Accuracy on the simulated test curves (errors on the log scale for the share exposed and the reported share)")
+tab(rd("seir_v4_method_comparison", "curve_recovery_simulated.csv"), digits = 2,
+    caption = "Recovering the simulated curves: 95% bands from each method's result")
+tab(rd("seir_v4_method_comparison", "time_per_curve.csv"),
+    caption = "Time per curve (BiLSTM: 5 seeds plus the R0 range; search methods: one CPU core)")
+tab(rd("seir_v4_method_comparison", "real_data_summary.csv"), digits = 2,
+    caption = "Real data: mean over the 7 windows; last column: windows where the method had the lowest interval score")
+rbm <- rd("seir_v4_method_comparison", "real_data_by_method.csv")
+w <- reshape(rbm[, c("window", "method", "interval_score")], idvar = "window", timevar = "method", direction = "wide")
+names(w) <- sub("interval_score.", "", names(w), fixed = TRUE)
+tab(w, digits = 1, caption = "Interval score in each real window (lower is better)")
+```
+
+```{r methods-figs, out.width="100%"}
+fig("seir_v4_method_comparison", "figures",
+    c("r0-scatter-1.png", "test-band-boxplot-1.png", sprintf("real-plots-%d.png", 1:7)))
+```
+
+# SEIR v6: any window length and reported cases
+
+v6 combines v3 and v5 in one model: it reads **30 to 365 days from the beginning, middle
+or end** of an epidemic (like v3) and is trained on **reported cases with new noise every
+time** (like v5), with v5's wider ranges. It also estimates the reported share, the noise,
+the weekday swing and the shares exposed, infectious and recovered at the window start
+(on the log scale), and gives an R0 range. Training windows: length drawn between 30 and
+365 days, start drawn inside the epidemic's informative days (before its first week
+without reported cases).
+
+```{r v6, results="asis", eval=file.exists(file.path(R, "seir_v6", "summary.csv"))}
+tab(rd("seir_v6", "summary.csv"), caption = "Summary")
+r6 <- rd("seir_v6", "R0_MAE_by_length_and_position.csv")
+for (m in unique(r6$model)) {
+  w <- reshape(r6[r6$model == m, c("length", "position", "R0_abs_error")], idvar = "length",
+               timevar = "position", direction = "wide")
+  names(w) <- sub("R0_abs_error.", "", names(w), fixed = TRUE)
+  cat(tab(w[order(w$length), intersect(c("length", "beginning", "middle", "end"), names(w))],
+          caption = paste(m, ": R0 MAE by window length and position (reported cases)")), sep = "\n")
+}
+tab(rd("seir_v6", "R0_MAE_compared.csv"), caption = "R0 MAE over all windows each model can read, and on the same 61-day windows from the beginning")
+tab(rd("seir_v6", "all_outputs.csv"), caption = "v6: R2 of every output over all test windows")
+tab(rd("seir_v6", "R0_range_check.csv"), digits = 2, caption = "v6: true R0 inside the 95% range, by window length")
+rr <- rd("seir_v6", "real_data.csv")
+tab(rr[, c("window", "days", "R0_v6", "R0_v6_low", "R0_v6_high", "reported_share_v6", "coverage_v6",
+           "interval_score_v6", "R0_v5", "coverage_v5", "interval_score_v5")], digits = 2,
+    col.names = c("window", "days", "R0 v6", "low", "high", "reported share v6", "coverage v6 %", "score v6",
+                  "R0 v5", "coverage v5 %", "score v5"), caption = "Real data")
+```
+
+## Six US states
+
+Daily COVID-19 cases from the Johns Hopkins University repository (January 2020 to March
+2023), scaled to cases per 10,000 people (the model population is a 10,000-person slice of
+the state). Three waves per state: v5 and v6 read the 61 days ending a week after the
+peak, and v6 also reads the whole wave.
+
+```{r v6-states, results="asis", eval=file.exists(file.path(R, "seir_v6", "states.csv"))}
+tab(rd("seir_v6", "states_summary.csv"), digits = 2,
+    col.names = c("fit", "mean coverage %", "mean interval score", "mean width of the R0 range"),
+    caption = "Mean over 6 states x 3 waves")
+s6 <- rd("seir_v6", "states.csv")
+for (col in c("coverage", "interval_score", "R0")) {
+  w <- reshape(s6[, c("state", "wave", "fit", col)], idvar = c("state", "wave"), timevar = "fit", direction = "wide")
+  names(w) <- sub(paste0(col, "."), "", names(w), fixed = TRUE)
+  cat(tab(w, digits = if (col == "R0") 2 else 1,
+          caption = c(coverage = "Coverage % of the 95% band", interval_score = "Interval score (lower is better)",
+                      R0 = "R0 estimates")[[col]]), sep = "\n")
+}
+```
+
+```{r v6-figs, out.width="100%", eval=file.exists(file.path(R, "seir_v6", "summary.csv"))}
+fig("seir_v6", "figures", c("grid-plot-1.png", sprintf("real-plots-%d.png", 1:17), sprintf("states-plots-%d.png", 1:6)))
+```
+
+# SIR v6: any window length and reported cases
+
+The SIR version of SEIR v6, built the same way (same training steps, network settings,
+R0 range, real data and states). Known values: `n` and `recov`. The two earlier SIR models
+were trained on every case, not on reported cases.
+
+```{r sir-v6, results="asis", eval=file.exists(file.path(R, "sir_v6", "summary.csv"))}
+tab(rd("sir_v6", "summary.csv"), caption = "Summary")
+r7 <- rd("sir_v6", "R0_MAE_by_length_and_position.csv")
+for (m in unique(r7$model)) {
+  w <- reshape(r7[r7$model == m, c("length", "position", "R0_abs_error")], idvar = "length",
+               timevar = "position", direction = "wide")
+  names(w) <- sub("R0_abs_error.", "", names(w), fixed = TRUE)
+  cat(tab(w[order(w$length), intersect(c("length", "beginning", "middle", "end"), names(w))],
+          caption = paste(m, ": R0 MAE by window length and position (reported cases)")), sep = "\n")
+}
+tab(rd("sir_v6", "R0_MAE_compared.csv"), caption = "R0 MAE over all windows each model can read, and on the same 61-day windows from the beginning")
+tab(rd("sir_v6", "all_outputs.csv"), caption = "SIR v6: every output over all test windows, with baselines for ptran and crate")
+tab(rd("sir_v6", "R0_range_check.csv"), digits = 2, caption = "SIR v6: true R0 inside the 95% range, by window length")
+rs <- rd("sir_v6", "real_data.csv")
+tab(rs, digits = 2, col.names = c("window", "days", "R0 SIR v6", "low", "high", "reported share", "coverage %", "score",
+                                  "R0 SEIR v6", "coverage % SEIR v6", "score SEIR v6"),
+    caption = "Real data: SIR v6 next to SEIR v6")
+tab(rd("sir_v6", "states_summary.csv"), digits = 2,
+    col.names = c("fit", "coverage % SIR v6", "score SIR v6", "coverage % SEIR v6", "score SEIR v6"),
+    caption = "Six states: mean over 18 waves")
+ss <- rd("sir_v6", "states.csv")
+tab(ss[ss$fit == "v6, whole wave", c("state", "wave", "R0_sir", "coverage_sir", "interval_score_sir", "R0_seir",
+                                     "coverage_seir", "interval_score_seir")], digits = 2,
+    col.names = c("state", "wave", "R0 SIR v6", "coverage %", "score", "R0 SEIR v6", "coverage %", "score"),
+    caption = "Six states, whole waves")
+```
+
+```{r sir-v6-figs, out.width="100%", eval=file.exists(file.path(R, "sir_v6", "summary.csv"))}
+fig("sir_v6", "figures", c("grid-plot-1.png", sprintf("states-plots-%d.png", 1:6)))
+```
+
+# ptran and crate
+
+Only R0 = ptran x crate / recov shapes an epidemic curve: 10 contacts a day with a 2% chance
+of passing the infection gives the same curve as 5 contacts with 4%. So ptran and crate
+cannot be recovered separately. The baseline knows the true R0 and makes the best guess
+for the split (ptran = R0 x recov x the average of 1/crate over its range; crate = the
+middle of its range). A model is only better than the baseline if the curve tells it
+something about the split.
+
+```{r ptran-crate}
+r2 <- function(p, y) 1 - sum((p - y)^2) / sum((y - mean(y))^2)
+pc_row <- function(model, ep, ec, tp, tc, tR0, recov, lo, hi) data.frame(
+  model = model, ptran_MAE = mean(abs(ep - tp)), ptran_R2 = r2(ep, tp),
+  baseline_ptran_R2 = r2(tR0 * recov * log(hi / lo) / (hi - lo), tp),
+  crate_MAE = mean(abs(ec - tc)), crate_R2 = r2(ec, tc), baseline_crate_MAE = mean(abs((lo + hi) / 2 - tc)))
+a <- rd("reproduce_pretrained_sir_75k", "test_predictions.csv")
+d <- rd("sir_no_day0_75k", "test_predictions.csv")
+v <- rd("seir_bilstm_v2", "test_predictions.csv")
+pc <- rbind(
+  pc_row("SIR, original pretrained", a$pretrained_ptran, a$pretrained_crate, a$true_ptran, a$true_crate, a$true_R0, a$recov, 1, 5),
+  pc_row("SIR, reproduced (reference)", a$new_ptran, a$new_crate, a$true_ptran, a$true_crate, a$true_R0, a$recov, 1, 5),
+  pc_row("SIR without day 0", d$estimated_ptran, d$estimated_crate, d$true_ptran, d$true_crate, d$true_R0, d$recov, 1, 5),
+  pc_row("SEIR v2", v$estimated_ptran, v$estimated_crate, v$true_ptran, v$true_crate, v$true_R0, v$recov, 5, 15)
+)
+tab(pc, caption = "Test curves (every case counted). SIR v6 on reported cases: see its table above.")
+```
+
+# Conclusions
+
+```{r conclusion-numbers}
+u5 <- rd("seir_bilstm_v5", "utah_windows_summary.csv")
+u4 <- rd("seir_bilstm_v4", "utah_windows_summary.csv")
+```
+
+- **SIR.** The pretrained SIR BiLSTM is reproduced (same settings, 60,000 training curves).
+  Dropping day 0 from the SIR curves removes the artificial drop on day 1 at no cost in
+  accuracy. For the flat Utah series every method is limited by the model itself (a
+  constant-parameter SIR in 5,000 people cannot stay flat for 60 days).
+- **SEIR, every case counted.** SEIR v2 (300,000 simulations, tuned settings, starting share
+  estimated, 5 seeds) is the most accurate model on simulated curves and beats all search
+  methods.
+- **SEIR on real data.** Real curves are reported cases. v5 (trained on reported cases, new
+  noise each epoch) is the model to use: compared with v4 it lowers the R0 error
+  (`r fmt(get(v4, "R0 MAE, new test bank (reported cases)", "model"))` to
+  `r fmt(get(v5, "R0 MAE, new test bank (reported cases)", "model"))` on reported-case curves) and fits the 24 Utah COVID-19 windows
+  much better (coverage `r fmt(u4$mean_fit_coverage_pct[3], 0)`% to `r fmt(u5$mean_fit_coverage_pct[3], 0)`%, interval score
+  `r fmt(u4$mean_fit_interval_score[3], 0)` to `r fmt(u5$mean_fit_interval_score[3], 0)`); v2's are `r fmt(u5$mean_fit_coverage_pct[1], 0)`% and `r fmt(u5$mean_fit_interval_score[1], 0)`.
+  A bigger network (128 hidden units) did not help.
+- **What can and cannot be recovered.** R0, the share initially exposed and the reported
+  share are recovered well (R2 about 0.93, 0.95 and 0.81). ptran and crate separately
+  cannot be: only their product (R0 x recov) shapes the curve. The noise level and the
+  weekday swing are only partly recoverable (R2 about 0.6 and 0.5).
+- **Any window length (v6).** One model now reads 30 to 365 days from any part of an
+  epidemic of reported cases. Longer windows give better R0 (R0 MAE about 0.5 at 30 days,
+  0.27 at 61 days, 0.06 at 270-365 days); on 61 days from the beginning v5 is still a little
+  better (0.23 vs 0.27). It fits single waves well, whole flu seasons and the waves of six
+  US states (mean coverage about 95%), but not a whole year with several waves (Utah's last
+  180-365 days): one constant R0 cannot make several waves.
+- **SIR v6.** The SIR version reads any length too and is more accurate on simulated SIR
+  epidemics than SEIR v6 is on SEIR ones (R0 MAE 0.12 vs 0.27 on 61 days from the
+  beginning; SIR has no incubation period to estimate). On real data and the six states it
+  fits as well as SEIR v6, but gives a lower R0 (about 1.2-1.8 vs 1.2-2.6): without an
+  incubation period the same growth needs a smaller R0. The curves cannot tell which
+  structure is right, so the R0 value depends on that choice.
+- **ptran and crate.** Only their product (R0) can be learned from a curve; crate is not
+  recovered by any model or method (R2 at or below 0), and ptran is no better than knowing
+  R0 (SIR curves add a little, about 0.60 vs 0.49).
+- **Where the search methods still help.** On the rising Utah COVID-19 waves ABC-SMC and
+  ABC-MCMC fit the curve better than v5, with a higher R0 but very wide R0 ranges. A
+  natural next step is to combine the two: start ABC-SMC inside v5's R0 range, which
+  should keep most of the speed and add the curve-matching of ABC.
+
+
+# Where everything is
+
+```{r folders}
+tab(data.frame(
+  folder = c("reproduce_pretrained_sir_75k", "sir_no_day0_75k, sir_no_day0_wide", "sir_method_comparison, sir_no_day0_method_comparison",
+             "sir_variable_length_tuned", "seir_bilstm_v2", "seir_method_comparison_v2", "seir_variable_length_v3",
+             "seir_v2_vs_v3_windows, seir_real_data_test", "seir_bilstm_v4, seir_bilstm_v5, seir_bilstm_v5_h128",
+             "seir_v4_method_comparison", "seir_v6", "sir_v6", "seir_clean, sir_clean", "clean_real_data"),
+  report = c("Reproduce_pretrained_SIR.Rmd", "SIR_no_day0_BiLSTM.Rmd", "Compare_SIR_methods.Rmd",
+             "SIR_variable_length_BiLSTM.Rmd", "SEIR_BiLSTM.Rmd", "Compare_SEIR_methods.Rmd",
+             "SEIR_variable_length_BiLSTM.Rmd", "Compare_SEIR_v2_v3_windows.Rmd, Test_SEIR_real_data.Rmd",
+             "SEIR_v4_BiLSTM.Rmd", "Compare_SEIR_v4_methods.Rmd", "SEIR_v6_BiLSTM.Rmd", "SIR_v6_BiLSTM.Rmd", "Clean_any_length.Rmd", "Clean_real_data.Rmd")
+))
+```

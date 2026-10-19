@@ -1,0 +1,637 @@
+---
+title: "SEIR BiLSTM for curves of any length (30 to 365 days)"
+author: "Sima Najafzadehkhoei"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  n_sims: 100000
+  n_days: 365
+  window_min: 30
+  window_max: 365
+  epochs: 100
+  n_test: 1000
+  n_grid: 300
+  n_reps: 300
+  out_dir: "results/seir_variable_length"
+  retrain: false
+  seeds: 122
+  ensemble: false
+  stop_after: ""
+  sim_cores: 1
+  device: "auto"
+  condaenv: "epiworldRcalibrate"
+  hyperparameters: "results/seir_tuning/best_params.json"
+  learning_rate: 0
+  grad_clip: 0
+  stop_zeros: 0
+  previous_models: ""
+  previous_label: "Whole-curve windows (before)"
+  estimate_state: false
+  fixed_label: "61-day SEIR model"
+  fixed_model: "results/seir_bilstm_tuned/model_seed_122"
+  utah_incub: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+```
+
+# What this document does
+
+The SEIR BiLSTM in `SEIR_BiLSTM.Rmd` only reads curves of exactly 61 days, starting
+at the beginning of the epidemic. This document trains one that reads **any length
+from `r params$window_min` to `r params$window_max` days, starting anywhere**:
+
+- the training epidemics are simulated for `r params$n_days` days;
+- in every training batch each curve is cut to a random window: the length is drawn
+  uniformly between `r params$window_min` and `r params$window_max` days (one length
+  per batch), and the start uniformly over the positions where the window fits, so
+  windows come from the beginning, middle and end of the epidemics;
+- the network estimates `ptran`, `crate` and `R0`, as before.
+- with `stop_zeros` above 0, each curve's **informative days** end at its first run
+  of `stop_zeros` days without cases (7 = a week): windows are only taken from the
+  informative days, the rest is ignored, and the trained model cuts new curves the
+  same way. Beginning, middle and end then refer to the informative days.
+- `previous_models` (model folders separated by commas) is an earlier model,
+  evaluated on exactly the same windows for comparison.
+- with `estimate_state`, the network also estimates the state of the epidemic at
+  the start of the window: the shares of the population exposed, infectious and
+  recovered. A rebuilt curve then starts from that state, wherever the window is.
+- `fixed_model` (folders separated by commas are averaged) is the 61-day model it is
+  compared with, named `fixed_label`.
+
+It is then checked on new simulated epidemics, for many window lengths at the
+beginning, middle and end, next to the 61-day model, and on the Utah COVID-19 data
+using the last 30 to 365 days.
+
+Everything is saved under `params$out_dir`, and re-knitting reuses the saved bank and
+models. `seeds`, `ensemble`, `stop_after` and `sim_cores` work as in `SEIR_BiLSTM.Rmd`.
+
+```r
+rmarkdown::render("SEIR_variable_length_BiLSTM.Rmd", output_dir = "results/seir_variable_length")
+```
+
+# Setup
+
+```{r packages}
+pkgload::load_all("..", quiet = TRUE)
+if (nzchar(params$condaenv)) {
+  reticulate::use_condaenv(params$condaenv, required = TRUE)
+}
+reticulate::py_run_string(paste(
+  "import warnings",
+  "from sklearn.exceptions import InconsistentVersionWarning",
+  "warnings.filterwarnings('ignore', category=InconsistentVersionWarning)",
+  sep = "\n"
+))
+```
+
+```{r settings}
+N_SIMS     <- params$n_sims
+N_DAYS     <- params$n_days
+WINDOW_MIN <- params$window_min
+WINDOW_MAX <- params$window_max
+EPOCHS     <- params$epochs
+N_TEST     <- params$n_test
+N_GRID     <- params$n_grid   # test curves used for the length x position grid
+N_REPS     <- params$n_reps
+RETRAIN    <- isTRUE(params$retrain)
+OUT_DIR    <- params$out_dir
+SIM_CORES  <- as.integer(params$sim_cores)
+SEEDS      <- as.integer(params$seeds)
+ENSEMBLE   <- isTRUE(params$ensemble) && length(SEEDS) > 1
+
+BANK_SEED <- 122
+TEST_SEED <- 2025
+
+KNOWN   <- c("n", "recov", "incub")
+TARGETS <- c("ptran", "crate", "R0")
+
+# Settings of the tuned SEIR model, with the SIR reference recipe's scaling and
+# output layer.
+hp <- jsonlite::read_json(params$hyperparameters)
+LEARNING_RATE     <- hp$learning_rate
+BATCH_SIZE        <- as.integer(hp$batch_size)
+HIDDEN_SIZE       <- as.integer(hp$hidden_size)
+NUM_LAYERS        <- as.integer(hp$num_layers)
+DROPOUT           <- hp$dropout
+PHYSICS_WEIGHT    <- hp$physics_weight
+# Optional overrides for long-sequence training (0 = keep the tuned value / no clipping).
+if (params$learning_rate > 0) LEARNING_RATE <- params$learning_rate
+GRAD_CLIP <- if (params$grad_clip > 0) params$grad_clip else NULL
+STOP_ZEROS <- params$stop_zeros   # 0 = use the whole curve
+ESTIMATE_STATE <- isTRUE(params$estimate_state)
+STATE_NAMES    <- c("exposed_share", "infected_share", "recovered_share")
+INCIDENCE_MAX     <- 10000
+OUTPUT_ACTIVATION <- c("sigmoid", "softplus", "softplus")
+
+# Window lengths and positions used to test the model.
+GRID_LENGTHS <- c(30, 61, 90, 120, 180, 270, 365)
+POSITIONS    <- c("beginning", "middle", "end")
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = file.path(normalizePath(OUT_DIR), "figures", ""))
+
+settings <- data.frame(
+  setting = c("training simulations", "days simulated", "window lengths", "epochs",
+              "test curves", "learning rate", "batch size", "hidden units", "BiLSTM layers",
+              "dropout", "physics weight", "gradient clipping", "informative days end after",
+              "daily cases divided by", "network seeds",
+              "output folder"),
+  value = c(N_SIMS, N_DAYS, paste(WINDOW_MIN, "to", WINDOW_MAX), EPOCHS, N_TEST,
+            signif(LEARNING_RATE, 3), BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, round(DROPOUT, 3),
+            signif(PHYSICS_WEIGHT, 3), if (is.null(GRAD_CLIP)) "none" else GRAD_CLIP,
+            if (STOP_ZEROS > 0) paste(STOP_ZEROS, "days without cases") else "(whole curve)", INCIDENCE_MAX,
+            paste(SEEDS, collapse = ", "),
+            normalizePath(OUT_DIR))
+)
+write.csv(settings, file.path(OUT_DIR, "settings.csv"), row.names = FALSE)
+knitr::kable(settings)
+```
+
+| | 61-day SEIR model | This document |
+|---|---|---|
+| Simulated days | 61 | `r N_DAYS` |
+| What the network reads | days 1 to 61 | any window of `r WINDOW_MIN` to `r WINDOW_MAX` days, anywhere in the epidemic |
+| Training windows | the whole curve | new random windows every epoch: length and start uniform |
+| Known inputs, estimated parameters, parameter ranges | `n`, `recov`, `incub`; `ptran`, `crate`, `R0`; `seir_simulator()` defaults | same |
+| Network settings | tuned (hyperparameter search) | same |
+
+The starting prevalence is not estimated: a window from the middle of an epidemic
+does not start at its beginning.
+
+# Step 1: simulate the training bank
+
+```{r training-bank}
+bank_dir   <- file.path(OUT_DIR, "training_bank")
+theta_file <- file.path(bank_dir, "seir_theta.csv")
+obs_file   <- file.path(bank_dir, "seir_observations.csv")
+state_files_of <- function(dir) setNames(file.path(dir, paste0("seir_", STATE_NAMES, ".csv")), STATE_NAMES)
+
+# The same epidemics as generate_seir_training_data(); with estimate_state, also
+# the shares exposed, infectious and recovered at the start of each day.
+simulate_bank <- function(n_sims, seed) {
+  if (!ESTIMATE_STATE) return(list(bank = generate_seir_training_data(n_sims = n_sims, ndays = N_DAYS, seed = seed)))
+  base <- seir_simulator(ndays = N_DAYS)
+  sim  <- new_simulator(
+    sample_parameters = base$sample_parameters,
+    run = function(parameters, seed) {
+      m <- epiworldR::ModelSEIRCONN(
+        name = "sim", n = parameters$n, prevalence = parameters$preval,
+        contact_rate = parameters$crate, incubation_days = parameters$incub,
+        transmission_rate = parameters$ptran, recovery_rate = parameters$recov
+      )
+      epiworldR::verbose_off(m)
+      epiworldR::run(m, ndays = N_DAYS + 1L, seed = seed)
+      h <- epiworldR::get_hist_total(m)
+      h <- h[order(h$date), ]
+      at_start <- function(state) h$counts[h$state == state][seq_len(N_DAYS)] / parameters$n
+      c(get_incidence(m, N_DAYS), at_start("Exposed"), at_start("Infected"), at_start("Recovered"))
+    },
+    type = "SEIR"
+  )
+  out <- simulate_training_data(sim, n_sims = n_sims, seed = seed)
+  cols <- function(k) out$observations[, k * N_DAYS + seq_len(N_DAYS), drop = FALSE]
+  list(
+    bank   = new_training_data(out$theta, cols(0), type = "SEIR", source = "epiworldR ModelSEIRCONN"),
+    states = setNames(lapply(1:3, cols), STATE_NAMES)
+  )
+}
+
+# data.table::fwrite is much faster than write.csv for large banks.
+write_matrix <- function(x, file) {
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    data.table::fwrite(as.data.frame(round(x, 5)), file)
+  } else {
+    write.csv(round(x, 5), file, row.names = FALSE)
+  }
+}
+save_bank <- function(x, dir) {
+  save_training_data(x$bank, name = "seir", output_dir = dir)
+  for (nm in names(x$states)) write_matrix(x$states[[nm]], state_files_of(dir)[[nm]])
+}
+
+have_bank <- file.exists(theta_file) && file.exists(obs_file) &&
+  nrow(read.csv(theta_file)) == N_SIMS &&
+  (!ESTIMATE_STATE || all(file.exists(state_files_of(bank_dir))))
+
+if (have_bank) {
+  train_bank <- read_training_data(theta_file, obs_file, type = "SEIR")
+} else {
+  sim_time <- system.time({
+    sizes  <- diff(round(seq(0, N_SIMS, length.out = max(SIM_CORES, 1) + 1)))
+    chunks <- parallel::mclapply(seq_along(sizes), function(k) {
+      simulate_bank(sizes[k], BANK_SEED + k - 1)
+    }, mc.cores = max(SIM_CORES, 1))
+    failed <- vapply(chunks, inherits, logical(1), what = "try-error")
+    if (any(failed)) stop("Simulation chunk(s) failed: ", paste(which(failed), collapse = ", "))
+    whole <- list(
+      bank = new_training_data(
+        parameters   = do.call(rbind, lapply(chunks, function(x) x$bank$theta)),
+        observations = do.call(rbind, lapply(chunks, function(x) x$bank$observations)),
+        type = "SEIR", source = "epiworldR ModelSEIRCONN"
+      ),
+      states = if (ESTIMATE_STATE) setNames(lapply(STATE_NAMES, function(nm) {
+        do.call(rbind, lapply(chunks, function(x) x$states[[nm]]))
+      }), STATE_NAMES)
+    )
+    rm(chunks)
+  })
+  dir.create(bank_dir, recursive = TRUE, showWarnings = FALSE)
+  save_bank(whole, bank_dir)
+  train_bank <- whole$bank
+  rm(whole)
+  writeLines(as.character(round(sim_time[["elapsed"]])), file.path(bank_dir, "simulation_seconds.txt"))
+}
+train_bank
+```
+
+How long the simulated epidemics last matters for windows taken late: a window that
+starts after the epidemic is over shows no cases.
+
+```{r epidemic-length}
+# Days before the first run of k days without cases (the whole curve if none).
+informative_days <- function(curve, k) {
+  if (k <= 0) return(length(curve))
+  r   <- rle(as.numeric(curve) == 0)
+  hit <- which(r$values & r$lengths >= k)[1]
+  if (is.na(hit)) length(curve) else sum(r$lengths[seq_len(hit)]) - r$lengths[hit]
+}
+last_case <- apply(train_bank$observations, 1, function(r) if (any(r > 0)) max(which(r > 0)) else 0)
+cat("Last day with a case:\n"); print(summary(last_case))
+if (STOP_ZEROS > 0) {
+  active_train <- apply(train_bank$observations, 1, informative_days, k = STOP_ZEROS)
+  cat("\nInformative days (before the first", STOP_ZEROS, "days without cases):\n")
+  print(summary(active_train))
+  cat("Share shorter than", WINDOW_MIN, "days (not used in training):",
+      round(mean(active_train < WINDOW_MIN), 3), "\n")
+}
+```
+
+```{r stop-after-bank, include=FALSE}
+if (identical(params$stop_after, "bank")) knitr::knit_exit()
+```
+
+# Step 2: train with random windows
+
+```{r train}
+model_dirs <- file.path(OUT_DIR, paste0("model_seed_", SEEDS))
+
+model_matches <- function(dir, seed) {
+  cfg_file <- file.path(dir, "model_config.json")
+  if (!file.exists(file.path(dir, "model.pt")) || !file.exists(cfg_file)) return(FALSE)
+  cfg <- jsonlite::read_json(cfg_file)
+  cfg$epochs == EPOCHS && cfg$seed == seed && isTRUE(cfg$variable_length) &&
+    cfg$window_min == WINDOW_MIN && cfg$window_max == WINDOW_MAX &&
+    cfg$hidden_size == HIDDEN_SIZE && cfg$batch_size == BATCH_SIZE &&
+    isTRUE(all.equal(cfg$learning_rate, LEARNING_RATE)) &&
+    identical(cfg$grad_clip, GRAD_CLIP) &&
+    identical(unlist(cfg$state_targets), if (ESTIMATE_STATE) STATE_NAMES else NULL) &&
+    identical(is.null(cfg$window_stop_zeros), STOP_ZEROS == 0) &&
+    (STOP_ZEROS == 0 || cfg$window_stop_zeros == STOP_ZEROS)
+}
+
+for (i in seq_along(SEEDS)) {
+  if (RETRAIN || !have_bank || !model_matches(model_dirs[i], SEEDS[i])) {
+    train_time <- system.time(train_bilstm_calibrator(
+      name = "seir", known_names = KNOWN, target_names = TARGETS, type = "SEIR",
+      parameter_file = theta_file, observation_file = obs_file, output_dir = model_dirs[i],
+      epochs = EPOCHS, batch_size = BATCH_SIZE, learning_rate = LEARNING_RATE,
+      seed = SEEDS[i], hidden_size = HIDDEN_SIZE, num_layers = NUM_LAYERS, dropout = DROPOUT,
+      physics_weight = PHYSICS_WEIGHT, incidence_max = INCIDENCE_MAX,
+      output_activation = c(OUTPUT_ACTIVATION, if (ESTIMATE_STATE) rep("sigmoid", length(STATE_NAMES))),
+      state_files = if (ESTIMATE_STATE) state_files_of(bank_dir), device = params$device,
+      window_min = WINDOW_MIN, window_max = WINDOW_MAX, grad_clip = GRAD_CLIP,
+      window_stop_zeros = if (STOP_ZEROS > 0) STOP_ZEROS else NULL
+    ))
+    writeLines(as.character(round(train_time[["elapsed"]])), file.path(model_dirs[i], "training_seconds.txt"))
+  }
+}
+
+cfg <- jsonlite::read_json(file.path(model_dirs[1], "model_config.json"))
+cat("Best epoch:", cfg$best_epoch, "of", cfg$epochs, " | trained on:", cfg$device,
+    " | training time:", round(as.numeric(readLines(file.path(model_dirs[1], "training_seconds.txt"))) / 60, 1), "minutes\n")
+```
+
+```{r stop-after-training, include=FALSE}
+if (identical(params$stop_after, "training")) knitr::knit_exit()
+```
+
+```{r history, fig.width=10, fig.height=4}
+history <- read.csv(file.path(model_dirs[1], "training_history.csv"))
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+matplot(history$epoch, history[, c("train_loss", "validation_loss")], type = "l", lty = 1,
+        lwd = 2, col = c("black", "red"), log = "y", xlab = "epoch", ylab = "loss (log scale)",
+        main = "Training history")
+abline(v = cfg$best_epoch, lty = 2, col = "grey40")
+legend("topright", bty = "n", lwd = 2, col = c("black", "red"), legend = c("train", "validation"))
+plot(history$epoch, history$validation_mse_R0, type = "l", lwd = 2, col = "red", log = "y",
+     xlab = "epoch", ylab = "scaled MSE (log scale)", main = "R0 part of the validation loss")
+abline(v = cfg$best_epoch, lty = 2, col = "grey40")
+par(op)
+```
+
+The trainer's validation windows cover 10 lengths. `R0` error by window length, on
+the validation curves:
+
+```{r validation-by-length}
+val <- read.csv(file.path(model_dirs[1], "validation_predictions.csv"))
+by_length <- aggregate(cbind(R0_abs_error = abs(pred_R0 - true_R0)) ~ window_length, val, mean)
+knitr::kable(by_length, digits = 3, row.names = FALSE)
+```
+
+# Step 3: new simulated epidemics, by window length and position
+
+`r format(N_TEST, big.mark = ",")` new `r N_DAYS`-day epidemics (a different seed).
+For the first `r N_GRID` of them, each model gets windows of
+`r paste(GRID_LENGTHS, collapse = ", ")` days taken from the **beginning** (day 1 on),
+the **middle** and the **end** of `r if (STOP_ZEROS > 0) "each curve's informative days (an epidemic only counts for a length if its informative days are at least that long)" else "the curve"`.
+`r if (nzchar(params$previous_models)) paste0("The earlier model (", params$previous_label, ") gets exactly the same windows.") else ""`
+
+```{r test-bank}
+test_dir        <- file.path(OUT_DIR, "test_bank")
+test_theta_file <- file.path(test_dir, "seir_theta.csv")
+test_obs_file   <- file.path(test_dir, "seir_observations.csv")
+if (file.exists(test_theta_file) && nrow(read.csv(test_theta_file)) == N_TEST) {
+  test_bank <- read_training_data(test_theta_file, test_obs_file, type = "SEIR")
+} else {
+  x <- simulate_bank(N_TEST, TEST_SEED)
+  dir.create(test_dir, recursive = TRUE, showWarnings = FALSE)
+  if (ESTIMATE_STATE) save_bank(x, test_dir) else save_training_data(x$bank, name = "seir", output_dir = test_dir)
+  test_bank <- x$bank
+}
+if (ESTIMATE_STATE && !all(file.exists(state_files_of(test_dir)))) {
+  # An older test bank without states: simulate the states for the same curves.
+  x <- simulate_bank(N_TEST, TEST_SEED)
+  stopifnot(isTRUE(all.equal(unname(x$bank$observations), unname(test_bank$observations))))
+  for (nm in STATE_NAMES) write_matrix(x$states[[nm]], state_files_of(test_dir)[[nm]])
+}
+test_states <- if (ESTIMATE_STATE) lapply(state_files_of(test_dir), function(f) as.matrix(read.csv(f)))
+truth <- test_bank$theta[seq_len(N_GRID), TARGETS]
+```
+
+```{r grid}
+make_model <- function(dirs) {
+  cls <- lapply(trimws(strsplit(dirs, ",")[[1]]), function(d) bilstm_calibrator(d, known_names = KNOWN, type = "SEIR"))
+  if (length(cls) == 1) return(cls[[1]])
+  structure(list(
+    pre_process  = function(x, ...) x,
+    run          = function(x, ...) rowMeans(sapply(cls, function(cl) calibrate(x, cl, ...))),
+    post_process = function(x, recov = NULL, ...) derive_crate(x, recov = recov),
+    type         = "SEIR"
+  ), class = "calibrator")
+}
+seed_cals <- lapply(model_dirs, function(d) bilstm_calibrator(d, known_names = KNOWN, type = "SEIR"))
+var_cal   <- if (ENSEMBLE) make_model(paste(model_dirs, collapse = ",")) else seed_cals[[1]]
+VAR_LABEL <- if (ENSEMBLE) sprintf("Variable-length (average of %d seeds)", length(SEEDS)) else "Variable-length"
+models <- list()
+models[[VAR_LABEL]] <- var_cal
+if (nzchar(params$previous_models)) models[[params$previous_label]] <- make_model(params$previous_models)
+
+# Informative days of each test curve (the whole curve when stop_zeros = 0).
+active <- apply(test_bank$observations[seq_len(N_GRID), , drop = FALSE], 1, informative_days,
+                k = STOP_ZEROS)
+
+window_start <- function(position, length, active) {
+  last <- max(active, length)   # windows stay inside the informative days
+  switch(position, beginning = 1, middle = floor((last - length) / 2) + 1, end = last - length + 1)
+}
+
+combos <- expand.grid(length = GRID_LENGTHS, position = POSITIONS, curve = seq_len(N_GRID),
+                      stringsAsFactors = FALSE)
+combos <- combos[active[combos$curve] >= combos$length, ]
+
+grid_file <- file.path(OUT_DIR, "grid_estimates.csv")
+grid <- if (file.exists(grid_file)) read.csv(grid_file) else NULL
+if (!is.null(grid)) for (nm in STATE_NAMES) if (is.null(grid[[nm]])) grid[[nm]] <- NA
+for (m in names(models)) {
+  if (!is.null(grid) && m %in% grid$model) next
+  rows <- lapply(seq_len(nrow(combos)), function(k) {
+    L <- combos$length[k]; i <- combos$curve[k]
+    st <- window_start(combos$position[k], L, active[i])
+    y  <- as.numeric(test_bank$observations[i, st:(st + L - 1)])
+    est <- calibrate(y, models[[m]], n = test_bank$theta$n[i], recov = test_bank$theta$recov[i],
+                     incub = test_bank$theta$incub[i])
+    data.frame(model = m, combos[k, ], window_start = st, window_cases = sum(y),
+               ptran = est[["ptran"]], crate = est[["crate"]], R0 = est[["R0"]],
+               as.list(setNames(unname(est[STATE_NAMES]), STATE_NAMES)))
+  })
+  grid <- rbind(grid, do.call(rbind, rows))
+  write.csv(grid, grid_file, row.names = FALSE)
+}
+grid <- grid[grid$model %in% names(models), ]
+grid$R0_abs_error <- abs(grid$R0 - truth$R0[grid$curve])
+
+r0_tables <- lapply(setNames(names(models), names(models)), function(m) {
+  g <- grid[grid$model == m, ]
+  tapply(g$R0_abs_error, list(g$length, g$position), mean)[, POSITIONS, drop = FALSE]
+})
+write.csv(aggregate(R0_abs_error ~ model + length + position, grid, mean),
+          file.path(OUT_DIR, "R0_MAE_by_length_and_position.csv"), row.names = FALSE)
+for (m in names(models)) {
+  print(knitr::kable(r0_tables[[m]], digits = 3,
+                     caption = paste0(m, ": R0 mean absolute error, by window length (rows) and position (columns)")))
+}
+```
+
+How many test epidemics each length uses, and the share of windows with fewer than
+20 cases in total (little to learn from):
+
+```{r empty-windows}
+g1 <- grid[grid$model == VAR_LABEL & grid$position == "beginning", ]
+knitr::kable(data.frame(length = GRID_LENGTHS,
+                        epidemics = as.integer(table(factor(g1$length, levels = GRID_LENGTHS)))),
+             row.names = FALSE)
+g1 <- grid[grid$model == VAR_LABEL, ]
+knitr::kable(tapply(g1$window_cases < 20, list(g1$length, g1$position), mean)[, POSITIONS, drop = FALSE],
+             digits = 2)
+```
+
+```{r state-accuracy, eval=ESTIMATE_STATE}
+# How well the start-of-window state is estimated (shares of the population).
+g <- grid[grid$model == VAR_LABEL, ]
+state_tab <- sapply(STATE_NAMES, function(nm) {
+  truth_nm <- test_states[[nm]][cbind(g$curve, g$window_start)]
+  tapply(abs(g[[nm]] - truth_nm), g$position, mean)[POSITIONS]
+})
+write.csv(state_tab, file.path(OUT_DIR, "state_MAE_by_position.csv"))
+knitr::kable(state_tab, digits = 4,
+             caption = "Mean absolute error of the estimated start-of-window shares, by position")
+```
+
+```{r grid-plot, fig.width=8, fig.height=4.5}
+cols <- c(beginning = "black", middle = "blue", end = "red")
+ymax <- max(unlist(r0_tables), na.rm = TRUE)
+plot(NA, xlim = range(GRID_LENGTHS), ylim = c(0, ymax), xlab = "window length (days)",
+     ylab = "R0 mean absolute error", main = "Accuracy by window length and position")
+for (k in seq_along(models)) {
+  tab <- r0_tables[[k]]
+  for (pos in POSITIONS) {
+    lines(as.numeric(rownames(tab)), tab[, pos], type = "b", pch = 16, lwd = 2, col = cols[pos], lty = k)
+  }
+}
+legend("topright", bty = "n", lwd = 2, col = c(cols, "grey40", "grey40"),
+       lty = c(1, 1, 1, seq_along(models)), legend = c(POSITIONS, names(models)))
+```
+
+## Next to the 61-day model
+
+The 61-day model can only read 61 days from the beginning. On the same 61-day
+windows:
+
+```{r vs-fixed}
+fixed_cal <- make_model(params$fixed_model)
+curves61  <- sort(unique(grid$curve[grid$length == 61 & grid$position == "beginning"]))
+fixed_R0  <- vapply(curves61, function(i) {
+  calibrate(as.numeric(test_bank$observations[i, 1:61]), fixed_cal, n = test_bank$theta$n[i],
+            recov = test_bank$theta$recov[i], incub = test_bank$theta$incub[i])[["R0"]]
+}, numeric(1))
+score <- function(est) {
+  t <- truth$R0[curves61]
+  c(R0_MAE = mean(abs(est - t)), R0_R2 = 1 - sum((est - t)^2) / sum((t - mean(t))^2))
+}
+vs_fixed <- rbind(
+  data.frame(model = params$fixed_label, t(score(fixed_R0))),
+  do.call(rbind, lapply(names(models), function(m) {
+    g <- grid[grid$model == m & grid$length == 61 & grid$position == "beginning", ]
+    data.frame(model = m, t(score(g$R0[order(g$curve)])))
+  }))
+)
+write.csv(vs_fixed, file.path(OUT_DIR, "vs_61_day_model.csv"), row.names = FALSE)
+knitr::kable(vs_fixed, digits = 3, row.names = FALSE,
+             caption = "First 61 days of the same test curves")
+```
+
+# Step 4: Utah COVID-19 data, last 30 to 365 days
+
+The same known values as `SEIR_BiLSTM.Rmd` (`n = 5000`, `recov = 1/7`,
+`incub = `r params$utah_incub``), with the model reading the last 30 up to 365 days.
+
+```{r utah-data}
+utah_file <- file.path(OUT_DIR, "utah_covid_last365days.csv")
+if (!file.exists(utah_file)) {
+  zip_file <- tempfile(fileext = ".zip")
+  download.file("https://coronavirus-dashboard.utah.gov/Utah_COVID19_data.zip",
+                zip_file, mode = "wb", quiet = TRUE)
+  target <- grep("Trends_Epidemic", unzip(zip_file, list = TRUE)$Name, value = TRUE)[1]
+  utah <- read.csv(unz(zip_file, target))
+  unlink(zip_file)
+  utah$Date <- as.Date(utah$Date)
+  utah <- tail(utah[order(utah$Date), c("Date", "Daily.Cases")], N_DAYS)
+  write.csv(utah, utah_file, row.names = FALSE)
+}
+utah <- read.csv(utah_file)
+UTAH_N <- 5000; UTAH_RECOV <- 1 / 7; UTAH_INCUB <- params$utah_incub
+cat("Dates:", min(utah$Date), "to", max(utah$Date), "\n")
+```
+
+```{r utah-plot-data, fig.width=9, fig.height=3.5}
+plot(as.Date(utah$Date), utah$Daily.Cases, type = "l", lwd = 2, col = "blue",
+     xlab = "", ylab = "daily cases", main = "Utah, last 365 days")
+```
+
+```{r utah-estimates}
+utah_est <- do.call(rbind, lapply(GRID_LENGTHS, function(L) {
+  y <- tail(utah$Daily.Cases, L)
+  est <- calibrate(y, var_cal, n = UTAH_N, recov = UTAH_RECOV, incub = UTAH_INCUB)
+  data.frame(last_days = L, ptran = est[["ptran"]], crate = est[["crate"]], R0 = est[["R0"]],
+             as.list(setNames(unname(est[STATE_NAMES]), STATE_NAMES)))
+}))
+if (nzchar(params$previous_models)) {
+  utah_est$R0_previous <- vapply(GRID_LENGTHS, function(L) calibrate(
+    tail(utah$Daily.Cases, L), models[[params$previous_label]], n = UTAH_N, recov = UTAH_RECOV,
+    incub = UTAH_INCUB)[["R0"]], numeric(1))
+}
+utah_est$R0_61_day_model <- ifelse(
+  utah_est$last_days == 61,
+  calibrate(tail(utah$Daily.Cases, 61), fixed_cal, n = UTAH_N, recov = UTAH_RECOV, incub = UTAH_INCUB)[["R0"]],
+  NA
+)
+write.csv(utah_est, file.path(OUT_DIR, "utah_estimates_by_length.csv"), row.names = FALSE)
+knitr::kable(utah_est, digits = 3, row.names = FALSE)
+```
+
+Rebuilding the last 61 and 120 days. `r if (ESTIMATE_STATE) "The simulations start from the model's own estimate of the shares exposed, infectious and recovered on the first day of the window." else "The simulations start as in SEIR_BiLSTM.Rmd: the number initially exposed is about the first day's cases times incub."`
+
+```{r utah-reconstruct, fig.width=10, fig.height=4.5}
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+utah_fit <- NULL
+for (L in c(61, 120)) {
+  y   <- tail(utah$Daily.Cases, L)
+  est <- utah_est[utah_est$last_days == L, ]
+  sim <- seir_simulator(ndays = L)
+  pars <- list(n = UTAH_N, recov = UTAH_RECOV, incub = UTAH_INCUB, preval = y[1] * UTAH_INCUB / UTAH_N,
+               ptran = est$ptran, crate = est$crate)
+  if (ESTIMATE_STATE) {
+    pars$preval          <- est$exposed_share
+    pars$start_infected  <- est$infected_share
+    pars$start_recovered <- est$recovered_share
+  }
+  runs <- vapply(seq_len(N_REPS), function(i) simulate_from_parameters(sim, pars, seed = i), numeric(L))
+  lo <- apply(runs, 1, quantile, 0.025); hi <- apply(runs, 1, quantile, 0.975); md <- apply(runs, 1, median)
+  day <- seq_len(L)
+  plot(day, md, type = "n", ylim = range(c(y, lo, hi)), xlab = "day", ylab = "daily cases",
+       main = sprintf("Last %d days (R0 %.2f)", L, est$R0))
+  polygon(c(day, rev(day)), c(hi, rev(lo)), col = adjustcolor("red", 0.3), border = NA)
+  lines(day, md, col = "red", lwd = 2)
+  lines(day, y, col = "blue", lwd = 2)
+  utah_fit <- rbind(utah_fit, data.frame(last_days = L, coverage_pct = 100 * mean(y >= lo & y <= hi),
+                                         RMSE = sqrt(mean((md - y)^2))))
+}
+par(op)
+write.csv(utah_fit, file.path(OUT_DIR, "utah_fit_metrics.csv"), row.names = FALSE)
+knitr::kable(utah_fit, digits = 2, row.names = FALSE)
+```
+
+# Run-to-run variation
+
+```{r seeds}
+if (length(SEEDS) > 1) {
+  seed_table <- do.call(rbind, lapply(seq_along(SEEDS), function(k) {
+    sub <- unique(grid[grid$length == 61 & grid$position == "beginning", "curve"])
+    r0  <- vapply(sort(sub), function(i) calibrate(as.numeric(test_bank$observations[i, 1:61]), seed_cals[[k]],
+             n = test_bank$theta$n[i], recov = test_bank$theta$recov[i], incub = test_bank$theta$incub[i])[["R0"]],
+             numeric(1))
+    data.frame(model = paste("seed", SEEDS[k]),
+               R0_MAE_first_61_days = mean(abs(r0 - truth$R0[sort(sub)])),
+               utah_R0_last_61_days = calibrate(tail(utah$Daily.Cases, 61), seed_cals[[k]], n = UTAH_N,
+                                                recov = UTAH_RECOV, incub = UTAH_INCUB)[["R0"]])
+  }))
+  write.csv(seed_table, file.path(OUT_DIR, "seed_variation.csv"), row.names = FALSE)
+  knitr::kable(seed_table, digits = 3, row.names = FALSE)
+} else {
+  cat("One seed only.\n")
+}
+```
+
+# Summary
+
+How to read it:
+
+- **The length x position table** is the main result: how accurate `R0` is for each
+  window length at the beginning, middle and end of an epidemic.
+- **Windows at the end** of the whole curve often contain no cases once the epidemic
+  is over; no method can estimate anything from those. With `stop_zeros`, windows
+  stay inside the informative days instead.
+- **Next to the 61-day model**: whether reading any length costs accuracy on the
+  61-day case the old model was built for.
+- **Utah**: how the estimate changes as the model reads more of the history. With
+  `n = 5000`, a long run of 30 or more cases a day cannot come from one SEIR
+  epidemic, so long Utah windows are outside what the model can describe.
+
+# Saved files
+
+```{r save}
+saveRDS(list(settings = settings, r0_tables = r0_tables, vs_fixed = vs_fixed,
+             utah_estimates = utah_est, utah_fit = utah_fit),
+        file.path(OUT_DIR, "results.rds"))
+writeLines(c(capture.output(sessionInfo()), "", capture.output(reticulate::py_config())),
+           file.path(OUT_DIR, "session_info.txt"))
+files <- list.files(OUT_DIR, recursive = TRUE)
+knitr::kable(data.frame(file = files, size_kb = round(file.size(file.path(OUT_DIR, files)) / 1024, 1)),
+             row.names = FALSE)
+```
