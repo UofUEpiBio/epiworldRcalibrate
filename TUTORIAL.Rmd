@@ -309,7 +309,7 @@ fits_free$`ABC-SMC`
 lapply(fits_free, function(f) signif(f$intervals, 3))   # 95% ranges of R0, ptran and crate
 ```
 
-The ranges of ptran and crate are wide, while the range of R0 is narrow. `plot_ptran_crate()`
+The ranges of ptran and crate cover almost their whole search ranges (crate 5 to 15). `plot_ptran_crate()`
 shows why: the accepted values (points) lie along the curve ptran = R0 x recov / crate
 (dashed: the estimated R0; orange: the true R0 and the true ptran and crate). Any point on
 that curve gives the same epidemic, so the data cannot tell ptran and crate apart:
