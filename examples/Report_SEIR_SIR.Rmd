@@ -36,7 +36,8 @@ STATE_OFFSET <- 1e-4
 LENGTHS <- c(30, 61, 90, 120, 180, 270, 365)
 POSITIONS <- c("beginning", "middle", "end")
 COLS <- c(SEIR = "#1b7837", SIR = "#2166ac")
-METHOD_COLS <- c(BiLSTM = "forestgreen", `ABC-MCMC` = "firebrick", `ABC-SMC` = "purple", DE = "goldenrod", NelderMead = "steelblue")
+METHOD_COLS <- c(BiLSTM = "forestgreen", `ABC-MCMC` = "firebrick", `ABC-SMC` = "purple", DE = "goldenrod", NelderMead = "steelblue",
+                 `ABC-MCMC-summary` = "salmon", `ABC-SMC-summary` = "orchid")
 METHODS <- names(METHOD_COLS)
 BASELINES <- METHODS[-1]
 SIM  <- file.path(R, params$sim_folder)
@@ -188,7 +189,8 @@ infections of **any length from 30 to 365 days**, taken from the beginning, midd
 epidemic. Known values: population `n`, recovery rate `recov` and (SEIR) incubation period
 `incub`. Each model is the average of 5 networks trained on 1,000,000 simulated epidemics.
 The BiLSTM was then compared with four standard calibration methods (ABC-MCMC, ABC-SMC,
-differential evolution and Nelder-Mead) on simulated windows, where the truth is known, and on
+differential evolution and Nelder-Mead; the two ABC methods both on the whole curve and on
+summary statistics of it) on simulated windows, where the truth is known, and on
 real data: COVID-19 waves in 10 US states, Utah COVID-19 and influenza, and Baltimore 1918.
 
 **Main findings**
@@ -213,7 +215,10 @@ real data: COVID-19 waves in 10 US states, Utah COVID-19 and influenza, and Balt
    `r rng(sapply(BASELINES, function(m) sim_get("SIR", m, "R0 MAE")))`. It also recovers the starting
    state and the hidden number currently infected best. Near the beginning of an epidemic the
    baselines come close; in the middle and at the end they are several times less accurate.
-   DE matches the *observed* curve about as closely as the BiLSTM.
+   DE matches the *observed* curve about as closely as the BiLSTM. Running the ABC methods on
+   summary statistics of the curve (mean, peak, peak day, growth, ...) instead of the whole curve
+   did not help: ABC-SMC gave about the same results and ABC-MCMC worse ones (Section "ABC on the
+   whole curve or on summary statistics?").
 5. **On real data** there are no true parameter values; methods are compared by how well their
    simulated curves cover the observed counts. On COVID-19 waves of **10 US states** the BiLSTM
    covers `r pct(real_get("SEIR", "US states", "BiLSTM", "Coverage (%)"))` (SEIR) and
@@ -268,6 +273,17 @@ so the same candidate always gets the same fit. Code: `methods_common.R`.
 | ABC-SMC | this package (`make_calibrator("ABC-SMC")`), defaults (200 particles, 6 generations, each tolerance the median distance of the previous generation) with its limits raised to 30,000 model runs and 20,000 attempts per generation so that it finishes | up to 30,000 | ranges, particles, generations, tolerances, budget |
 | DE | `DEoptim`, defaults: population 10 x the number of unknowns, 200 generations, F = 0.8, CR = 0.5 | 6,000-8,000 | ranges, population, generations |
 | Nelder-Mead | `stats::optim`, defaults, started at the middle of the ranges; values outside the ranges rejected | 100-500 | ranges, starting point |
+| ABC-MCMC-summary | as ABC-MCMC, but comparing summary statistics of the curves (below) instead of the whole curve; 200 prior simulations first, for the scales of the statistics and the tolerance (the 5% quantile of their distances) | about 3,200 | as ABC-MCMC, and the statistics |
+| ABC-SMC-summary | as ABC-SMC, but comparing summary statistics; the scales come from its first generation | up to 30,000 | as ABC-SMC, and the statistics |
+
+**Summary statistics.** ABC-MCMC and ABC-SMC compare the observed and simulated curves day by day
+(root mean squared error over every day of the window). The `-summary` versions instead compare
+11 summary statistics of each curve (`epidemic_summary()` in the package): the mean, the peak and
+the minimum (as log(1 + count)), the day of the peak of the 7-day average, the mean of the first
+and of the last week (log scale), the days by which 25%, 50% and 75% of the window's cases have
+happened, and the growth rate over the first and the last two weeks. Each statistic is divided by
+its spread (median absolute deviation) over simulations from the prior, so that a day and a
+log count weigh alike, and the distance is the root mean square of the scaled differences.
 
 ## How the methods are scored
 
@@ -485,14 +501,17 @@ for (M in names(INFO)) for (pos in POSITIONS) {
 par(op)
 ```
 
-```{r sim-method-scatter, fig.width=14, fig.height=6.5, fig.cap=fc("Estimated vs true R0 for every simulated window (circles: beginning, triangles: middle, squares: end). The line is perfect agreement.")}
-op <- par(mfrow = c(2, length(METHODS)), mar = c(4, 4, 2.5, 0.5))
-for (M in names(INFO)) for (m in METHODS) {
-  d <- sbr_ok[sbr_ok$model == M & sbr_ok$method == m, ]
-  plot(d$R0_true, d$R0, pch = c(beginning = 16, middle = 17, end = 15)[d$position], cex = 0.8,
-       col = adjustcolor(METHOD_COLS[[m]], 0.7), xlim = c(0.7, 5.1), ylim = c(0.7, 5.1),
-       xlab = "true R0", ylab = "estimated R0", main = sprintf("%s, %s (MAE %.2f)", M, m, mean(d$error)))
-  abline(0, 1, lty = 2)
+```{r sim-method-scatter, fig.width=14, fig.height=4 * 2 * ceiling(length(METHODS) / 4) * 0.85, fig.cap=fc("Estimated vs true R0 for every simulated window (circles: beginning, triangles: middle, squares: end). The line is perfect agreement.")}
+op <- par(mfrow = c(2 * ceiling(length(METHODS) / 4), 4), mar = c(4, 4, 2.5, 0.5))
+for (M in names(INFO)) {
+  for (m in METHODS) {
+    d <- sbr_ok[sbr_ok$model == M & sbr_ok$method == m, ]
+    plot(d$R0_true, d$R0, pch = c(beginning = 16, middle = 17, end = 15)[d$position], cex = 0.8,
+         col = adjustcolor(METHOD_COLS[[m]], 0.7), xlim = c(0.7, 5.1), ylim = c(0.7, 5.1),
+         xlab = "true R0", ylab = "estimated R0", main = sprintf("%s, %s (MAE %.2f)", M, m, mean(d$error)))
+    abline(0, 1, lty = 2)
+  }
+  for (k in seq_len((-length(METHODS)) %% 4)) plot.new()   # each model starts a new row
 }
 par(op)
 ```
@@ -535,6 +554,51 @@ pt <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(BASEL
 }))))
 cat(tab(blank_repeats(pt, "Model"), digits = 3, caption = tn("Paired difference in R0 error, simulated windows")), sep = "\n")
 ```
+
+## ABC on the whole curve or on summary statistics?
+
+The two ABC methods were run twice with the same settings: comparing the whole curve day by day
+(as everywhere else in this report) and comparing the 11 summary statistics of Section "The methods
+compared". The table puts the simulated windows (truth known) and the real data side by side.
+
+```{r abc-summary, results="asis"}
+ABC4 <- c("ABC-MCMC", "ABC-MCMC-summary", "ABC-SMC", "ABC-SMC-summary")
+abc_tab <- do.call(rbind, lapply(names(INFO), function(M) do.call(rbind, lapply(ABC4, function(m) {
+  d  <- sbr_ok[sbr_ok$model == M & sbr_ok$method == m, ]
+  us <- real_ok[real_ok$model == M & real_ok$method == m & real_ok$group == "US states", ]
+  ub <- real_ok[real_ok$model == M & real_ok$method == m & real_ok$group == "Utah and Baltimore", ]
+  data.frame(Model = M, Method = m, Compares = if (grepl("summary", m)) "summary statistics" else "whole curve",
+             `R0 MAE` = mean(d$error), `Starting state error (% points)` = mean(d$state_error),
+             `Coverage (%)` = mean(d$cov_new), `Interval score` = mean(d$IS_new),
+             `US states: coverage (%)` = mean(us$coverage), `US states: interval score` = mean(us$interval_score),
+             `Utah and Baltimore: coverage (%)` = mean(ub$coverage), `Utah and Baltimore: interval score` = mean(ub$interval_score),
+             `Seconds per window` = mean(d$seconds), check.names = FALSE)
+}))))
+cat(tab(blank_repeats(abc_tab, "Model"), digits = 2, caption = tn("ABC on the whole curve or on summary statistics. Simulated windows: R0 error, starting-state error, and coverage and interval score of the true daily new infections in the window. Real data: coverage and interval score of the observed counts.")), sep = "\n")
+abc_get <- function(M, m, col) abc_tab[[col]][abc_tab$Model == M & abc_tab$Method == m]
+```
+
+- **ABC-SMC** gives about the same results with summary statistics as with the whole curve: R0
+  error `r f2(abc_get("SEIR", "ABC-SMC-summary", "R0 MAE"))` vs
+  `r f2(abc_get("SEIR", "ABC-SMC", "R0 MAE"))` (SEIR) and
+  `r f2(abc_get("SIR", "ABC-SMC-summary", "R0 MAE"))` vs `r f2(abc_get("SIR", "ABC-SMC", "R0 MAE"))`
+  (SIR), slightly better starting states, slightly wider bands. Its tolerance shrinks generation
+  by generation, so it ends close to the data either way.
+- **ABC-MCMC** is worse with summary statistics: R0 error
+  `r f2(abc_get("SEIR", "ABC-MCMC-summary", "R0 MAE"))` vs `r f2(abc_get("SEIR", "ABC-MCMC", "R0 MAE"))`
+  (SEIR) and `r f2(abc_get("SIR", "ABC-MCMC-summary", "R0 MAE"))` vs
+  `r f2(abc_get("SIR", "ABC-MCMC", "R0 MAE"))` (SIR), and interval scores about twice as large.
+  Its fixed tolerance (the 5% quantile of 200 prior simulations) is loose, so the chain accepts a
+  wide range of R0: its bands are wide and its R0 is pulled toward the middle of the range. On
+  US-state data its coverage of `r sprintf("%.1f%%", abc_get("SEIR", "ABC-MCMC-summary", "US states: coverage (%)"))`
+  (SEIR) comes from bands about ten times wider (interval score
+  `r round(abc_get("SEIR", "ABC-MCMC-summary", "US states: interval score"))` vs
+  `r round(abc_get("SEIR", "ABC-MCMC", "US states: interval score"))`).
+- **On real data** summary statistics did not help either: the hope was that they would be less
+  sensitive to weekday swings and spikes, but on Utah and Baltimore both summary versions have
+  lower coverage or higher interval scores than the whole-curve versions.
+- The whole curve carries more information than a few statistics of it, so with default settings
+  the whole-curve distance is the better choice; neither version comes close to the BiLSTM.
 
 # Real data: the BiLSTM against standard methods
 
@@ -1036,6 +1100,8 @@ same trained model can be shared and used by others without any of this cost.
   faster. The baselines come close only near the beginning of an epidemic; DE matches the
   observed curve about as closely. ABC-SMC finishes only with more model runs than its default
   limit allows.
+- **ABC on summary statistics** (mean, peak, peak day, growth, ...) instead of the whole curve
+  did not improve ABC-SMC and made ABC-MCMC worse, on simulated and on real data.
 - **Ease of use:** the BiLSTM needs only the daily counts and the known values. Every baseline
   needs ranges for R0 and for the starting state, its own settings, and seconds to minutes of
   model runs for every window.
@@ -1113,7 +1179,9 @@ calibration_estimate(fit)                  # the estimates as a named vector
 
 ## Calibrating with ABC-MCMC, ABC-SMC, DE or Nelder-Mead
 
-`window_baselines()` gives the four standard methods with the settings of this report (Section
+`window_baselines()` gives the four standard methods with the settings of this report (and,
+with `methods = c("ABC-MCMC-summary", "ABC-SMC-summary")`, the ABC methods on summary statistics;
+`epidemic_summary()` shows the statistics of a curve) (Section
 "The methods compared"). They are used with `calibrate()` like the BiLSTM; each takes seconds
 to minutes, so here they run in parallel:
 
@@ -1287,7 +1355,8 @@ network on a recent GPU to train (Section "Computational cost").
 | Function | What it does |
 |---|---|
 | `window_calibrator(model)` | the trained BiLSTM for SEIR or SIR windows (or your own with `model_dir`) |
-| `window_baselines(model, methods, settings, unknowns)` | ABC-MCMC, ABC-SMC, DE and Nelder-Mead, set up as in this report; `unknowns = "ptran_crate"` searches ptran and crate |
+| `window_baselines(model, methods, settings, unknowns)` | ABC-MCMC, ABC-SMC, DE and Nelder-Mead, set up as in this report; `"ABC-MCMC-summary"`, `"ABC-SMC-summary"` compare summary statistics; `unknowns = "ptran_crate"` searches ptran and crate |
+| `epidemic_summary(cases)` | the summary statistics the `-summary` ABC methods compare |
 | `calibrate(cases, method, n, recov, incub)` | fit a window with any of them |
 | `calibration_estimate(fit)` | the estimates as a named vector |
 | `predict_cases(fit, ahead, method)` | 95% bands by model runs or the renewal equation |

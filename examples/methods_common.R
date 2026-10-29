@@ -19,6 +19,15 @@
 #   Nelder-Mead  stats::optim(method = "Nelder-Mead") with its default settings,
 #                started at the middle of the ranges; values outside the ranges are
 #                rejected.
+#   ABC-MCMC-summary, ABC-SMC-summary
+#                the same two ABC methods, comparing summary statistics of the curves
+#                (epidemic_summary(): mean, peak, minimum, peak day, first and last
+#                week, the days by which 25%, 50% and 75% of the cases happened,
+#                growth at the start and the end; each scaled by its spread over prior
+#                simulations) instead of the whole curve. ABC-MCMC-summary runs 200
+#                prior simulations first for the scales and its tolerance (their 5%
+#                distance quantile); ABC-SMC-summary takes the scales from its first
+#                generation.
 # All three use the same unknowns and ranges as the BiLSTM: R0 in [0.8, 5] and the
 # state on the first day of the window (shares exposed (SEIR), infected and
 # recovered, searched as log10 shares from 1e-4 to 0.4, 0.95 for recovered), with
@@ -28,9 +37,10 @@
 # with a fixed seed per candidate, so the same candidate always gets the same fit.
 
 STATE_OFFSET <- 1e-4
-BASELINES <- c("ABC-MCMC", "ABC-SMC", "DE", "NelderMead")
+BASELINES <- c("ABC-MCMC", "ABC-SMC", "DE", "NelderMead", "ABC-MCMC-summary", "ABC-SMC-summary")
 METHOD_COLS <- c(BiLSTM = "forestgreen", `ABC-MCMC` = "firebrick", `ABC-SMC` = "purple",
-                 DE = "goldenrod", NelderMead = "steelblue")
+                 DE = "goldenrod", NelderMead = "steelblue", `ABC-MCMC-summary` = "salmon",
+                 `ABC-SMC-summary` = "orchid")
 
 model_info <- function(M) {
   seir <- M == "SEIR"
@@ -94,17 +104,21 @@ baseline_result <- function(theta, info, known, seconds, runs, draws = NULL, nam
        seconds = seconds, model_runs = runs)
 }
 
-fit_de <- function(y, info, known, seed = 1L) {
+# fixed_seed = TRUE: every candidate is run with the same seed, so the fit of a candidate never changes
+# (common random numbers). fixed_seed = FALSE: a new seed for every model run, as a user who simply
+# calls the stochastic model would do ("DE-random-seed").
+fit_de <- function(y, info, known, seed = 1L, fixed_seed = TRUE, name = "DE") {
   sp <- baseline_space(info)
   runs <- 0L
   sse <- function(theta) {
     runs <<- runs + 1L
-    sum((y - run_model(info, baseline_pars(info, theta, known), length(y), seed = seed)$new)^2)
+    s <- if (fixed_seed) seed else sample.int(.Machine$integer.max, 1L)
+    sum((y - run_model(info, baseline_pars(info, theta, known), length(y), seed = s)$new)^2)
   }
   set.seed(seed)
   t0 <- proc.time()[["elapsed"]]
   fit <- DEoptim::DEoptim(sse, sp$lower, sp$upper, control = DEoptim::DEoptim.control(trace = FALSE))
-  baseline_result(as.numeric(fit$optim$bestmem), info, known, proc.time()[["elapsed"]] - t0, runs, name = "DE")
+  baseline_result(as.numeric(fit$optim$bestmem), info, known, proc.time()[["elapsed"]] - t0, runs, name = name)
 }
 
 fit_nm <- function(y, info, known, seed = 1L) {
@@ -122,7 +136,7 @@ fit_nm <- function(y, info, known, seed = 1L) {
 
 # The package's ABC-MCMC or ABC-SMC with their default settings, on the same unknowns
 # and ranges (the simulator maps R0 and the log10 shares to the model inputs).
-fit_package_abc <- function(method, y, info, known, seed = 2025L) {
+fit_package_abc <- function(method, y, info, known, seed = 2025L, distance = "rmse", name = method) {
   sp <- baseline_space(info)
   sim <- new_simulator(
     sample_parameters = function(n_sims) stop("Not used."),
@@ -130,8 +144,9 @@ fit_package_abc <- function(method, y, info, known, seed = 2025L) {
       run_model(info, baseline_pars(info, unlist(parameters[sp$names]), parameters[info$known]), length(y), seed)$new
     }, type = info$model)
   bounds <- stats::setNames(lapply(seq_along(sp$names), function(j) c(sp$lower[j], sp$upper[j])), sp$names)
-  cal <- if (method == "ABC-SMC") make_calibrator(method, sim, bounds, info$known, sim_budget = 30000L, max_attempt_mult = 100L) else
-    make_calibrator(method, sim, bounds, info$known)
+  cal <- if (method == "ABC-SMC") make_calibrator(method, sim, bounds, info$known, sim_budget = 30000L, max_attempt_mult = 100L,
+                                                   distance = distance) else
+    make_calibrator(method, sim, bounds, info$known, distance = distance)
   set.seed(seed)
   t0 <- proc.time()[["elapsed"]]
   res <- do.call(calibrate, c(list(y, cal), as.list(known)))
@@ -140,7 +155,7 @@ fit_package_abc <- function(method, y, info, known, seed = 2025L) {
     post$particles[sample(nrow(post$particles), 500, replace = TRUE, prob = post$weights), , drop = FALSE]
   draws <- as.matrix(draws[, sp$names, drop = FALSE])
   est <- calibration_estimate(res)[sp$names]
-  baseline_result(as.numeric(est), info, known, proc.time()[["elapsed"]] - t0, res$diagnostics$n_model_runs, draws, method)
+  baseline_result(as.numeric(est), info, known, proc.time()[["elapsed"]] - t0, res$diagnostics$n_model_runs, draws, name)
 }
 
 # A failed fit (for example ABC-SMC running out of model runs) is recorded, not fatal.
@@ -148,7 +163,10 @@ fit_baseline <- function(method, y, info, known) {
   t0 <- proc.time()[["elapsed"]]
   tryCatch(switch(method, `ABC-MCMC` = fit_package_abc("ABC-MCMC", y, info, known),
                   `ABC-SMC` = fit_package_abc("ABC-SMC", y, info, known), DE = fit_de(y, info, known),
-                  NelderMead = fit_nm(y, info, known)),
+                  NelderMead = fit_nm(y, info, known),
+                  `DE-random-seed` = fit_de(y, info, known, fixed_seed = FALSE, name = method),
+                  `ABC-MCMC-summary` = fit_package_abc("ABC-MCMC", y, info, known, distance = "summary", name = method),
+                  `ABC-SMC-summary` = fit_package_abc("ABC-SMC", y, info, known, distance = "summary", name = method)),
            error = function(e) list(method = method, failed = TRUE, error = conditionMessage(e),
                                     seconds = proc.time()[["elapsed"]] - t0, model_runs = NA))
 }
@@ -205,13 +223,74 @@ make_bilstm <- function(info, model_dir, seeds, device = "cpu", k = 500L, n_draw
 # 95% bands of daily new infections and of the number infectious from n runs of the
 # model, with parameters drawn from a method's draws (a single set for DE and
 # Nelder-Mead: then the band shows only the randomness of the epidemic).
+# Bands of n model runs from parameter draws: the median and the central 50%, 80% and 95% intervals
+# (lower/upper are the 95% ones) of the daily new infections, the number currently infected and the
+# cumulative new infections since the first day of the window.
 band_of <- function(info, draws, days, n = 500L) {
   pick <- if (length(draws) == n) draws else draws[sample(length(draws), n, replace = TRUE)]
   runs <- lapply(seq_len(n), function(i) run_model(info, pick[[i]], days, seed = i))
-  summ <- function(x) data.frame(median = apply(x, 1, stats::median), lower = apply(x, 1, stats::quantile, 0.025),
-                                 upper = apply(x, 1, stats::quantile, 0.975))
-  list(new = summ(vapply(runs, `[[`, numeric(days), "new")),
-       infected = summ(vapply(runs, `[[`, numeric(days), "infected")))
+  summ <- function(x) {
+    q <- t(apply(x, 1, stats::quantile, c(0.025, 0.1, 0.25, 0.5, 0.75, 0.9, 0.975), names = FALSE))
+    data.frame(median = q[, 4], lower = q[, 1], upper = q[, 7], l80 = q[, 2], u80 = q[, 6], l50 = q[, 3], u50 = q[, 5])
+  }
+  new <- vapply(runs, `[[`, numeric(days), "new")
+  list(new = summ(new), infected = summ(vapply(runs, `[[`, numeric(days), "infected")),
+       cumulative = summ(apply(new, 2, cumsum)))
+}
+
+# Weighted interval score (Bracher et al. 2021) of a band against the values y, averaged over the days:
+# half the absolute error of the median plus the interval scores of the central 50%, 80% and 95%
+# intervals, each weighted by alpha / 2, divided by K + 1/2 (K = 3 intervals). It combines the accuracy
+# of the median (MAE) with the width and coverage of the intervals; lower is better.
+wis_of <- function(b, y) {
+  is <- function(l, u, a) (u - l) + 2 / a * pmax(l - y, 0) + 2 / a * pmax(y - u, 0)
+  w <- 0.5 * abs(y - b$median) + 0.25 * is(b$l50, b$u50, 0.5) + 0.1 * is(b$l80, b$u80, 0.2) +
+    0.025 * is(b$lower, b$upper, 0.05)
+  mean(w / 3.5)
+}
+
+# Gaussian kernel smoothing of a series of daily counts (Nadaraya-Watson, stats::ksmooth), with a
+# bandwidth equal to `frac` of the length of the series (the kernel's quartiles are at +/- bandwidth/4).
+smooth_counts <- function(y, frac) {
+  x <- seq_along(y)
+  stats::ksmooth(x, y, kernel = "normal", bandwidth = frac * length(y), x.points = x)$y
+}
+
+# The same Gaussian kernel with a fixed standard deviation in days, whatever the window length
+# (ksmooth's bandwidth puts the quartiles at +/- bandwidth/4, i.e. bandwidth = 4 x 0.674 x sd).
+smooth_days <- function(y, sd_days) {
+  x <- seq_along(y)
+  stats::ksmooth(x, y, kernel = "normal", bandwidth = 4 * stats::qnorm(0.75) * sd_days, x.points = x)$y
+}
+
+# A 7-day running median (removes isolated one-day bursts), then the 2.5-day kernel.
+smooth_median <- function(y) smooth_days(stats::runmed(y, 7, endrule = "median"), 2.5)
+
+# Local-linear smoothing (lowess: tricube kernel, a straight line fitted around each day) with a span of
+# `f` of the window; robust = TRUE down-weights outlying days (three robustness iterations).
+smooth_lowess <- function(y, f, robust = FALSE) {
+  pmax(stats::lowess(seq_along(y), y, f = f, iter = if (robust) 3L else 0L)$y, 0)
+}
+
+# A centred 7-day moving average (box kernel; at the ends, the mean of the days available).
+smooth_box7 <- function(y) {
+  x <- seq_along(y)
+  stats::ksmooth(x, y, kernel = "box", bandwidth = 7, x.points = x)$y
+}
+
+# Epanechnikov kernel, weight 1 - (u / h)^2 within h days; h = 2.5 x sqrt(5) days gives the same standard
+# deviation as the 2.5-day Gaussian kernel.
+smooth_epanechnikov <- function(y, h = 2.5 * sqrt(5)) {
+  x <- seq_along(y)
+  vapply(x, function(t) { w <- pmax(1 - ((x - t) / h)^2, 0); sum(w * y) / sum(w) }, 0)
+}
+
+# Day-to-day noise of a series relative to Poisson noise: the variance of the counts around a centred
+# 7-day mean divided by that mean (about 0.9 for the agent-based model's own curves).
+dispersion_index <- function(y) {
+  m <- stats::filter(y, rep(1 / 7, 7), sides = 2); ok <- !is.na(m) & m > 0.5
+  if (sum(ok) < 3) return(NA)
+  sum((y[ok] - m[ok])^2) / sum(m[ok])
 }
 # Over the days `idx`: coverage (%), mean band width, MAE of the median, and the
 # interval score (band width plus 40 times how far a day falls outside the band; a
@@ -275,4 +354,32 @@ renewal_initial_state <- function(info, y, R0, known) {
   fits <- lapply(starts, function(s0) stats::optim(s0, sse, method = "L-BFGS-B", lower = lo, upper = hi))
   best <- fits[[which.min(vapply(fits, `[[`, 0, "value"))]]
   baseline_pars(info, c(R0, best$par), known)
+}
+
+# ---- DeepIMC weighted by the data ------------------------------------------------------------------
+# Each of DeepIMC's draws (R0 and starting state) is run once through the agent-based model for the
+# window, and the draws are weighted by how close their simulated curves are to the observed counts
+# (root mean squared difference of the square roots; Poisson noise is about 0.5 on this scale). Returns
+# n draws chosen by these weights (to make the band from), the state and R0 of the chosen draws, and the
+# fit check: the distance of the closest draw. (The paper keeps DeepIMC's own R0 and range, which are
+# calibrated; the selection, made from one run per draw, gives too narrow an R0 range.)
+#   version "best50":  the 50 closest draws (10%), equally weighted (the version of the paper)
+#   version "best100": the 100 closest draws, equally weighted
+#   version "soft":    weight exp(-(d / eps)^2 / 2), eps = the distance of the 50th closest draw
+weight_draws <- function(info, draws, y, version = "best50", n = 500L, seed = 1L) {
+  L <- length(y)
+  d <- vapply(seq_along(draws), function(i) {
+    r <- run_model(info, draws[[i]], L, seed = seed + i)$new
+    sqrt(mean((sqrt(r) - sqrt(y))^2))
+  }, 0)
+  idx <- switch(version,
+    best50 = rep(order(d)[1:50], length.out = n),
+    best100 = rep(order(d)[1:100], length.out = n),
+    soft = { eps <- sort(d)[min(50, length(d))]; w <- exp(-0.5 * (d / eps)^2)
+             with_seed(seed, sample(length(d), n, replace = TRUE, prob = w)) })
+  R0s <- vapply(draws[idx], function(p) p$ptran * p$crate / p$recov, 0)
+  list(draws = draws[idx], R0 = stats::median(R0s), R0_low = unname(stats::quantile(R0s, 0.025)),
+       R0_high = unname(stats::quantile(R0s, 0.975)),
+       state = sapply(info$states, function(s) stats::median(vapply(draws[idx], `[[`, 0, s))),
+       fit_best = min(d), fit_median = stats::median(d))
 }
