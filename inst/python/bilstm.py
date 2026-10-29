@@ -150,11 +150,19 @@ def _optional_physics_loss(pred_scaled, known_scaled, target_scaler, known_scale
 
 
 def _predict_in_chunks(model, x, known, chunk_size=1024):
-    # Whole validation sets can be too large for one pass on a GPU.
-    return torch.cat([
-        model(x[i:i + chunk_size], known[i:i + chunk_size])
-        for i in range(0, len(x), chunk_size)
-    ])
+    # Whole validation sets can be too large for one pass on a GPU. On a GPU
+    # with little free memory, retry with smaller chunks (same predictions).
+    while True:
+        try:
+            return torch.cat([
+                model(x[i:i + chunk_size], known[i:i + chunk_size])
+                for i in range(0, len(x), chunk_size)
+            ])
+        except torch.OutOfMemoryError:
+            if chunk_size <= 16:
+                raise
+            torch.cuda.empty_cache()
+            chunk_size //= 4
 
 
 def _window_batches(n, batch_size, window_min, window_max, n_days, rng, device):
@@ -249,6 +257,10 @@ def train_model(theta_csv, incidence_csv, output_dir, known_names, target_names,
 
     device = _resolve_device(device)
     print(f"Training on: {device}", flush=True)
+    if str(device).startswith("cuda"):
+        # Start CUDA before loading the data, so that a GPU that cannot be used
+        # fails the job at once instead of after the data are read.
+        torch.zeros(1, device=device)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -501,6 +513,7 @@ def train_model(theta_csv, incidence_csv, output_dir, known_names, target_names,
             batches = noisy_batches()
         else:
             batches = ((xb.to(device), kb.to(device), yb.to(device)) for xb, kb, yb in loader)
+        skipped = 0
         for xb, kb, yb in batches:
             optimizer.zero_grad()
             pred = model(xb, kb)
@@ -509,14 +522,24 @@ def train_model(theta_csv, incidence_csv, output_dir, known_names, target_names,
                 pred, kb, target_scaler, known_scaler,
                 target_names, known_names, physics_weight, mse
             )
+            if not torch.isfinite(loss):
+                # A non-finite loss (a numerical fault, for example on an old GPU)
+                # would turn every weight into NaN; skip the batch instead.
+                skipped += 1
+                continue
             loss.backward()
-            if grad_clip:
-                # Limits the size of each update; steadies LSTMs on long sequences.
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            # Limits the size of each update (steadies LSTMs on long sequences);
+            # with no limit it only measures the gradient.
+            norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip if grad_clip else float("inf"))
+            if not torch.isfinite(norm):
+                skipped += 1
+                continue
             optimizer.step()
             total += loss.item() * len(xb)
             seen += len(xb)
-        train_history.append(total / seen)
+        if skipped:
+            print(f"epoch {epoch + 1}: skipped {skipped} batches with a non-finite loss or gradient", flush=True)
+        train_history.append(total / max(seen, 1))
 
         model.eval()
         with torch.no_grad():

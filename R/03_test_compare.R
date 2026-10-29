@@ -130,6 +130,67 @@ calibrate <- function(daily_cases, calibrator, ...) {
   )
 }
 
+#' Summary statistics of an epidemic curve
+#'
+#' The statistics the ABC methods compare when `distance = "summary"`
+#' (instead of the whole curve): for a run of daily counts, the mean, the peak
+#' and the minimum (all as log(1 + count)), the day of the peak of the 7-day
+#' average, the mean of the first and of the last week (log scale), the days
+#' by which 25\%, 50\% and 75\% of the cases of the run have happened, and the
+#' growth rate (slope of log(1 + count) per day) over the first and the last
+#' two weeks.
+#'
+#' The ABC methods divide each statistic by its spread (median absolute
+#' deviation) over simulations from the prior, so that statistics in different
+#' units count alike, and use the root mean square of the scaled differences
+#' as the distance.
+#'
+#' @param x Daily counts.
+#' @return A named numeric vector of 11 statistics.
+#' @examples
+#' epidemic_summary(c(1, 3, 8, 20, 41, 60, 52, 33, 20, 9, 4, 2, 1, 0))
+#' @export
+epidemic_summary <- function(x) {
+  x <- pmax(as.numeric(x), 0)
+  L <- length(x)
+  k <- min(7L, L)
+  w <- min(14L, L)
+  ma <- if (L >= 7) as.numeric(stats::filter(x, rep(1 / 7, 7), sides = 2)) else rep(mean(x), L)
+  ma[is.na(ma)] <- x[is.na(ma)]
+  cs <- cumsum(x)
+  day_q <- function(q) if (cs[L] > 0) which(cs >= q * cs[L])[1] else (L + 1) / 2
+  slope <- function(v) if (length(v) < 2) 0 else stats::cov(seq_along(v), log1p(v)) / stats::var(seq_along(v))
+  c(log_mean = log1p(mean(x)), log_peak = log1p(max(x)), log_min = log1p(min(x)), peak_day = which.max(ma),
+    log_first_week = log1p(mean(x[seq_len(k)])), log_last_week = log1p(mean(x[(L - k + 1):L])),
+    day_25 = day_q(0.25), day_50 = day_q(0.5), day_75 = day_q(0.75),
+    growth_start = slope(x[seq_len(w)]), growth_end = slope(x[(L - w + 1):L]))
+}
+
+# Spread of each summary statistic over prior simulations (median absolute
+# deviation, or the standard deviation when that is 0, or 1).
+.summary_scale <- function(S) {
+  sc <- apply(S, 2, stats::mad, na.rm = TRUE)
+  sdv <- apply(S, 2, stats::sd, na.rm = TRUE)
+  bad <- !is.finite(sc) | sc <= 0
+  sc[bad] <- sdv[bad]
+  sc[!is.finite(sc) | sc <= 0] <- 1
+  sc
+}
+
+.summary_distance <- function(s_obs, s_sim, scale) {
+  if (anyNA(s_sim)) return(Inf)
+  sqrt(mean(((s_sim - s_obs) / scale)^2))
+}
+
+# Draw n parameter vectors uniformly within the bounds.
+.runif_bounds <- function(n, bnd) {
+  theta <- matrix(stats::runif(n * nrow(bnd)), nrow = n, ncol = nrow(bnd))
+  theta <- sweep(theta, 2, bnd$upper - bnd$lower, `*`)
+  theta <- sweep(theta, 2, bnd$lower, `+`)
+  colnames(theta) <- rownames(bnd)
+  theta
+}
+
 .safe_simulate <- function(simulator, parameters, seed) {
   tryCatch(
     as.numeric(simulator$run(parameters = parameters, seed = seed)),
@@ -284,6 +345,10 @@ make_calibrator <- function(
 # Gaussian random-walk proposal, and the Gaussian ABC kernel
 # exp(-d^2 / (2 * epsilon^2)). The default epsilon is 0.30 times the RMS of
 # the observed series, matching the current project comparison.
+# With distance = "summary" the curves are compared through epidemic_summary()
+# (or the function `summary`): each statistic is scaled by its spread over
+# n_pilot prior simulations, and epsilon is the pilot_quantile quantile of the
+# pilot distances.
 # Built by make_calibrator("ABC-MCMC", ...); not exported on its own.
 .abc_mcmc_calibrator <- function(
     simulator,
@@ -294,6 +359,9 @@ make_calibrator <- function(
     prop_frac = 0.08,
     eps_frac = 0.30,
     distance = "rmse",
+    summary = epidemic_summary,
+    n_pilot = 200L,
+    pilot_quantile = 0.05,
     derive = NULL,
     type = simulator$type,
     name = "ABC-MCMC"
@@ -314,22 +382,34 @@ make_calibrator <- function(
   run <- function(x, ...) {
     observed <- x$observed
     known <- x$known
-    eps <- max(eps_frac * sqrt(mean(observed^2)), 1e-8)
     prop_sd <- prop_frac * (bnd$upper - bnd$lower)
+    use_summary <- identical(distance, "summary")
 
     n_model_runs <- 0L
 
-    dist_one <- function(theta) {
+    simulate_one <- function(theta) {
       n_model_runs <<- n_model_runs + 1L
       names(theta) <- pars
-      p <- .merge_candidate(known, theta)
-      pred <- .safe_simulate(
-        simulator,
-        p,
-        seed = sample.int(.Machine$integer.max, 1L)
-      )
+      .safe_simulate(simulator, .merge_candidate(known, theta), seed = sample.int(.Machine$integer.max, 1L))
+    }
+
+    if (use_summary) {
+      s_obs <- summary(observed)
+      S <- t(apply(.runif_bounds(n_pilot, bnd), 1, function(th) {
+        pred <- simulate_one(th)
+        if (is.null(pred)) rep(NA_real_, length(s_obs)) else summary(pred)
+      }))
+      s_scale <- .summary_scale(S)
+      pilot_d <- apply(S, 1, function(s) .summary_distance(s_obs, s, s_scale))
+      eps <- max(as.numeric(stats::quantile(pilot_d[is.finite(pilot_d)], pilot_quantile)), 1e-8)
+    } else {
+      eps <- max(eps_frac * sqrt(mean(observed^2)), 1e-8)
+    }
+
+    dist_one <- function(theta) {
+      pred <- simulate_one(theta)
       if (is.null(pred)) return(Inf)
-      .metric_value(observed, pred, distance)
+      if (use_summary) .summary_distance(s_obs, summary(pred), s_scale) else .metric_value(observed, pred, distance)
     }
 
     kern <- function(d) {
@@ -437,6 +517,9 @@ make_calibrator <- function(
 # ABC-SMC calibrator ----------------------------------------------------------
 # Uses a multivariate Gaussian perturbation kernel with covariance equal to
 # twice the weighted covariance of the previous particle population.
+# With distance = "summary" the curves are compared through epidemic_summary()
+# (or the function `summary`), each statistic scaled by its spread over the
+# first generation (drawn from the prior).
 # Built by make_calibrator("ABC-SMC", ...); not exported on its own.
 .abc_smc_calibrator <- function(
     simulator,
@@ -448,6 +531,7 @@ make_calibrator <- function(
     max_attempt_mult = 25L,
     sim_budget = 8000L,
     distance = "rmse",
+    summary = epidemic_summary,
     derive = NULL,
     type = simulator$type,
     name = "ABC-SMC"
@@ -468,30 +552,32 @@ make_calibrator <- function(
     observed <- x$observed
     known <- x$known
     n_model_runs <- 0L
+    use_summary <- identical(distance, "summary")
+    if (use_summary) s_obs <- summary(observed)
 
-    dist_one <- function(theta) {
+    simulate_one <- function(theta) {
       n_model_runs <<- n_model_runs + 1L
       names(theta) <- pars
-      p <- .merge_candidate(known, theta)
-      pred <- .safe_simulate(
-        simulator,
-        p,
-        seed = sample.int(.Machine$integer.max, 1L)
-      )
+      .safe_simulate(simulator, .merge_candidate(known, theta), seed = sample.int(.Machine$integer.max, 1L))
+    }
+    dist_one <- function(theta) {
+      pred <- simulate_one(theta)
       if (is.null(pred)) return(Inf)
-      .metric_value(observed, pred, distance)
+      if (use_summary) .summary_distance(s_obs, summary(pred), s_scale) else .metric_value(observed, pred, distance)
     }
 
-    theta <- matrix(
-      stats::runif(n_particles * d),
-      nrow = n_particles,
-      ncol = d
-    )
-    theta <- sweep(theta, 2, bnd$upper - bnd$lower, `*`)
-    theta <- sweep(theta, 2, bnd$lower, `+`)
-    colnames(theta) <- pars
+    theta <- .runif_bounds(n_particles, bnd)
 
-    dist <- apply(theta, 1, dist_one)
+    if (use_summary) {
+      S <- t(apply(theta, 1, function(th) {
+        pred <- simulate_one(th)
+        if (is.null(pred)) rep(NA_real_, length(s_obs)) else summary(pred)
+      }))
+      s_scale <- .summary_scale(S)
+      dist <- apply(S, 1, function(s) .summary_distance(s_obs, s, s_scale))
+    } else {
+      dist <- apply(theta, 1, dist_one)
+    }
     w <- rep(1 / n_particles, n_particles)
     eps <- as.numeric(stats::quantile(dist, eps_quantile, names = FALSE))
 

@@ -15,7 +15,7 @@
 #     tune_window_calibrator(): make your own any-length BiLSTM
 #
 # A window is a run of daily new infectious people (E -> I for SEIR, S -> I for
-# SIR) of any length (30 to 365 days for the shipped models), taken from any
+# SIR) of any length (15 to 365 days for the shipped models), taken from any
 # part of an epidemic. Known values: population n, recovery rate recov and, for
 # SEIR, the incubation period incub (days).
 # =============================================================================
@@ -127,7 +127,7 @@ print.window_fit <- function(x, ...) {
 #'
 #' Estimates R0, ptran, crate and the state on the first day of the window (the
 #' shares exposed, infectious and recovered) from a window of daily new
-#' infectious people of any length (30 to 365 days for the shipped models) from
+#' infectious people of any length (15 to 365 days for the shipped models) from
 #' any part of an epidemic. The package ships one SEIR and one SIR model, each
 #' the average of 5 networks trained on 1,000,000 noise-free simulated
 #' epidemics of `ModelSEIRCONN` / `ModelSIRCONN`. Only R0 = ptran x crate /
@@ -285,7 +285,7 @@ window_calibrator <- function(model = c("SEIR", "SIR"), model_dir = NULL, device
   .baseline_fit("NelderMead", info, y, known, fit$par, proc.time()[["elapsed"]] - t0, runs, unknowns = unknowns)
 }
 
-.fit_abc <- function(method, y, info, known, settings, unknowns = "R0") {
+.fit_abc <- function(method, y, info, known, settings, unknowns = "R0", name = method) {
   sp <- .baseline_space(info, unknowns)
   sim <- new_simulator(
     sample_parameters = function(n_sims) stop("Not used."),
@@ -300,7 +300,7 @@ window_calibrator <- function(model = c("SEIR", "SIR"), model_dir = NULL, device
   post <- res$posterior
   draws <- if (is.matrix(post)) post else
     post$particles[sample(nrow(post$particles), 500, replace = TRUE, prob = post$weights), , drop = FALSE]
-  .baseline_fit(method, info, y, known, as.numeric(calibration_estimate(res)[sp$names]), proc.time()[["elapsed"]] - t0,
+  .baseline_fit(name, info, y, known, as.numeric(calibration_estimate(res)[sp$names]), proc.time()[["elapsed"]] - t0,
                 res$diagnostics$n_model_runs, as.matrix(draws[, sp$names, drop = FALSE]), unknowns)
 }
 
@@ -337,10 +337,20 @@ window_calibrator <- function(model = c("SEIR", "SIR"), model_dir = NULL, device
 #'     started at the middle of the ranges (values outside are rejected); it
 #'     stops when its trial points give fits within 1.5e-8 of each other, or
 #'     after 500 runs. Same fit as DE.}
+#'   \item{ABC-MCMC-summary, ABC-SMC-summary}{The same ABC methods, comparing
+#'     summary statistics of the curves ([epidemic_summary()]: mean, peak,
+#'     minimum, peak day, first and last week, the days by which 25\%, 50\% and
+#'     75\% of the cases happened, growth at the start and the end) instead of
+#'     the whole curve, each statistic scaled by its spread over simulations
+#'     from the prior. ABC-MCMC-summary first runs 200 prior simulations for
+#'     the scales and takes as its tolerance the 5\% quantile of their
+#'     distances; ABC-SMC-summary takes the scales from its first generation.
+#'     Not in the default `methods`.}
 #' }
 #'
 #' @param model `"SEIR"` or `"SIR"`.
-#' @param methods Which methods.
+#' @param methods Which methods: any of `"ABC-MCMC"`, `"ABC-SMC"`, `"DE"`,
+#'   `"NelderMead"`, `"ABC-MCMC-summary"` and `"ABC-SMC-summary"`.
 #' @param settings Optional named list of settings per method, for example
 #'   `list(DE = list(itermax = 50), NelderMead = list(maxit = 1000))`: passed to
 #'   `DEoptim::DEoptim.control()`, `stats::optim(control = )`, or
@@ -362,17 +372,19 @@ window_calibrator <- function(model = c("SEIR", "SIR"), model_dir = NULL, device
 window_baselines <- function(model = c("SEIR", "SIR"), methods = c("ABC-MCMC", "ABC-SMC", "DE", "NelderMead"),
                              settings = list(), unknowns = c("R0", "ptran_crate")) {
   info <- .window_info(model[1])
-  methods <- match.arg(methods, c("ABC-MCMC", "ABC-SMC", "DE", "NelderMead"), several.ok = TRUE)
+  methods <- match.arg(methods, c("ABC-MCMC", "ABC-SMC", "DE", "NelderMead", "ABC-MCMC-summary", "ABC-SMC-summary"),
+                       several.ok = TRUE)
   unknowns <- match.arg(unknowns)
   defaults <- list(`ABC-MCMC` = list(), `ABC-SMC` = list(sim_budget = 30000L, max_attempt_mult = 100L),
-                   DE = list(), NelderMead = list())
+                   DE = list(), NelderMead = list(), `ABC-MCMC-summary` = list(distance = "summary"),
+                   `ABC-SMC-summary` = list(sim_budget = 30000L, max_attempt_mult = 100L, distance = "summary"))
   lapply(stats::setNames(methods, methods), function(m) {
     s <- utils::modifyList(defaults[[m]], if (is.null(settings[[m]])) list() else settings[[m]])
     list(
       pre_process = function(daily_cases, ...) list(observed = as.numeric(daily_cases), known = .check_known(info, list(...))),
       run = function(x, ...) switch(m, DE = .fit_de(x$observed, info, x$known, s, unknowns),
                                     NelderMead = .fit_nm(x$observed, info, x$known, s, unknowns),
-                                    .fit_abc(m, x$observed, info, x$known, s, unknowns)),
+                                    .fit_abc(sub("-summary$", "", m), x$observed, info, x$known, s, unknowns, name = m)),
       post_process = function(x, ...) x,
       type = info$model
     ) |> structure(class = "calibrator")
@@ -728,7 +740,7 @@ simulate_window_data <- function(model = c("SEIR", "SIR"), n_sims, output_dir, n
 #' Train an any-length BiLSTM for windows of daily new infections
 #'
 #' Trains one network per seed on data from [simulate_window_data()]: inputs are
-#' random windows of 30 to 365 days inside the informative part of each
+#' random windows of 15 to 365 days inside the informative part of each
 #' epidemic (before the first week without new infections), log(1 + count),
 #' and the known values; outputs are ptran, R0 and the log shares in each state
 #' at the window start. Then simulates `n_calib` more epidemics, cuts one random
@@ -751,14 +763,14 @@ simulate_window_data <- function(model = c("SEIR", "SIR"), n_sims, output_dir, n
 #' @param epochs,lr_schedule,device,resume Passed to
 #'   [train_bilstm_calibrator()]. With `resume = TRUE` a stopped run continues
 #'   from its last epoch.
-#' @param window_min,window_max Range of window lengths (by default 30 days to
+#' @param window_min,window_max Range of window lengths (by default 15 days to
 #'   the simulated length, at most 365).
 #' @param n_calib Number of calibration windows for the R0 range.
 #' @param cores Cores for simulating the calibration windows.
 #' @return Invisibly, `output_dir`.
 #' @export
 train_window_calibrator <- function(data, output_dir, seeds = c(122L, 1L, 2L, 3L, 4L), hyperparameters = NULL,
-                                    epochs = 50L, lr_schedule = "cosine", window_min = 30L, window_max = NULL,
+                                    epochs = 50L, lr_schedule = "cosine", window_min = 15L, window_max = NULL,
                                     n_calib = 100000L, device = "auto", resume = TRUE, cores = 1L) {
   if (is.character(data)) data <- readRDS(file.path(data, "window_data.rds"))
   info <- .window_info(data$model)
@@ -813,7 +825,8 @@ train_window_calibrator <- function(data, output_dir, seeds = c(122L, 1L, 2L, 3L
 #' search by using the same `output_dir`.
 #'
 #' The shipped models' settings come from 40 trials of 20 epochs on 100,000
-#' epidemics.
+#' epidemics, with windows of 30 to 365 days; the shipped networks were then
+#' trained with these settings on windows of 15 to 365 days.
 #'
 #' @param data A `window_data` object from [simulate_window_data()] (or the path
 #'   of its folder).
@@ -825,10 +838,12 @@ train_window_calibrator <- function(data, output_dir, seeds = c(122L, 1L, 2L, 3L
 #' @param lr_max Largest learning rate tried.
 #' @param timeout Optional time limit in seconds.
 #' @param device `"auto"`, `"cpu"` or `"cuda"`.
+#' @param window_min Shortest window length in days (the longest is the
+#'   simulated length, at most 365).
 #' @return The best settings (a list), also saved as `best_params.json`.
 #' @export
 tune_window_calibrator <- function(data, output_dir, n_trials = 40L, epochs = 20L, subset = 100000L, lr_max = 1e-3,
-                                   timeout = NULL, device = "auto") {
+                                   timeout = NULL, device = "auto", window_min = 15L) {
   if (is.character(data)) data <- readRDS(file.path(data, "window_data.rds"))
   info <- .window_info(data$model)
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
@@ -853,7 +868,7 @@ tune_window_calibrator <- function(data, output_dir, n_trials = 40L, epochs = 20
     "--study-dir", output_dir, "--study-name", paste0(tolower(info$model), "_window"),
     "--score-targets", paste(c(rep("R0", length(info$states)), state_targets), collapse = ","),
     "--epochs", as.integer(epochs), "--n-trials", as.integer(n_trials), "--lr-max", lr_max,
-    "--window-min", 30L, "--window-max", min(365L, as.integer(data$n_days)), "--window-stop-zeros", 7L, "--grad-clip", 1,
+    "--window-min", as.integer(window_min), "--window-max", min(365L, as.integer(data$n_days)), "--window-stop-zeros", 7L, "--grad-clip", 1,
     "--incidence-max", 10000,
     "--output-activation", paste(c("sigmoid", "softplus", rep("sigmoid", length(info$states))), collapse = ","),
     "--device", device,

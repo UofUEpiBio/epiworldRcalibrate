@@ -54,6 +54,19 @@ for (method in names(free)) {
 fit_smc <- do.call(calibrate, c(list(cases, free$`ABC-SMC`), known))
 stopifnot(all(is.finite(fit_smc$intervals)))
 
+# ABC on summary statistics instead of the whole curve ---------------------------
+
+s <- epidemic_summary(cases)
+stopifnot(length(s) == 11, all(is.finite(s)), s[["peak_day"]] >= 1, s[["day_25"]] <= s[["day_75"]])
+summ <- window_baselines("SIR", methods = c("ABC-MCMC-summary", "ABC-SMC-summary"), settings = list(
+  `ABC-MCMC-summary` = list(n_samples = 60L, burnin = 30L, n_pilot = 20L),
+  `ABC-SMC-summary` = list(n_particles = 20L, n_generations = 2L)))
+for (method in names(summ)) {
+  fit <- do.call(calibrate, c(list(cases, summ[[method]]), known))
+  stopifnot(fit$method == method, fit$estimate[["R0"]] >= 0.8, fit$estimate[["R0"]] <= 5,
+            all(is.finite(fit$intervals["R0", ])))
+}
+
 # Predictions: model runs and the renewal equation -----------------------------
 
 fit <- do.call(calibrate, c(list(cases, base$DE), known))

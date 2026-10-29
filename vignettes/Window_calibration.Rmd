@@ -13,7 +13,7 @@ knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
 
 # What this is for
 
-You have a run of **daily new infections** (a *window*, 30 to 365 days long, from any part of
+You have a run of **daily new infections** (a *window*, 15 to 365 days long, from any part of
 an epidemic) and you know the population size `n`, the recovery rate `recov` and, for the SEIR
 model, the incubation period `incub` (days). You want R0, the state of the epidemic on the
 first day of the window (how many people are exposed, infectious and recovered), and a

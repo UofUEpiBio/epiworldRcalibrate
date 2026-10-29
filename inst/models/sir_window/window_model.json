@@ -11,9 +11,9 @@
     "dropout": 0.282453926335454
   },
   "lr_schedule": "cosine",
-  "window_min": 30,
+  "window_min": 15,
   "window_max": 365,
-  "n_calib": 97754,
+  "n_calib": 99942,
   "priors": {
     "n": [5000, 10000],
     "recov": [0.071, 0.25],

@@ -31,7 +31,7 @@ A `calibrator`; [calibrate()] returns a `window_fit`.
 \description{
 Estimates R0, ptran, crate and the state on the first day of the window (the
 shares exposed, infectious and recovered) from a window of daily new
-infectious people of any length (30 to 365 days for the shipped models) from
+infectious people of any length (15 to 365 days for the shipped models) from
 any part of an epidemic. The package ships one SEIR and one SIR model, each
 the average of 5 networks trained on 1,000,000 noise-free simulated
 epidemics of `ModelSEIRCONN` / `ModelSIRCONN`. Only R0 = ptran x crate /

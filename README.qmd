@@ -64,7 +64,7 @@ See [USER_GUIDE.md](USER_GUIDE.md) for complete examples.
 ## Calibrating a window of daily infections (SEIR or SIR)
 
 The package ships trained BiLSTM calibrators for windows of daily new
-infections (30 to 365 days, from any part of an epidemic) of
+infections (15 to 365 days, from any part of an epidemic) of
 `epiworldR::ModelSEIRCONN` and `ModelSIRCONN`:
 
 ``` r

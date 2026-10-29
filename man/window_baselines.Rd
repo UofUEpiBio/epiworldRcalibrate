@@ -14,7 +14,8 @@ window_baselines(
 \arguments{
 \item{model}{`"SEIR"` or `"SIR"`.}
 
-\item{methods}{Which methods.}
+\item{methods}{Which methods: any of `"ABC-MCMC"`, `"ABC-SMC"`, `"DE"`,
+`"NelderMead"`, `"ABC-MCMC-summary"` and `"ABC-SMC-summary"`.}
 
 \item{settings}{Optional named list of settings per method, for example
 `list(DE = list(itermax = 50), NelderMead = list(maxit = 1000))`: passed to
@@ -61,6 +62,15 @@ Default settings (change them with `settings`):
     started at the middle of the ranges (values outside are rejected); it
     stops when its trial points give fits within 1.5e-8 of each other, or
     after 500 runs. Same fit as DE.}
+  \item{ABC-MCMC-summary, ABC-SMC-summary}{The same ABC methods, comparing
+    summary statistics of the curves ([epidemic_summary()]: mean, peak,
+    minimum, peak day, first and last week, the days by which 25\%, 50\% and
+    75\% of the cases happened, growth at the start and the end) instead of
+    the whole curve, each statistic scaled by its spread over simulations
+    from the prior. ABC-MCMC-summary first runs 200 prior simulations for
+    the scales and takes as its tolerance the 5\% quantile of their
+    distances; ABC-SMC-summary takes the scales from its first generation.
+    Not in the default `methods`.}
 }
 }
 \examples{

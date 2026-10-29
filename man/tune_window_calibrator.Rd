@@ -12,7 +12,8 @@ tune_window_calibrator(
   subset = 100000L,
   lr_max = 0.001,
   timeout = NULL,
-  device = "auto"
+  device = "auto",
+  window_min = 15L
 )
 }
 \arguments{
@@ -33,6 +34,9 @@ of its folder).}
 \item{timeout}{Optional time limit in seconds.}
 
 \item{device}{`"auto"`, `"cpu"` or `"cuda"`.}
+
+\item{window_min}{Shortest window length in days (the longest is the
+simulated length, at most 365).}
 }
 \value{
 The best settings (a list), also saved as `best_params.json`.
@@ -48,5 +52,6 @@ search by using the same `output_dir`.
 }
 \details{
 The shipped models' settings come from 40 trials of 20 epochs on 100,000
-epidemics.
+epidemics, with windows of 30 to 365 days; the shipped networks were then
+trained with these settings on windows of 15 to 365 days.
 }

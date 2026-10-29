@@ -16,7 +16,7 @@
   "num_layers": 2,
   "dropout": 0.282453926335454,
   "epochs": 50,
-  "best_epoch": 46,
+  "best_epoch": 50,
   "batch_size": 32,
   "learning_rate": 0.000794384841818199,
   "seed": 3,
@@ -35,7 +35,7 @@
   "lr_schedule": "cosine",
   "variable_length": true,
   "window_stop_zeros": 7,
-  "window_min": 30,
+  "window_min": 15,
   "window_max": 365,
   "state_targets": [
     "log_infected_share",

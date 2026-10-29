@@ -11,7 +11,7 @@ train_window_calibrator(
   hyperparameters = NULL,
   epochs = 50L,
   lr_schedule = "cosine",
-  window_min = 30L,
+  window_min = 15L,
   window_max = NULL,
   n_calib = 100000L,
   device = "auto",
@@ -36,7 +36,7 @@ shipped models' settings.}
 [train_bilstm_calibrator()]. With `resume = TRUE` a stopped run continues
 from its last epoch.}
 
-\item{window_min, window_max}{Range of window lengths (by default 30 days to
+\item{window_min, window_max}{Range of window lengths (by default 15 days to
 the simulated length, at most 365).}
 
 \item{n_calib}{Number of calibration windows for the R0 range.}
@@ -48,7 +48,7 @@ Invisibly, `output_dir`.
 }
 \description{
 Trains one network per seed on data from [simulate_window_data()]: inputs are
-random windows of 30 to 365 days inside the informative part of each
+random windows of 15 to 365 days inside the informative part of each
 epidemic (before the first week without new infections), log(1 + count),
 and the known values; outputs are ptran, R0 and the log shares in each state
 at the window start. Then simulates `n_calib` more epidemics, cuts one random
