@@ -1,0 +1,26 @@
+\begin{tabular}{lrr}
+\toprule
+ & SEIR & SIR \\
+\midrule
+\multicolumn{3}{l}{\textit{Calibrating one window (seconds, one CPU core)}} \\
+DeepIMC, first call (starts Python, loads networks) & 9.6 & 6.3 \\
+DeepIMC, one window & 0.150 & 0.082 \\
+DeepIMC, 10 windows in one pass, per window & 0.127 & 0.084 \\
+ABC-MCMC & 194.0 & 84.4 \\
+ABC-SMC & 344.4 & 124.9 \\
+DE & 588.3 & 163.3 \\
+Nelder--Mead & 9.8 & 3.0 \\
+\midrule
+\multicolumn{3}{l}{\textit{From a fit to a 95\% band (seconds per window)}} \\
+500 runs of the agent-based model & 38.3 & 12.7 \\
+Renewal equation & 0.203 & 0.123 \\
+\midrule
+\multicolumn{3}{l}{\textit{One-time cost of DeepIMC (CPU)}} \\
+Simulating 1,000,000 training epidemics (CPU-hours) & 27.2 & 13.5 \\
+Estimates for 100,000 calibration windows (hours, 1 core) & 1.4 & 0.2 \\
+Training one network, 50 epochs (hours, 16 cores, estimated) & 85.7 & 26.8 \\
+\midrule
+\multicolumn{3}{l}{\textit{For reference: training as done, on GPUs}} \\
+Training one network, 50 epochs (hours, one GPU) & 5.8--11.4 & 2.7--9.9 \\
+\bottomrule
+\end{tabular}

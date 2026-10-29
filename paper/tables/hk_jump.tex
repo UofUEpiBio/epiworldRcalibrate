@@ -1,0 +1,20 @@
+\begin{tabular}{lrrr}
+\toprule
+ & \multicolumn{3}{c}{Windows that \ldots\ the jump} \\
+\cmidrule(lr){2-4}
+ & end before & contain & start after \\
+\midrule
+Windows (both models) & 4 & 14 & 6 \\
+Not reproduced (\%) & 25 & 100 & 0 \\
+\midrule
+\multicolumn{4}{l}{\textit{WIS in the window}} \\
+DeepIMC & 1.88 & 24.16 & 0.96 \\
+DeepIMC, weighted & 1.42 & 20.47 & \textbf{0.67} \\
+DeepIMC, 20\%, weighted & 1.40 & 12.94 & 0.68 \\
+DeepIMC, 50\%, weighted & \textbf{1.33} & 9.40 & 0.80 \\
+ABC-MCMC & 13.30 & 26.32 & 9.49 \\
+ABC-SMC & 2.00 & 10.04 & 1.06 \\
+DE & 1.57 & \textbf{8.86} & 0.77 \\
+Nelder--Mead & 2.48 & 10.86 & 0.89 \\
+\bottomrule
+\end{tabular}

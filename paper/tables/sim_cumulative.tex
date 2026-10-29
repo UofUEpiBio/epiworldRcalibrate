@@ -1,0 +1,21 @@
+\begin{tabular}{llrrrrrr}
+\toprule
+ &  & \multicolumn{3}{c}{Window} & \multicolumn{3}{c}{Next 14 days} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}
+Model & Method & Cov. (\%) & Rel.\ MAE (\%) & WIS & Cov. (\%) & Rel.\ MAE (\%) & WIS \\
+\midrule
+SEIR & DeepIMC & \textbf{98.9} & 3.5 & 36.8 & \textbf{97.7} & 6.2 & 46.8 \\
+ & DeepIMC, weighted & 99.4 & \textbf{1.9} & \textbf{23.7} & 98.6 & \textbf{2.9} & \textbf{27.6} \\
+ & ABC-MCMC & 99.3 & 90.4 & 390.8 & 98.1 & 174.7 & 550.2 \\
+ & ABC-SMC & 99.8 & 10.8 & 150.2 & 99.3 & 18.4 & 201.7 \\
+ & DE & 77.9 & 3.2 & 35.4 & 61.3 & 5.2 & 49.5 \\
+ & Nelder--Mead & 38.6 & 14.3 & 168.8 & 34.5 & 31.2 & 231.3 \\
+\midrule
+SIR & DeepIMC & \textbf{99.1} & 8.9 & 48.0 & \textbf{98.4} & 13.0 & 55.7 \\
+ & DeepIMC, weighted & 99.6 & \textbf{2.3} & \textbf{23.4} & 98.8 & \textbf{3.2} & \textbf{24.8} \\
+ & ABC-MCMC & 99.3 & 71.1 & 451.1 & 99.5 & 131.4 & 604.4 \\
+ & ABC-SMC & 99.6 & 20.4 & 190.6 & 99.6 & 26.7 & 230.6 \\
+ & DE & 82.9 & 5.4 & 28.5 & 68.3 & 27.9 & 38.3 \\
+ & Nelder--Mead & 56.6 & 10.3 & 101.9 & 48.7 & 18.4 & 129.4 \\
+\bottomrule
+\end{tabular}

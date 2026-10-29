@@ -1,0 +1,23 @@
+\begin{tabular}{llrrrrrrrrr}
+\toprule
+ &  & \multicolumn{4}{c}{$R_0$ MAE} & \multicolumn{2}{c}{95\% range of $R_0$} & $p_{tran}$ & $c_{rate}$ & State \\
+\cmidrule(lr){3-6}\cmidrule(lr){7-8}
+Model & Method & all & early & middle & late & has true (\%) & width & MAE & MAE & error \\
+\midrule
+SEIR & DeepIMC & \textbf{0.19} & \textbf{0.14} & \textbf{0.17} & \textbf{0.27} & 96.2 & 0.98 & 0.0148 & 2.58 & 1.5 \\
+ & DeepIMC, weighted & 0.19 & 0.14 & 0.17 & 0.27 & 96.2 & 0.98 & 0.0148 & 2.58 & \textbf{1.2} \\
+ & ABC-MCMC & 0.88 & 0.75 & 0.88 & 1.00 & 94.8 & 3.56 & 0.0202 & 2.51 & 9.0 \\
+ & ABC-SMC & 0.61 & 0.37 & 0.61 & 0.85 & 97.1 & 2.98 & 0.0178 & 2.51 & 5.0 \\
+ & DE & 0.63 & 0.27 & 0.67 & 0.96 & -- & -- & 0.0190 & 2.51 & 4.3 \\
+ & Nelder--Mead & 0.93 & 0.52 & 0.99 & 1.28 & -- & -- & 0.0222 & 2.51 & 9.7 \\
+ & \textit{guess knowing $R_0$} &  &  &  &  &  &  & 0.0140 & 2.51 &  \\
+\midrule
+SIR & DeepIMC & \textbf{0.19} & \textbf{0.12} & \textbf{0.17} & \textbf{0.28} & 96.6 & 0.93 & 0.0709 & 1.05 & 2.7 \\
+ & DeepIMC, weighted & 0.19 & 0.12 & 0.17 & 0.28 & 96.6 & 0.93 & 0.0709 & 1.05 & \textbf{2.2} \\
+ & ABC-MCMC & 0.84 & 0.72 & 0.86 & 0.95 & 96.0 & 3.45 & 0.0842 & 1.01 & 14.1 \\
+ & ABC-SMC & 0.54 & 0.27 & 0.49 & 0.85 & 97.3 & 2.78 & 0.0778 & 1.01 & 7.3 \\
+ & DE & 0.49 & 0.23 & 0.49 & 0.76 & -- & -- & 0.0772 & 1.01 & 5.4 \\
+ & Nelder--Mead & 0.92 & 0.36 & 1.05 & 1.36 & -- & -- & 0.0950 & 1.01 & 11.9 \\
+ & \textit{guess knowing $R_0$} &  &  &  &  &  &  & 0.0734 & 1.01 &  \\
+\bottomrule
+\end{tabular}

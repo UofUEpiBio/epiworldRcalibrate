@@ -1,0 +1,53 @@
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Dataset & Model & DeepIMC & DeepIMC, weighted & DeepIMC, 20\%, weighted & DeepIMC, 50\%, weighted & ABC-MCMC & ABC-SMC & DE & Nelder--Mead \\
+\midrule
+\multicolumn{10}{l}{\textit{Coverage of the observed counts in the window (\%)}} \\
+Hong Kong SARS 2003 (12) & SEIR & 77 & 78 & 80 & 75 & \textbf{93} & 92 & 70 & 63 \\
+ & SIR & 90 & 83 & 83 & 79 & 100 & \textbf{95} & 75 & 66 \\
+Canada SARS 2003 (12) & SEIR & 98 & 96 & 96 & \textbf{95} & 98 & 100 & 93 & 79 \\
+ & SIR & 98 & 96 & 96 & \textbf{95} & 100 & 100 & 91 & 86 \\
+South Korea MERS 2015 (6) & SEIR & \textbf{95} & 87 & 88 & 90 & 99 & 100 & 88 & 76 \\
+ & SIR & 84 & 84 & 86 & 87 & 100 & \textbf{99} & 84 & 80 \\
+Kosovo smallpox 1972 (6) & SEIR & 88 & 86 & 86 & 85 & \textbf{94} & 100 & 83 & 73 \\
+ & SIR & 98 & 90 & 88 & 88 & 100 & \textbf{96} & 78 & 83 \\
+Pennsylvania influenza 2009 (6) & SEIR & 100 & 94 & 90 & 89 & \textbf{96} & 99 & 86 & 57 \\
+ & SIR & 98 & 91 & 91 & \textbf{92} & 100 & 100 & 87 & 91 \\
+Hagelloch measles 1861 (9) & SEIR & 86 & 83 & 86 & 88 & 99 & \textbf{97} & 90 & 73 \\
+ & SIR & 91 & 89 & 90 & 88 & 100 & \textbf{96} & 85 & 81 \\
+Kikwit Ebola 1995 (18) & SEIR & 99 & 95 & \textbf{95} & 93 & 94 & 100 & 93 & 81 \\
+ & SIR & 99 & 92 & 93 & \textbf{94} & 100 & 99 & 91 & 91 \\
+\midrule
+\multicolumn{10}{l}{\textit{WIS in the window}} \\
+Hong Kong SARS 2003 (12) & SEIR & 21.98 & 18.44 & 9.73 & 5.99 & 22.06 & 6.64 & \textbf{5.73} & 7.13 \\
+ & SIR & 7.32 & 6.26 & 6.18 & 5.82 & 17.83 & 6.26 & \textbf{5.51} & 6.81 \\
+Canada SARS 2003 (12) & SEIR & 0.92 & \textbf{0.86} & 0.87 & 0.88 & 13.69 & 1.33 & 0.88 & 1.35 \\
+ & SIR & 1.07 & 0.89 & 0.89 & \textbf{0.88} & 8.27 & 1.08 & 1.29 & 1.07 \\
+South Korea MERS 2015 (6) & SEIR & 1.49 & 1.46 & 1.43 & 1.44 & 21.48 & 4.24 & \textbf{1.36} & 2.08 \\
+ & SIR & 2.98 & 1.85 & 1.73 & \textbf{1.51} & 13.36 & 1.99 & 1.72 & 2.23 \\
+Kosovo smallpox 1972 (6) & SEIR & 1.52 & 1.51 & \textbf{1.45} & 1.46 & 13.48 & 1.93 & 1.50 & 2.00 \\
+ & SIR & 2.32 & 1.44 & 1.45 & 1.43 & 19.90 & \textbf{1.21} & 1.78 & 1.81 \\
+Pennsylvania influenza 2009 (6) & SEIR & 1.93 & \textbf{1.48} & 1.51 & 1.54 & 17.01 & 1.68 & 1.86 & 3.31 \\
+ & SIR & 1.89 & 1.68 & 1.66 & \textbf{1.62} & 5.20 & 2.03 & 1.72 & 1.74 \\
+Hagelloch measles 1861 (9) & SEIR & 2.39 & 1.96 & 1.48 & 1.36 & 13.14 & 1.44 & \textbf{1.33} & 1.93 \\
+ & SIR & 1.92 & 1.39 & 1.36 & 1.33 & 10.13 & \textbf{1.28} & 1.46 & 1.84 \\
+Kikwit Ebola 1995 (18) & SEIR & 1.67 & \textbf{0.77} & 0.93 & 0.79 & 16.09 & 1.43 & 0.83 & 1.05 \\
+ & SIR & 1.96 & 0.86 & 0.82 & \textbf{0.80} & 9.33 & 2.48 & 1.85 & 0.91 \\
+\midrule
+\multicolumn{10}{l}{\textit{WIS in the next 14 days}} \\
+Hong Kong SARS 2003 (12) & SEIR & 57.07 & 52.58 & 47.43 & \textbf{12.84} & 17.07 & 14.37 & 13.79 & 23.14 \\
+ & SIR & 19.71 & 15.94 & 14.09 & 10.19 & 11.84 & 11.80 & \textbf{8.55} & 13.22 \\
+Canada SARS 2003 (12) & SEIR & 2.61 & 2.38 & 2.25 & 1.57 & 12.55 & 2.41 & \textbf{1.33} & 4.75 \\
+ & SIR & \textbf{1.33} & 1.33 & 1.44 & 1.38 & 6.94 & 2.90 & 7.66 & 1.42 \\
+South Korea MERS 2015 (6) & SEIR & 3.58 & 3.62 & 3.22 & \textbf{2.87} & 25.30 & 9.20 & 3.99 & 5.44 \\
+ & SIR & 3.75 & 2.65 & \textbf{2.61} & 2.86 & 18.82 & 5.96 & 8.81 & 9.25 \\
+Kosovo smallpox 1972 (6) & SEIR & 4.19 & 3.66 & 2.70 & 2.47 & 16.11 & 2.85 & \textbf{2.31} & 4.64 \\
+ & SIR & 4.56 & 2.92 & 2.42 & 2.46 & 16.55 & \textbf{1.90} & 8.21 & 10.04 \\
+Pennsylvania influenza 2009 (6) & SEIR & 17.11 & 14.78 & 11.35 & 6.05 & 14.20 & 7.48 & 18.75 & \textbf{3.01} \\
+ & SIR & 1.82 & 1.49 & 1.76 & \textbf{1.49} & 10.07 & 7.50 & 5.63 & 2.66 \\
+Hagelloch measles 1861 (9) & SEIR & 18.39 & 12.30 & 5.03 & \textbf{2.00} & 16.03 & 3.49 & 3.02 & 5.30 \\
+ & SIR & 2.50 & 2.15 & 2.09 & \textbf{1.87} & 13.89 & 3.00 & 2.50 & 5.48 \\
+Kikwit Ebola 1995 (18) & SEIR & 2.49 & 1.26 & 2.62 & \textbf{0.84} & 11.95 & 2.22 & 1.70 & 1.83 \\
+ & SIR & 1.89 & 1.25 & \textbf{0.77} & 0.90 & 8.10 & 3.17 & 12.82 & 3.45 \\
+\bottomrule
+\end{tabular}

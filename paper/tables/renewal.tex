@@ -1,0 +1,15 @@
+\begin{tabular}{llrrrrrrrr}
+\toprule
+ &  & State & \multicolumn{2}{c}{New infections} & \multicolumn{2}{c}{Currently infectious} & \multicolumn{2}{c}{Next 14 days} & Seconds \\
+\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+Model & Curves from & error & Cov. & MAE & Cov. & MAE & Cov. & MAE & per window \\
+\midrule
+SEIR & model, 500 runs & 1.5 & 98.1 & 4.8 & 98.4 & 17.9 & 98.8 & 1.8 & 21.0 \\
+ & renewal A & 1.5 & 97.5 & 5.0 & 89.2 & 19.0 & 98.3 & 1.8 & 0.88 \\
+ & renewal B & 2.1 & 96.6 & 4.3 & 38.5 & 24.1 & 97.2 & 1.7 & 19.6 \\
+\midrule
+SIR & model, 500 runs & 2.7 & 98.8 & 6.2 & 98.7 & 35.1 & 99.1 & 1.0 & 7.8 \\
+ & renewal A & 2.7 & 96.5 & 7.7 & 88.5 & 41.0 & 98.2 & 1.0 & 0.50 \\
+ & renewal B & 3.2 & 95.5 & 5.2 & 48.8 & 41.4 & 97.6 & 0.9 & 5.10 \\
+\bottomrule
+\end{tabular}

@@ -1,0 +1,15 @@
+\begin{tabular}{llrrrrrr}
+\toprule
+ &  & \multicolumn{4}{c}{1,000 simulated windows} & \multicolumn{2}{c}{Real data (window)} \\
+\cmidrule(lr){3-6}\cmidrule(lr){7-8}
+Model & Method & $R_0$ MAE & State error & MAE, new inf. & Cov., infectious (\%) & Cov. (\%) & MAE \\
+\midrule
+SEIR & DeepIMC & 0.20 & 1.5 & 4.8 & 98.2 & -- & -- \\
+ & DE & 0.73 & 4.6 & 4.7 & 77.4 & 80.9 & 9.4 \\
+ & DE, new seed per run & 0.71 & 4.6 & 4.7 & 76.4 & 81.0 & 9.3 \\
+\midrule
+SIR & DeepIMC & 0.19 & 2.6 & 6.5 & 98.3 & -- & -- \\
+ & DE & 0.55 & 6.1 & 6.0 & 71.5 & 79.2 & 10.0 \\
+ & DE, new seed per run & 0.53 & 5.8 & 6.0 & 73.1 & 79.2 & 10.7 \\
+\bottomrule
+\end{tabular}

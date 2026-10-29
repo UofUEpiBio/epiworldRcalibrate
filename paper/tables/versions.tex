@@ -1,0 +1,17 @@
+\begin{tabular}{lllrrrrrrr}
+\toprule
+ &  & Trained & \multicolumn{3}{c}{61-day windows from the beginning} & \multicolumn{3}{c}{Windows of 30--365 days} & 15 days \\
+\cmidrule(lr){4-6}\cmidrule(lr){7-9}\cmidrule(lr){10-10}
+Model & Version & on (days) & $R_0$ & $p_{tran}$ & $c_{rate}$ & $R_0$ & $p_{tran}$ & $c_{rate}$ & $R_0$ \\
+\midrule
+SEIR & Current & 30--365 & 0.121 & 0.0145 & 2.58 & 0.223 & 0.0141 & 2.56 & -- \\
+ & Tuned & 30--365 & 0.118 & 0.0147 & 2.60 & 0.225 & 0.0141 & 2.57 & -- \\
+ & Final & 30--365 & 0.107 & 0.0145 & 2.59 & 0.218 & 0.0141 & 2.57 & -- \\
+ & Final & 15--365 & 0.109 & 0.0145 & 2.58 & 0.216 & 0.0141 & 2.56 & 0.734 \\
+\midrule
+SIR & Current & 30--365 & 0.109 & 0.0483 & 1.06 & 0.192 & 0.0524 & 1.05 & -- \\
+ & Tuned & 30--365 & 0.106 & 0.0490 & 1.08 & 0.195 & 0.0532 & 1.07 & -- \\
+ & Final & 30--365 & 0.098 & 0.0486 & 1.07 & 0.189 & 0.0527 & 1.06 & -- \\
+ & Final & 15--365 & 0.101 & 0.0489 & 1.07 & 0.186 & 0.0528 & 1.06 & 0.466 \\
+\bottomrule
+\end{tabular}

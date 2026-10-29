@@ -1,0 +1,76 @@
+% DeepIMC network (the shipped SEIR and SIR models). Needs tikz with the positioning and arrows.meta
+% libraries. \input inside a figure environment.
+\begin{tikzpicture}[
+  font=\sffamily\small, >=Latex, line width=0.6pt,
+  box/.style={draw, rounded corners=6pt, align=center, inner sep=4pt},
+  inp/.style={box, fill=violet!8, minimum width=3.2cm},
+  fwd/.style={box, fill=teal!18, minimum width=2.1cm, minimum height=0.95cm},
+  bwd/.style={box, fill=violet!18, minimum width=2.1cm, minimum height=0.95cm},
+  catbox/.style={box, fill=orange!30, minimum width=3.6cm, minimum height=1.6cm},
+  fcbox/.style={box, fill=red!20, minimum width=2.4cm, minimum height=1.6cm},
+  outbox/.style={box, fill=violet!8, minimum width=2.6cm},
+  der/.style={box, fill=cyan!20, minimum width=3.0cm},
+  lab/.style={font=\sffamily\bfseries\small}
+]
+% Inputs
+\node[inp] (inc) at (0, 2.6) {Daily new infections\\ window of $L$ days\\ ($30 \le L \le 365$)\\[1pt] {\footnotesize $\log(1+x_t)/\log(1+10^4)$}};
+\node[inp] (known) at (0, -1.0) {Known values\\ $n$: population size\\ $recov$: recovery rate\\ $incub$: latent period (SEIR)};
+
+% BiLSTM stack
+\node[fwd] (f1) at (4.9, 2.6) {LSTM (fwd)\\ $\longrightarrow$};
+\node[bwd] (b1) at (7.5, 2.6) {LSTM (bwd)\\ $\longleftarrow$};
+\node[fwd] (f2) at (4.9, 1.1) {LSTM (fwd)\\ $\longrightarrow$};
+\node[bwd] (b2) at (7.5, 1.1) {LSTM (bwd)\\ $\longleftarrow$};
+\node[fwd, dashed] (f3) at (4.9, -0.4) {LSTM (fwd)\\ $\longrightarrow$};
+\node[bwd, dashed] (b3) at (7.5, -0.4) {LSTM (bwd)\\ $\longleftarrow$};
+\node[font=\sffamily\footnotesize, anchor=east] at (3.55, 2.6) {layer 1};
+\node[font=\sffamily\footnotesize, anchor=east] at (3.55, 1.1) {layer 2};
+\node[font=\sffamily\footnotesize, anchor=east, align=right] at (3.55, -0.4) {layer 3\\ (SEIR)};
+\draw[rounded corners=10pt] (3.65, -1.25) rectangle (8.75, 3.45);
+\node[lab, align=center] at (6.2, 5.35) {Bidirectional LSTM};
+\node[font=\sffamily\footnotesize, align=center] at (6.2, 4.85) {SEIR: 3 layers $\times$ 128 units, dropout 0.13 \quad SIR: 2 layers $\times$ 64 units, dropout 0.28};
+\foreach \a/\b in {f1/f2, f2/f3, b1/b2, b2/b3} \draw[->] (\a) -- (\b);
+
+% Input routing (both directions read the whole window)
+\draw[->] (inc.north) -- ++(0, 0.85) -| (f1.north);
+\draw[->] (inc.north) ++(0, 0.85) -| (b1.north);
+
+% Final states and known values to the concatenation
+\node[catbox] (cat) at (11.6, 0.9) {\textbf{CONCAT}\\ final states $h_{\rightarrow}$, $h_{\leftarrow}$\\ + known values\\ {\footnotesize SEIR $256+3$, SIR $128+2$}};
+\draw[->] (f3.south) -- ++(0, -0.45) -| ([xshift=-6pt]cat.south);
+\draw (b3.south) -- ++(0, -0.45);
+\draw[->] (known.south) -- ++(0, -0.55) -| ([xshift=6pt]cat.south);
+
+% Dense layers
+\node[fcbox] (fc1) at (15.1, 0.9) {\textbf{Linear (fc1)}\\ $\to 64$\\ ReLU};
+\node[fcbox] (fc2) at (18.2, 0.9) {\textbf{Linear (fc2)}\\ $64 \to 5$ (SEIR)\\ $64 \to 4$ (SIR)};
+\draw[->] (cat) -- (fc1);
+\draw[->] (fc1) -- node[above, font=\sffamily\footnotesize\itshape] {64} (fc2);
+
+% Outputs
+\node[outbox] (o1) at (23.2, 2.9) {sigmoid\\ $(0,1)$};
+\node[lab, above=1pt of o1] {Transmission prob.\ $p_{tran}$};
+\node[outbox] (o2) at (23.2, 0.9) {softplus\\ $>0$};
+\node[lab, above=1pt of o2] {$R_0$};
+\node[outbox] (o3) at (23.2, -1.3) {sigmoid, scaled\\ log shares};
+\node[lab, above=1pt of o3, align=center] {State on day 1 of the window};
+\node[font=\sffamily\footnotesize, below=1pt of o3, align=center] {exposed (SEIR), infectious, recovered};
+\draw (fc2.east) -- ++(0.5, 0) coordinate (split);
+\foreach \o in {o1, o2, o3} \draw[->] (split) |- (\o.west);
+
+% Derived quantity
+\node[der] (crate) at (29.6, 1.9) {\textbf{Epidemiological information}\\ \textit{(built in as an exact constraint)}\\[3pt]
+  $R_0 = \dfrac{c_{rate} \times p_{tran}}{recov}$\\[6pt] $\Rightarrow\ c_{rate} = \dfrac{R_0 \times recov}{p_{tran}}$};
+\node[lab, above=1pt of crate] {Contact rate $c_{rate}$};
+\draw[->, dashed] (o1.east) -- ++(1.1, 0) |- ([yshift=10pt]crate.west);
+\draw[->, dashed] (o2.east) -- ++(1.1, 0) |- ([yshift=-10pt]crate.west);
+
+% Legend
+\begin{scope}[shift={(0.2, -3.5)}, every node/.style={font=\sffamily\small}]
+  \foreach \c/\t/\x in {teal!18/Forward LSTM/0, violet!18/Backward LSTM/4.4, orange!30/Concatenate/9.0,
+                        red!20/Fully connected/13.2, cyan!20/Epidemiological constraint/17.8} {
+    \draw[rounded corners=4pt, fill=\c] (\x, -0.22) rectangle ++(1.0, 0.44);
+    \node[anchor=west] at (\x + 1.15, 0) {\t};
+  }
+\end{scope}
+\end{tikzpicture}

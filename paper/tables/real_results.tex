@@ -1,0 +1,47 @@
+\begin{tabular}{llrrrrrrrrrr}
+\toprule
+Dataset & Model & DeepIMC & DeepIMC, 20\% & DeepIMC, 50\% & DeepIMC, weighted & DeepIMC, 20\%, weighted & DeepIMC, 50\%, weighted & ABC-MCMC & ABC-SMC & DE & Nelder--Mead \\
+\midrule
+\multicolumn{12}{l}{\textit{Coverage of the observed counts (\%)}} \\
+Utah COVID-19 admissions (45) & SEIR & 80 & 79 & 74 & 77 & 77 & 73 & 96 & \textbf{96} & 78 & 64 \\
+ & SIR & 74 & 74 & 74 & 74 & 73 & 74 & \textbf{95} & 94 & 77 & 68 \\
+Utah influenza admissions (36) & SEIR & 100 & 99 & 98 & 99 & 98 & 97 & 92 & 100 & \textbf{96} & 42 \\
+ & SIR & 97 & 98 & 98 & 97 & 97 & 96 & \textbf{94} & 100 & 86 & 89 \\
+Baltimore influenza 1918 (12) & SEIR & 91 & 82 & 67 & 79 & 72 & 57 & \textbf{95} & 94 & 68 & 48 \\
+ & SIR & 84 & 86 & 72 & 82 & 81 & 68 & 92 & \textbf{95} & 75 & 52 \\
+Hong Kong SARS 2003 (12) & SEIR & 77 & 81 & 82 & 78 & 80 & 75 & \textbf{93} & 92 & 70 & 63 \\
+ & SIR & 90 & 91 & 87 & 83 & 83 & 79 & 100 & \textbf{95} & 75 & 66 \\
+Sierra Leone Ebola 2014-15 (18) & SEIR & 81 & 79 & 78 & 77 & 75 & 73 & 98 & \textbf{96} & 74 & 61 \\
+ & SIR & 84 & 84 & 82 & 78 & 78 & 76 & \textbf{98} & 98 & 76 & 65 \\
+Utah COVID-19 cases$^\dagger$ (48) & SEIR & 93 & \textbf{95} & 97 & 94 & 94 & 96 & 99 & 100 & 90 & 79 \\
+ & SIR & 98 & 98 & 97 & 97 & 97 & \textbf{96} & 100 & 100 & 89 & 84 \\
+\midrule
+\multicolumn{12}{l}{\textit{MAE of the median curve}} \\
+Utah COVID-19 admissions (45) & SEIR & 14.1 & 14.6 & 17.2 & 12.1 & 12.5 & 14.2 & 38.3 & 15.9 & \textbf{10.5} & 14.5 \\
+ & SIR & 17.5 & 17.4 & 17.4 & 15.4 & 15.3 & 15.3 & 36.3 & 19.7 & \textbf{12.1} & 15.1 \\
+Utah influenza admissions (36) & SEIR & 2.4 & 2.3 & 2.4 & 2.1 & \textbf{2.1} & 2.1 & 21.4 & 6.0 & 2.3 & 3.4 \\
+ & SIR & 2.6 & 2.6 & 2.5 & 2.4 & 2.4 & \textbf{2.3} & 12.4 & 3.8 & 2.4 & 2.4 \\
+Baltimore influenza 1918 (12) & SEIR & 33.1 & 35.5 & 36.3 & 32.4 & 32.8 & 35.2 & 66.1 & 32.1 & \textbf{30.7} & 37.4 \\
+ & SIR & 33.0 & 30.2 & 35.4 & 30.3 & \textbf{29.2} & 33.4 & 64.4 & 42.7 & 29.6 & 43.9 \\
+Hong Kong SARS 2003 (12) & SEIR & 32.8 & 18.8 & 8.8 & 28.1 & 15.1 & 8.6 & 31.8 & 12.9 & \textbf{8.2} & 9.7 \\
+ & SIR & 12.5 & 10.7 & 9.0 & 9.6 & 9.3 & 8.6 & 17.8 & 10.1 & \textbf{8.2} & 9.6 \\
+Sierra Leone Ebola 2014-15 (18) & SEIR & 9.1 & 9.7 & 10.5 & 8.1 & 8.8 & 9.6 & 27.3 & 14.9 & \textbf{7.7} & 9.6 \\
+ & SIR & 9.9 & 10.1 & 10.3 & 9.1 & 9.1 & 9.4 & 31.7 & 21.5 & \textbf{8.1} & 10.3 \\
+Utah COVID-19 cases$^\dagger$ (48) & SEIR & 6.5 & 4.7 & 2.9 & 4.9 & 3.2 & \textbf{2.5} & 22.7 & 3.4 & 2.7 & 3.6 \\
+ & SIR & 3.7 & 3.3 & 3.2 & 3.0 & 2.8 & \textbf{2.7} & 8.2 & 3.1 & 3.4 & 4.0 \\
+\midrule
+\multicolumn{12}{l}{\textit{Weighted interval score (WIS)}} \\
+Utah COVID-19 admissions (45) & SEIR & 9.3 & 9.8 & 12.1 & 7.9 & 8.3 & 9.8 & 23.2 & 9.5 & \textbf{6.4} & 10.1 \\
+ & SIR & 12.2 & 12.1 & 12.1 & 10.2 & 10.1 & 10.0 & 28.0 & 11.6 & \textbf{7.6} & 10.3 \\
+Utah influenza admissions (36) & SEIR & 1.4 & 1.4 & 1.4 & 1.2 & 1.1 & \textbf{1.1} & 16.6 & 3.4 & 1.2 & 2.8 \\
+ & SIR & 1.5 & 1.5 & 1.4 & 1.3 & 1.3 & \textbf{1.2} & 12.1 & 3.6 & 1.6 & 1.4 \\
+Baltimore influenza 1918 (12) & SEIR & 20.5 & 22.6 & 25.9 & 21.4 & 22.1 & 26.3 & 40.7 & \textbf{18.8} & 22.3 & 30.6 \\
+ & SIR & 20.8 & \textbf{19.5} & 25.0 & 20.0 & 19.6 & 24.1 & 42.9 & 24.5 & 20.6 & 36.7 \\
+Hong Kong SARS 2003 (12) & SEIR & 22.0 & 12.1 & 5.8 & 18.4 & 9.7 & 6.0 & 22.1 & 6.6 & \textbf{5.7} & 7.1 \\
+ & SIR & 7.3 & 6.4 & 5.8 & 6.3 & 6.2 & 5.8 & 17.8 & 6.3 & \textbf{5.5} & 6.8 \\
+Sierra Leone Ebola 2014-15 (18) & SEIR & 5.6 & 6.3 & 7.2 & 5.0 & 5.8 & 6.6 & 16.5 & 7.4 & \textbf{4.8} & 6.7 \\
+ & SIR & 6.4 & 6.5 & 6.8 & 5.7 & 5.8 & 6.1 & 19.7 & 10.2 & \textbf{5.1} & 7.1 \\
+Utah COVID-19 cases$^\dagger$ (48) & SEIR & 4.3 & 2.7 & 1.6 & 3.1 & 1.8 & \textbf{1.5} & 16.2 & 2.2 & 1.6 & 2.4 \\
+ & SIR & 2.1 & 2.0 & 2.0 & 1.6 & 1.6 & \textbf{1.6} & 10.1 & 2.1 & 2.0 & 2.4 \\
+\bottomrule
+\end{tabular}
